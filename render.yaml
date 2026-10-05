@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: organizing-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m bot.main
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: NOTION_DATABASE_ID
+        value: 253fac34a9674889b6e4035acc27828d
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: HF_TOKEN
+        sync: false
+      - key: NOTION_TOKEN
+        sync: false
