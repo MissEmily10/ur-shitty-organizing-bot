@@ -18,6 +18,12 @@ class NotionError(RuntimeError):
         self.status = status
 
 
+def _forget_db() -> None:
+    """Сбрасывает запомненную таблицу: при следующем обращении бот заново проверит её колонки."""
+    global _db_id
+    _db_id = None
+
+
 async def _call(method: str, path: str, json: dict | None = None) -> dict:
     headers = {
         "Authorization": f"Bearer {c.NOTION_TOKEN}",
@@ -26,6 +32,8 @@ async def _call(method: str, path: str, json: dict | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.request(method, f"{API}{path}", headers=headers, json=json)
     if r.is_error:
+        if r.status_code == 400 and "property" in r.text.lower():
+            _forget_db()  # колонку удалили или переименовали в Notion: в следующий раз бот её вернёт
         raise NotionError(r.status_code, r.text)
     return r.json()
 
@@ -61,8 +69,6 @@ SCHEMA = {
     },
     "Создано": {"created_time": {}},
 }
-# Колонки, которых не было в первой версии таблицы: бот дописывает их в существующую таблицу сам
-ADDED_LATER = (c.P_TYPE,)
 
 _db_id: str | None = None
 _db_lock = asyncio.Lock()
@@ -96,7 +102,10 @@ async def db_id() -> str:
         if not found:
             found = next((db for db in await _search("database", DB_TITLE) if _plain(db["title"]) == DB_TITLE), None)
         if found:
-            missing = {name: SCHEMA[name] for name in ADDED_LATER if name not in found["properties"]}
+            # Колонки, которых нет (новые в этой версии бота или удалённые вручную), бот возвращает сам
+            missing = {
+                name: spec for name, spec in SCHEMA.items() if name not in found["properties"] and "title" not in spec
+            }
             if missing:
                 await _call("PATCH", f"/databases/{found['id']}", {"properties": missing})
             _db_id = found["id"]
@@ -121,7 +130,12 @@ async def db_id() -> str:
 
 
 def _title(page: dict) -> str:
-    return _plain(page["properties"][c.P_TITLE]["title"]) or "Без названия"
+    return _plain((page["properties"].get(c.P_TITLE) or {}).get("title") or []) or "Без названия"
+
+
+def _select(page: dict, prop: str) -> str | None:
+    """Значение колонки-выбора; None, если пусто или колонки нет."""
+    return ((page["properties"].get(prop) or {}).get("select") or {}).get("name")
 
 
 async def upload_image(data: bytes, filename: str) -> str:
@@ -152,11 +166,14 @@ async def create_idea(title: str, source: str, tags: list[str], blocks: list[dic
         c.P_SOURCE: {"select": {"name": source}},
         c.P_TAGS: {"multi_select": [{"name": t} for t in tags]},
     }
-    page = await _call(
-        "POST",
-        "/pages",
-        {"parent": {"database_id": await db_id()}, "properties": props, "children": blocks[:100]},
-    )
+    body = {"properties": props, "children": blocks[:100]}
+    try:
+        page = await _call("POST", "/pages", {"parent": {"database_id": await db_id()}, **body})
+    except NotionError as e:
+        if e.status != 400:
+            raise
+        # Скорее всего, колонку удалили вручную: бот уже сбросил таблицу, проверит колонки и попробует ещё раз
+        page = await _call("POST", "/pages", {"parent": {"database_id": await db_id()}, **body})
     await _append(page["id"], blocks[100:])
     if details:
         added = await _call("PATCH", f"/blocks/{page['id']}/children", {"children": [toggle(DETAILS_TITLE, details)]})
@@ -170,13 +187,12 @@ async def _append(block_id: str, blocks: list[dict]) -> None:
 
 
 def _item(p: dict) -> dict:
-    project = p["properties"][c.P_PROJECT]["select"]
     return {
         "id": p["id"].replace("-", ""),
         "title": _title(p),
         "url": p["url"],
-        "project": project["name"] if project else None,
-        "type": ((p["properties"].get(c.P_TYPE) or {}).get("select") or {}).get("name"),
+        "project": _select(p, c.P_PROJECT),
+        "type": _select(p, c.P_TYPE),
     }
 
 
@@ -185,9 +201,7 @@ async def page_info(page_id: str) -> dict:
 
 
 async def page_project(page_id: str) -> str | None:
-    page = await _call("GET", f"/pages/{page_id}")
-    project = page["properties"][c.P_PROJECT]["select"]
-    return project["name"] if project else None
+    return _select(await _call("GET", f"/pages/{page_id}"), c.P_PROJECT)
 
 
 async def review_items() -> list[dict]:
@@ -251,7 +265,7 @@ async def read_note(page_id: str) -> dict:
 
 async def _project_options() -> list[dict]:
     db = await _call("GET", f"/databases/{await db_id()}")
-    return db["properties"][c.P_PROJECT]["select"]["options"]
+    return ((db["properties"].get(c.P_PROJECT) or {}).get("select") or {}).get("options", [])
 
 
 async def _set_project_options(options: list[dict]) -> None:
@@ -304,7 +318,7 @@ async def file_to_project(page_id: str, project: str) -> None:
 
 async def types() -> list[str]:
     db = await _call("GET", f"/databases/{await db_id()}")
-    return [o["name"] for o in db["properties"][c.P_TYPE]["select"]["options"]]
+    return [o["name"] for o in ((db["properties"].get(c.P_TYPE) or {}).get("select") or {}).get("options", [])]
 
 
 async def set_type(page_id: str, type_name: str) -> None:
