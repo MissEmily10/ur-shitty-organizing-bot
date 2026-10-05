@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -376,3 +377,24 @@ async def add_expansion(page_id: str, type_name: str, blocks: list[dict]) -> Non
     """Расширенное описание дописывается в заметку открыто, под заголовком «✨ <тип>: подробно»."""
     heading = {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"✨ {type_name}: подробно"}}]}}
     await _append(page_id, [heading] + blocks)
+
+
+async def notes_in_scope(project: str | None = None, days: int | None = None, limit: int = 150) -> list[dict]:
+    """Заметки проекта или за последние N дней, новые первыми (не больше limit)."""
+    if project:
+        flt = {"property": c.P_PROJECT, "select": {"equals": project}}
+    else:
+        since = (datetime.now(timezone.utc) - timedelta(days=days or 7)).isoformat()
+        flt = {"timestamp": "created_time", "created_time": {"on_or_after": since}}
+    notes, cursor = [], None
+    while len(notes) < limit:
+        body = {"filter": flt, "sorts": [{"timestamp": "created_time", "direction": "descending"}], "page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        data = await _call("POST", f"/databases/{await db_id()}/query", body)
+        for p in data["results"]:
+            notes.append({**_item(p), "created": p["created_time"][:10]})
+        if not data.get("has_more"):
+            break
+        cursor = data["next_cursor"]
+    return notes[:limit]

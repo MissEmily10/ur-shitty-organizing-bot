@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import re
 from dataclasses import dataclass, field
@@ -200,3 +201,60 @@ async def expand(
     questions = [q.strip(" -•\t") for q in (m.group(2) or "").splitlines()]
     questions = [re.sub(r"^\d+[.)]\s*", "", q) for q in questions if q.strip(" -•\t")]
     return m.group(1).strip(), questions[:3]
+
+
+# ---------- 🔎 вопрос по многим заметкам ----------
+
+NOTES_PROMPT = """Ты личный ассистент. Ниже заметки пользователя ({scope}), у каждой название, дата и тип.
+Ответь на вопрос, опираясь только на эти заметки. Называй заметки, на которые опираешься, в «кавычках».
+Пиши на языке вопроса, по делу: списки через "- ", таблицы в Markdown. Если ответа в заметках нет, так и скажи.
+
+{notes}{history}
+
+Вопрос: {question}"""
+
+EXTRACT_PROMPT = """Ниже часть заметок пользователя. Выпиши из них всё, что относится к вопросу «{question}»:
+факты, решения, даты, цифры, с названием заметки в «кавычках». Только то, что есть в заметках. Если ничего нет, ответь одним словом: нет.
+
+{notes}"""
+
+# Сколько текста заметок отдаём модели за один запрос
+NOTES_CHUNK_CHARS = 25000
+NOTES_MAX_CHUNKS = 8
+
+
+async def _complete(text: str, max_tokens: int) -> str:
+    response = await _client().chat_completion(
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": text}], max_tokens=max_tokens, temperature=0.3
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def pack(notes: list[str], limit: int = NOTES_CHUNK_CHARS) -> list[str]:
+    """Складывает заметки в куски не длиннее limit; слишком длинная заметка обрезается."""
+    chunks, current = [], ""
+    for note in notes:
+        note = note[:limit]
+        if current and len(current) + len(note) + 2 > limit:
+            chunks.append(current)
+            current = ""
+        current = f"{current}\n\n{note}" if current else note
+    return chunks + [current] if current else chunks
+
+
+async def ask_notes(question: str, notes: list[str], scope: str, history: str = "") -> tuple[str, bool]:
+    """Ответ по многим заметкам. Если не влезают в один запрос: из каждой части выбираем относящееся
+    к вопросу, потом отвечаем по выжимке. Второе значение — пришлось ли обрезать заметки."""
+    chunks = pack(notes)
+    truncated = len(chunks) > NOTES_MAX_CHUNKS
+    chunks = chunks[:NOTES_MAX_CHUNKS]
+    hist = f"\n\nПредыдущий ответ, который пользователь уточняет:\n{history[:6000]}" if history else ""
+    if len(chunks) > 1:
+        parts = await asyncio.gather(*(_complete(EXTRACT_PROMPT.format(question=question, notes=ch), 1500) for ch in chunks))
+        relevant = [p for p in parts if p and p.strip(" .").lower() != "нет"]
+        context = "\n\n".join(relevant) or "В заметках ничего не нашлось по этому вопросу."
+        scope += ", выжимка по частям"
+    else:
+        context = chunks[0] if chunks else "Заметок нет."
+    answer = await _complete(NOTES_PROMPT.format(scope=scope, notes=context, history=hist, question=question), 3000)
+    return answer or "🤷 Модель вернула пустой ответ.", truncated

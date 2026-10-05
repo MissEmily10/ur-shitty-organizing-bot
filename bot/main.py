@@ -29,6 +29,7 @@ MENU = (
     "/razbor — разобрать входящие\n"
     "/projects — список проектов и удаление\n"
     "/addproject — добавить проект (бот спросит название)\n"
+    "/ask — спросить ИИ по проекту или по всем заметкам за период\n"
     "/remindlink — ссылка для вечернего напоминания\n"
     "/start — это меню\n\n"
     "Или жми кнопку 👇"
@@ -37,6 +38,7 @@ MENU_KB = InlineKeyboardMarkup(
     [
         [Btn("🗂 Разобрать входящие", callback_data="m:razbor")],
         [Btn("📁 Проекты", callback_data="m:projects"), Btn("➕ Добавить проект", callback_data="m:add")],
+        [Btn("🔎 Спросить по заметкам", callback_data="m:ask")],
         [Btn("🔔 Ссылка напоминания", callback_data="m:remind")],
     ]
 )
@@ -72,6 +74,9 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await _ask_project_names(q.message)
         elif action == "remind":
             await q.message.reply_text(_remind_text())
+        elif action == "ask":
+            text, kb = await _ask_scope_view()
+            await q.message.reply_text(text, reply_markup=kb)
     except Exception as e:
         log.exception("menu failed")
         await q.message.reply_text(f"❌ Ошибка: {e}"[:4000])
@@ -206,6 +211,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if page_id := _ai_page(reply):
             await expand_note(update.message, page_id, reply=reply, answers=update.message.text)
             return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (scope := _scope_from(reply.text or "")):
+        # Вопрос по заметкам проекта или периода, либо уточнение к ответу
+        history = reply.text if reply.text.startswith(NOTES_ANSWER_MARK) else ""
+        await _ask_notes(update.message, scope, update.message.text, history)
+        return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (page_id := _ai_page(reply)):
         # Ответ на вопрос «🤖 Что сделать с заметкой?» или уточнение к ответу ИИ
         history = reply.text if reply.text.startswith(AI_ANSWER_MARK) else ""
@@ -478,6 +488,117 @@ async def on_ai_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await _ask_ai(q.message, page_id, question, label=label)
 
 
+# ---------- 🔎 Вопрос по многим заметкам ----------
+# callback_data: q:p:<номер проекта>  |  q:d:<дней>
+# Область вопроса записана в первой строке сообщения бота, поэтому ответ и уточнения переживают перезапуск.
+
+NOTES_PROMPT_MARK = "🔎 Вопрос по "
+NOTES_ANSWER_MARK = "🔎 «"
+PERIODS = {7: "заметкам за неделю", 30: "заметкам за месяц"}
+
+
+def _scope_label(scope: tuple[str, str | int]) -> str:
+    kind, value = scope
+    return f"проекту «{value}»" if kind == "p" else PERIODS.get(int(value), f"заметкам за {value} дн.")
+
+
+def _scope_from(text: str) -> tuple[str, str | int] | None:
+    """Достаёт область из первой строки: «🔎 Вопрос по проекту «Сайт»…» или «🔎 «вопрос» · по проекту «Сайт»…»."""
+    first = text.split("\n", 1)[0]
+    if not first.startswith(("🔎",)):
+        return None
+    if m := re.search(r"проекту «(.+?)»", first):
+        return ("p", m.group(1))
+    for days, label in PERIODS.items():
+        if label in first:
+            return ("d", days)
+    return None
+
+
+async def _ask_scope_view() -> tuple[str, InlineKeyboardMarkup]:
+    projects = await notion.projects()
+    buttons = [Btn(f"📁 {p}", callback_data=f"q:p:{i}") for i, p in enumerate(projects)]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([Btn("🗂 Всё за неделю", callback_data="q:d:7"), Btn("🗂 Всё за месяц", callback_data="q:d:30")])
+    return "🔎 По каким заметкам спросить ИИ?", InlineKeyboardMarkup(rows)
+
+
+async def ask_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = await _ask_scope_view()
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def on_scope_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != c.OWNER_ID:
+        return
+    _, kind, value = q.data.split(":")
+    if kind == "p":
+        projects = await notion.projects()
+        if int(value) >= len(projects):
+            await q.message.reply_text("Список проектов изменился, откройте /ask ещё раз.")
+            return
+        scope = ("p", projects[int(value)])
+    else:
+        scope = ("d", int(value))
+    await q.message.reply_text(
+        f"{NOTES_PROMPT_MARK}{_scope_label(scope)}: напишите вопрос ответом на это сообщение.\n"
+        "Например: «что мы решили за это время?», «собери все идеи для логотипа», «какие задачи без срока?»",
+        reply_markup=ForceReply(input_field_placeholder="ваш вопрос"),
+    )
+
+
+def _notes_word(n: int) -> str:
+    """1 заметка, 3 заметки, 5 заметок."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} заметка"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} заметки"
+    return f"{n} заметок"
+
+
+def _note_text(item: dict, note: dict) -> str:
+    head = f"### «{item['title']}» ({item['created']}" + (f", {item['type']}" if item.get("type") else "") + ")"
+    return "\n".join(p for p in (head, note["summary"], note["details"]) if p)
+
+
+async def _ask_notes(message: Message, scope: tuple[str, str | int], question: str, history: str = "") -> None:
+    kind, value = scope
+    label = _scope_label(scope)
+    status = await message.reply_text(f"📚 Собираю заметки по {label}…")
+    try:
+        items = await notion.notes_in_scope(project=value if kind == "p" else None, days=int(value) if kind == "d" else None)
+        if not items:
+            await status.edit_text(f"🤷 По {label} заметок нет.")
+            return
+        await status.edit_text(f"📚 Читаю: {_notes_word(len(items))}…")
+        limiter = asyncio.Semaphore(3)  # Notion разрешает около 3 запросов в секунду
+
+        async def read(item: dict) -> str:
+            async with limiter:
+                return _note_text(item, await notion.read_note(item["id"]))
+
+        notes = await asyncio.gather(*(read(i) for i in items))
+        await status.edit_text("🤖 Думаю…")
+        answer, truncated = await ai.ask_notes(question, list(notes), label, history)
+    except Exception as e:
+        log.exception("ask notes failed")
+        await status.edit_text(f"❌ ИИ не ответил: {e}"[:4000])
+        return
+    header = f"{NOTES_ANSWER_MARK}{escape(question[:100])}» · по {escape(label)} ({_notes_word(len(items))})\n\n"
+    footer = "\n\n↩️ Ответьте на это сообщение, чтобы уточнить."
+    if truncated:
+        footer = "\n\n⚠️ Заметок очень много, ИИ прочитал не все: сузьте вопрос до проекта или периода." + footer
+    chunks = _chunks(tg_html(answer))
+    for i, chunk in enumerate(chunks):
+        text = header + chunk + (footer if i == len(chunks) - 1 else "")
+        if i == 0:
+            await status.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        else:
+            await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
 # ---------- ✨ Расширение заметки под её тип ----------
 # callback_data: x:<page_id>:<номер> (из разбора)  |  xs:<page_id> (сохранить)  |  xc:<page_id> (не надо)
 
@@ -705,6 +826,7 @@ COMMANDS = [
     ("razbor", "Разобрать входящие"),
     ("projects", "Список проектов"),
     ("addproject", "Добавить проект"),
+    ("ask", "Спросить ИИ по заметкам"),
     ("remindlink", "Ссылка для вечернего напоминания"),
 ]
 
@@ -774,6 +896,8 @@ def main() -> None:
     app.add_handler(CommandHandler("razbor", razbor, filters=owner))
     app.add_handler(CommandHandler("remindlink", remindlink, filters=owner))
     app.add_handler(CommandHandler("projects", projects_cmd, filters=owner))
+    app.add_handler(CommandHandler("ask", ask_cmd, filters=owner))
+    app.add_handler(CallbackQueryHandler(on_scope_button, pattern=r"^q:"))
     app.add_handler(CommandHandler("addproject", addproject, filters=owner))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|x|pj|p|d|v):"))
     app.add_handler(CallbackQueryHandler(on_expand_button, pattern=r"^x[sc]:"))
