@@ -180,6 +180,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
         await update.message.reply_text(await _add_projects_text(update.message.text))
         return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(EXPAND_MARK):
+        if page_id := _ai_page(reply):
+            await expand_note(update.message, page_id, reply=reply, answers=update.message.text)
+            return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (page_id := _ai_page(reply)):
         # Ответ на вопрос «🤖 Что сделать с заметкой?» или уточнение к ответу ИИ
         history = reply.text if reply.text.startswith(AI_ANSWER_MARK) else ""
@@ -319,7 +323,7 @@ PRESETS = [
 
 def _ai_page(message: Message) -> str | None:
     """Ищет в сообщении бота ссылку на заметку в Notion и достаёт из неё id страницы."""
-    if not message.text or not message.text.startswith(("🤖", "✍️")):
+    if not message.text or not message.text.startswith(("🤖", "✍️", EXPAND_MARK)):
         return None
     for entity in message.entities or []:
         if entity.url and "notion" in entity.url:
@@ -405,6 +409,83 @@ async def on_ai_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         label, question = PRESETS[int(rest[0])]
         await _ask_ai(q.message, page_id, question, label=label)
+
+
+# ---------- ✨ Расширение заметки под её тип ----------
+# callback_data: x:<page_id>:<номер> (из разбора)  |  xs:<page_id> (сохранить)  |  xc:<page_id> (не надо)
+
+EXPAND_MARK = "✨ "
+QUESTIONS_MARK = "❓ Уточните:"
+# Черновики по id сообщения: точный Markdown. Если бот перезапустился, берём текст из самого сообщения.
+_drafts: dict[int, tuple[str, str]] = {}
+
+
+def _draft_from_message(message: Message) -> tuple[str, str]:
+    """(тип, черновик) из сообщения бота: первая строка «✨ <тип> · <заметка>», дальше черновик до вопросов."""
+    if message.message_id in _drafts:
+        return _drafts[message.message_id]
+    first, _, rest = message.text.partition("\n")
+    type_name = first.removeprefix(EXPAND_MARK).split(" · ")[0]
+    return type_name, rest.split(QUESTIONS_MARK)[0].split("↩️")[0].strip()
+
+
+async def expand_note(message: Message, page_id: str, reply: Message | None = None, answers: str = "") -> None:
+    status = await message.reply_text("✨ Расширяю…" if not reply else "✨ Дополняю…")
+    try:
+        item = await notion.page_info(page_id)
+        type_name, draft = _draft_from_message(reply) if reply else (item["type"] or "Заметка", "")
+        note = await notion.read_note(page_id)
+        images = []
+        for url in note["images"][:4]:
+            try:
+                images.append(await notion.download(url))
+            except Exception:
+                log.exception("image download failed")
+        titles = await notion.project_titles(item["project"], page_id) if item["project"] else []
+        context = "\n\n".join(p for p in (f"# {item['title']}", note["summary"], note["details"]) if p)
+        description, questions = await ai.expand(type_name, context, item["project"], titles, images, draft, answers)
+    except Exception as e:
+        log.exception("expand failed")
+        await status.edit_text(f"❌ Не получилось расширить: {e}"[:4000])
+        return
+    header = f'{EXPAND_MARK}{escape(type_name)} · <a href="{item["url"]}">{escape(item["title"])}</a>\n\n'
+    tail = ""
+    if questions:
+        tail = f"\n\n<b>{QUESTIONS_MARK}</b>\n" + "\n".join(f"{i}. {escape(q)}" for i, q in enumerate(questions, 1))
+        tail += "\n\n↩️ Ответьте на это сообщение — дополню описание. Или сохраните как есть."
+    body = tg_html(description)
+    if len(header) + len(body) + len(tail) > 4000:
+        body = body[: 4000 - len(header) - len(tail) - 40].rsplit("\n", 1)[0] + "\n… (полностью — после сохранения в Notion)"
+    keyboard = InlineKeyboardMarkup(
+        [[Btn("✅ Сохранить в заметку", callback_data=f"xs:{page_id}"), Btn("✖️ Не надо", callback_data=f"xc:{page_id}")]]
+    )
+    sent = await status.edit_text(
+        header + body + tail, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard
+    )
+    _drafts[sent.message_id if hasattr(sent, "message_id") else status.message_id] = (type_name, description)
+
+
+async def on_expand_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if q.from_user.id != c.OWNER_ID:
+        await q.answer()
+        return
+    action, page_id = q.data.split(":")[:2]
+    if action == "xc":
+        await q.answer()
+        _drafts.pop(q.message.message_id, None)
+        await q.edit_message_reply_markup(None)
+        return
+    try:
+        type_name, draft = _draft_from_message(q.message)
+        await notion.add_expansion(page_id, type_name, to_blocks(draft))
+    except Exception as e:
+        log.exception("save expansion failed")
+        await q.answer(f"Ошибка: {e}"[:200], show_alert=True)
+        return
+    await q.answer("Сохранено ✓")
+    _drafts.pop(q.message.message_id, None)
+    await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("✅ Сохранено в заметке", callback_data="noop")]]))
 
 
 # ---------- проекты ----------
@@ -500,6 +581,25 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 await notion.set_type(page_id, names[idx])
                 await q.answer(f"{names[idx]} ✓")
+                item = await notion.page_info(page_id)
+                await q.edit_message_text(
+                    f'<a href="{item["url"]}">{escape(item["title"])}</a> → {escape(names[idx])} ✓\n\n'
+                    "Расширить описание под этот тип? ИИ дополнит заметку с учётом проекта и задаст пару уточняющих вопросов.",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(
+                        [[Btn("✨ Расширить", callback_data=f"x:{page_id}:{k}"), Btn("⏭ Следующая", callback_data=f"r:{k}")]]
+                    ),
+                )
+                return
+        elif action == "x":
+            # Карточка сразу переходит к следующей заметке, а черновик описания приходит отдельными сообщениями ниже
+            page_id, k = args[0], int(args[1])
+            await q.answer("✨ Расширяю…")
+            text, kb = await _review_view(k)
+            await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await expand_note(q.message, page_id)
+            return
         elif action == "pj":
             page_id, k = args[0], int(args[1])
             show_projects = True
@@ -608,7 +708,9 @@ def main() -> None:
     app.add_handler(CommandHandler("remindlink", remindlink, filters=owner))
     app.add_handler(CommandHandler("projects", projects_cmd, filters=owner))
     app.add_handler(CommandHandler("addproject", addproject, filters=owner))
-    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|pj|p|d|v):"))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|x|pj|p|d|v):"))
+    app.add_handler(CallbackQueryHandler(on_expand_button, pattern=r"^x[sc]:"))
+    app.add_handler(CallbackQueryHandler(lambda u, _: u.callback_query.answer(), pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^n[px]?:"))
     app.add_handler(CallbackQueryHandler(on_ai_button, pattern=r"^aq?:"))
     app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^p[akl]"))

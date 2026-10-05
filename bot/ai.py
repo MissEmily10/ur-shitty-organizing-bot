@@ -117,3 +117,86 @@ async def ask(note: str, question: str, images: list[bytes] | None = None, histo
         model=c.VISION_MODEL, messages=[{"role": "user", "content": content}], max_tokens=3000, temperature=0.3
     )
     return (response.choices[0].message.content or "").strip() or "🤷 Модель вернула пустой ответ."
+
+
+# ---------- ✨ расширение заметки под её тип ----------
+
+TEMPLATES = {
+    "Идея": "## Суть\n## Зачем, в чём ценность\n## Как реализовать (шаги)\n## Что нужно: ресурсы, люди\n## Риски и сомнения\n## Следующий шаг",
+    "Задача": "## Что сделать\n## Подзадачи (чек-лист - [ ])\n## Критерий готовности\n## Срок и приоритет\n## Что нужно, от кого зависит",
+    "Быстрая": "## Факт, кратко и точно\n## Контекст: откуда и зачем пригодится",
+    "Напомин": "## О чём напомнить\n## Когда\n## Где, кому, что взять с собой",
+    "Референс": "## Что на референсе\n## Что берём: цвет, композиция, типографика, свет, фактуры, настроение\n## Палитра (HEX-коды, если есть изображение)\n## Как применить в проекте\n## Источник, ссылка",
+    "Обсудить": "## Вопрос\n## Контекст\n## Варианты решения\n## С кем обсудить\n## Что нужно решить в итоге",
+    "Событие": "## Что\n## Когда и где\n## Кто участвует\n## Подготовка (чек-лист - [ ])",
+}
+TEMPLATE_DEFAULT = "## Суть\n## Детали\n## Следующий шаг"
+
+EXPAND_PROMPT = """Ты помогаешь развить заметку пользователя в полноценное описание типа «{type}».
+Проект: {project}.{project_notes}
+
+Структура описания для этого типа:
+{template}
+
+Правила:
+- Опирайся на заметку{photos}. Ничего не выдумывай: где данных нет, оставь пункт с пометкой «уточнить» и задай об этом вопрос.
+- Адаптируй содержание под тип и под проект.
+- Пиши на языке заметки, Markdown: заголовки ##, списки -, задачи - [ ].
+
+=== ЗАМЕТКА ===
+{note}
+=== КОНЕЦ ЗАМЕТКИ ==={refine}
+
+Ответь строго в формате, без пояснений:
+===ОПИСАНИЕ===
+описание по структуре
+===ВОПРОСЫ===
+до 3 коротких уточняющих вопросов, каждый с новой строки; если всё ясно — оставь пустым"""
+
+
+def _template(type_name: str) -> str:
+    return next((t for key, t in TEMPLATES.items() if key.lower() in type_name.lower()), TEMPLATE_DEFAULT)
+
+
+async def expand(
+    type_name: str,
+    note: str,
+    project: str | None,
+    project_titles: list[str],
+    images: list[bytes] | None = None,
+    draft: str = "",
+    answers: str = "",
+) -> tuple[str, list[str]]:
+    """Возвращает (описание в Markdown, уточняющие вопросы)."""
+    images = images or []
+    content: list[dict] = []
+    for image in images:
+        b64 = base64.b64encode(image).decode()
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    project_notes = ("\nДругие заметки проекта: " + "; ".join(project_titles[:15])) if project_titles else ""
+    refine = (
+        f"\n\nТекущий черновик описания:\n{draft[:8000]}\n\nОтветы пользователя на уточняющие вопросы:\n{answers}\n"
+        "Обнови черновик с учётом ответов и задай новые вопросы, только если что-то важное всё ещё неясно."
+        if draft
+        else ""
+    )
+    text = EXPAND_PROMPT.format(
+        type=type_name,
+        project=project or "не указан",
+        project_notes=project_notes,
+        template=_template(type_name),
+        photos=" и оригиналы фото" if images else "",
+        note=note[:ASK_MAX_CHARS],
+        refine=refine,
+    )
+    content.append({"type": "text", "text": text})
+    response = await _client().chat_completion(
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": content}], max_tokens=2500, temperature=0.3
+    )
+    raw = response.choices[0].message.content or ""
+    m = re.search(r"===\s*ОПИСАНИЕ\s*===(.*?)(?:===\s*ВОПРОСЫ\s*===(.*))?\Z", raw, re.S)
+    if not m:
+        return raw.strip(), []
+    questions = [q.strip(" -•\t") for q in (m.group(2) or "").splitlines()]
+    questions = [re.sub(r"^\d+[.)]\s*", "", q) for q in questions if q.strip(" -•\t")]
+    return m.group(1).strip(), questions[:3]

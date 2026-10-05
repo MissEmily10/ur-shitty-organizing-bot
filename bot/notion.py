@@ -333,3 +333,23 @@ async def download(url: str) -> bytes:
         r = await client.get(url)
         r.raise_for_status()
         return r.content
+
+
+async def project_titles(project: str, exclude: str, limit: int = 15) -> list[str]:
+    """Названия других заметок проекта: контекст для ИИ, пока у проекта нет своей страницы с описанием."""
+    data = await _call(
+        "POST",
+        f"/databases/{await db_id()}/query",
+        {
+            "filter": {"property": c.P_PROJECT, "select": {"equals": project}},
+            "sorts": [{"timestamp": "created_time", "direction": "descending"}],
+            "page_size": limit + 1,
+        },
+    )
+    return [_title(p) for p in data["results"] if p["id"].replace("-", "") != exclude][:limit]
+
+
+async def add_expansion(page_id: str, type_name: str, blocks: list[dict]) -> None:
+    """Расширенное описание дописывается в заметку открыто, под заголовком «✨ <тип>: подробно»."""
+    heading = {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"✨ {type_name}: подробно"}}]}}
+    await _append(page_id, [heading] + blocks)
