@@ -1,13 +1,14 @@
-import hashlib
+import asyncio
 import logging
 from html import escape
 
 from telegram import InlineKeyboardButton as Btn
+from aiohttp import web
 from telegram import InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from . import ai, notion
+from . import ai, notion, remind
 from . import config as c
 from .markdown import to_blocks
 
@@ -28,7 +29,20 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "Присылайте текст, фото блокнота или голосовое — я разложу всё в Notion.\n"
-        "/razbor — разобрать входящие прямо сейчас."
+        "/razbor — разобрать входящие прямо сейчас.\n"
+        "/remindlink — ссылка для вечернего напоминания."
+    )
+
+
+async def remindlink(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not c.WEBHOOK_BASE:
+        await update.message.reply_text("Ссылка появится, когда бот запущен на хостинге (Render).")
+        return
+    url = f"{c.WEBHOOK_BASE.rstrip('/')}/remind/{c.secret('remind')}"
+    await update.message.reply_text(
+        f"Ссылка для cron-job.org:\n{url}\n\n"
+        f"Проверить прямо сейчас (пуш придёт, даже если сегодня уже был):\n{url}?force=1\n\n"
+        "Никому её не показывайте."
     )
 
 
@@ -145,26 +159,70 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- запуск ----------
 
 
+async def serve(app: Application) -> None:
+    """Свой веб-сервер вместо run_webhook: кроме Telegram он принимает вечерний пинг от cron-job.org."""
+    webhook_secret = c.secret("webhook")
+
+    async def telegram(request: web.Request) -> web.Response:
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != webhook_secret:
+            return web.Response(status=403)
+        await app.update_queue.put(Update.de_json(await request.json(), app.bot))
+        return web.Response()
+
+    async def remind_hook(request: web.Request) -> web.Response:
+        if request.match_info["secret"] != c.secret("remind"):
+            return web.Response(status=404)
+        try:
+            result = await remind.send(app.bot, force="force" in request.query)
+        except Exception as e:
+            log.exception("remind failed")
+            return web.Response(status=500, text=str(e))
+        return web.Response(text=result)
+
+    async def health(_: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    server = web.Application()
+    server.add_routes(
+        [
+            web.post("/telegram", telegram),
+            web.get("/remind/{secret}", remind_hook),
+            web.post("/remind/{secret}", remind_hook),
+            web.get("/", health),
+        ]
+    )
+    runner = web.AppRunner(server)
+    await runner.setup()
+    async with app:
+        await app.bot.set_webhook(
+            f"{c.WEBHOOK_BASE.rstrip('/')}/telegram", secret_token=webhook_secret, allowed_updates=Update.ALL_TYPES
+        )
+        await app.start()
+        await web.TCPSite(runner, "0.0.0.0", c.PORT).start()
+        log.info("Сервер слушает порт %s", c.PORT)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await runner.cleanup()
+            await app.stop()
+
+
 def main() -> None:
     c.require("TELEGRAM_TOKEN", "HF_TOKEN", "NOTION_TOKEN")
-    app = Application.builder().token(c.TELEGRAM_TOKEN).concurrent_updates(True).build()
+    builder = Application.builder().token(c.TELEGRAM_TOKEN).concurrent_updates(True)
+    if c.WEBHOOK_BASE:
+        builder = builder.updater(None)  # обновления приходят в наш сервер, встроенный не нужен
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("razbor", razbor, filters=owner))
+    app.add_handler(CommandHandler("remindlink", remindlink, filters=owner))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^[rpd]:"))
     app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(owner & (filters.PHOTO | filters.Document.IMAGE), on_photo))
     app.add_handler(MessageHandler(owner & (filters.VOICE | filters.AUDIO), on_voice))
 
     if c.WEBHOOK_BASE:
-        secret = hashlib.sha256(c.TELEGRAM_TOKEN.encode()).hexdigest()[:32]
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=c.PORT,
-            url_path="telegram",
-            webhook_url=f"{c.WEBHOOK_BASE.rstrip('/')}/telegram",
-            secret_token=secret,
-            allowed_updates=Update.ALL_TYPES,
-        )
+        asyncio.run(serve(app))
     else:
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 

@@ -1,31 +1,30 @@
-"""Вечерний пуш «У тебя есть неразобранное». Запускается по расписанию из GitHub Actions."""
+"""Вечерний пуш «У тебя есть неразобранное». Его дёргает cron-job.org по секретной ссылке /remind/<секрет>."""
 
-import asyncio
+from datetime import datetime, timezone
 
-import httpx
+from telegram import Bot
+from telegram import InlineKeyboardButton as Btn
+from telegram import InlineKeyboardMarkup
 
 from . import config as c
 from . import notion
 
+_last_sent = None
 
-async def main() -> None:
-    c.require("TELEGRAM_TOKEN", "OWNER_ID", "NOTION_TOKEN")
+
+async def send(bot: Bot, force: bool = False) -> str:
+    """Шлёт пуш не чаще раза в день: cron стучится дважды, чтобы первый запрос разбудил уснувший Render."""
+    global _last_sent
+    today = datetime.now(timezone.utc).date()
+    if _last_sent == today and not force:
+        return "Сегодня уже проверяли"
     count = len(await notion.unsorted())
+    _last_sent = today
     if not count:
-        print("Неразобранного нет, пуш не нужен")
-        return
-    r = httpx.post(
-        f"https://api.telegram.org/bot{c.TELEGRAM_TOKEN}/sendMessage",
-        json={
-            "chat_id": c.OWNER_ID,
-            "text": f"🌙 У тебя есть неразобранное: {count}",
-            "reply_markup": {"inline_keyboard": [[{"text": "Разобрать", "callback_data": "r:0"}]]},
-        },
-        timeout=30,
+        return "Неразобранного нет"
+    await bot.send_message(
+        c.OWNER_ID,
+        f"🌙 У тебя есть неразобранное: {count}",
+        reply_markup=InlineKeyboardMarkup([[Btn("Разобрать", callback_data="r:0")]]),
     )
-    r.raise_for_status()
-    print(f"Пуш отправлен, неразобранных: {count}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    return f"Пуш отправлен, неразобранных: {count}"

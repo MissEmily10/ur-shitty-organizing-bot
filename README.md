@@ -13,7 +13,7 @@
 | Что | Где работает |
 |---|---|
 | Бот (приём заметок, кнопки) | Render, бесплатный тариф, webhook |
-| Вечерний пуш | GitHub Actions по расписанию (`.github/workflows/remind.yml`) |
+| Вечерний пуш | cron-job.org открывает секретную ссылку бота `/remind/…` |
 | Голос → текст | Hugging Face, `openai/whisper-large-v3` |
 | Фото/текст → структура | Hugging Face, `google/gemma-4-26B-A4B-it` (Gemma 4) |
 
@@ -43,12 +43,14 @@
 3. После деплоя напишите боту `/start`. Он ответит вашим Telegram ID.
 4. Впишите ID в `OWNER_ID` (Render → сервис → Environment) и сохраните, сервис перезапустится. Теперь бот слушается только вас.
 
-### 4. GitHub (вечерний пуш)
-Репозиторий → Settings → Secrets and variables → Actions → **New repository secret**, три штуки:
-`TELEGRAM_TOKEN`, `OWNER_ID`, `NOTION_TOKEN`.
+### 4. cron-job.org (вечерний пуш)
+1. Напишите боту `/remindlink`. Он пришлёт секретную ссылку вида `https://….onrender.com/remind/…`. Никому её не показывайте.
+2. Зарегистрируйтесь на [cron-job.org](https://cron-job.org) → **Create cronjob**.
+3. **URL:** ссылка из бота. **Execution schedule:** *Custom*, часы `20`, минуты `0` и `3`, каждый день. Часовой пояс (**Time zone**) выберите свой.
+4. Сохраните.
 
-Проверить сразу: вкладка Actions → «Вечерний пуш» → **Run workflow**.
-Время меняется в `remind.yml`. Cron там в UTC: 20:00 МСК = `0 17 * * *`.
+Ссылку открывают дважды: первый запрос будит уснувший Render, второй точно застаёт его проснувшимся. Пуш приходит не чаще раза в день.
+Проверить сразу: откройте в браузере ту же ссылку с `?force=1` на конце.
 
 ## Запуск локально
 

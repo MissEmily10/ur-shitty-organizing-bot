@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sys
 
@@ -25,6 +26,13 @@ ASR_MODEL = env("ASR_MODEL", "openai/whisper-large-v3")
 # Render задаёт RENDER_EXTERNAL_URL сам. Без него бот работает в режиме polling (удобно локально).
 WEBHOOK_BASE = env("WEBHOOK_URL") or env("RENDER_EXTERNAL_URL")
 PORT = int(env("PORT", "8080"))
+
+
+
+def secret(purpose: str) -> str:
+    """Стабильный секрет, выведенный из токена бота: отдельная переменная окружения не нужна."""
+    return hashlib.sha256(f"{purpose}:{TELEGRAM_TOKEN}".encode()).hexdigest()[:32]
+
 
 # Имена полей в Notion
 P_TITLE = "Название"
