@@ -34,22 +34,24 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _save(update: Update, source: str, *, text: str = "", image: bytes | None = None) -> None:
     status = await update.message.reply_text("⏳ Обрабатываю…")
+    note = ""
     try:
         try:
             idea = await ai.structure(text=text, image=image)
-        except Exception:
+        except Exception as e:
             if image:
                 raise
             # ИИ недоступен: текст всё равно не теряем, кладём как есть
             log.exception("AI failed, saving raw text")
             idea = ai.Idea(title=text.splitlines()[0][:60], markdown=text)
+            note = f"\n\n⚠️ Сохранено без обработки ИИ: {escape(str(e)[:500])}"
         url = await notion.create_idea(idea.title, source, idea.tags, to_blocks(idea.markdown))
     except Exception as e:
         log.exception("save failed")
         await status.edit_text(f"❌ Не получилось сохранить: {e}"[:4000])
         return
     await status.edit_text(
-        f'✅ <a href="{url}">{escape(idea.title)}</a>', parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        f'✅ <a href="{url}">{escape(idea.title)}</a>{note}', parse_mode=ParseMode.HTML, disable_web_page_preview=True
     )
 
 

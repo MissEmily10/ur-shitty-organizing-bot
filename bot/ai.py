@@ -50,11 +50,12 @@ async def structure(text: str = "", image: bytes | None = None) -> Idea:
     if image:
         b64 = base64.b64encode(image).decode()
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-    content.append({"type": "text", "text": text or "Распознай и структурируй заметку на фото."})
+    # Инструкцию кладём в сообщение пользователя: не все модели принимают роль system
+    content.append({"type": "text", "text": f"{PROMPT}\n\nЗаметка:\n{text or '(на фото)'}"})
 
     response = await _client().chat_completion(
         model=c.VISION_MODEL,
-        messages=[{"role": "system", "content": PROMPT}, {"role": "user", "content": content}],
+        messages=[{"role": "user", "content": content}],
         max_tokens=1500,
         temperature=0.2,
     )

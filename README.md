@@ -15,9 +15,9 @@
 | Бот (приём заметок, кнопки) | Render, бесплатный тариф, webhook |
 | Вечерний пуш | GitHub Actions по расписанию (`.github/workflows/remind.yml`) |
 | Голос → текст | Hugging Face, `openai/whisper-large-v3` |
-| Фото/текст → структура | Hugging Face, `Qwen/Qwen2.5-VL-7B-Instruct` |
+| Фото/текст → структура | Hugging Face, `google/gemma-4-26B-A4B-it` (Gemma 4) |
 
-Модели меняются переменными `VISION_MODEL` и `ASR_MODEL`, например на `meta-llama/Llama-3.2-11B-Vision-Instruct` (сначала нужно принять лицензию Meta на странице модели).
+Модели меняются переменными `VISION_MODEL` и `ASR_MODEL`, Подойдёт любая модель с пометкой *Inference Providers* на [странице моделей для картинок](https://huggingface.co/models?pipeline_tag=image-text-to-text&inference_provider=all).
 
 На бесплатном Render сервис засыпает после 15 минут тишины. Первое сообщение после паузы бот обработает с задержкой до минуты, это нормально.
 

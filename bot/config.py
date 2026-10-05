@@ -19,7 +19,7 @@ HF_TOKEN = env("HF_TOKEN")
 NOTION_TOKEN = env("NOTION_TOKEN")
 NOTION_DATABASE_ID = env("NOTION_DATABASE_ID")
 
-VISION_MODEL = env("VISION_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
+VISION_MODEL = env("VISION_MODEL", "google/gemma-4-26B-A4B-it")
 ASR_MODEL = env("ASR_MODEL", "openai/whisper-large-v3")
 
 # Render задаёт RENDER_EXTERNAL_URL сам. Без него бот работает в режиме polling (удобно локально).
