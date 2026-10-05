@@ -5,7 +5,7 @@ from html import escape
 
 from telegram import InlineKeyboardButton as Btn
 from aiohttp import web
-from telegram import ForceReply, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -96,20 +96,30 @@ async def remindlink(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(_remind_text())
 
 
-async def _save(update: Update, source: str, *, text: str = "", image: bytes | None = None) -> None:
-    status = await update.message.reply_text("⏳ Обрабатываю…")
+async def _save(update: Update, source: str, *, text: str = "", images: list[bytes] | None = None) -> None:
+    images = images or []
+    status = await update.message.reply_text("⏳ Обрабатываю…" if len(images) < 2 else f"⏳ Обрабатываю альбом из {len(images)} фото…")
     note = ""
     try:
         try:
-            idea = await ai.structure(text=text, image=image)
+            idea = await ai.structure(text=text, images=images)
         except Exception as e:
-            if image:
+            if images:
                 raise
             # ИИ недоступен: текст всё равно не теряем, кладём как есть
             log.exception("AI failed, saving raw text")
             idea = ai.Idea(title=text.splitlines()[0][:60], summary=text)
             note = f"\n\n⚠️ Сохранено без обработки ИИ: {escape(str(e)[:500])}"
-        url = await notion.create_idea(idea.title, source, idea.tags, to_blocks(idea.summary), to_blocks(idea.details))
+        originals = []
+        for i, image in enumerate(images, 1):
+            try:
+                originals.append(notion.image_block(await notion.upload_image(image, f"photo-{i}.jpg")))
+            except Exception as e:
+                # Заметку всё равно сохраняем, просто без оригинала
+                log.exception("image upload failed")
+                note = f"\n\n⚠️ Фото {i} не прикрепилось к Notion: {escape(str(e)[:300])}"
+        blocks = to_blocks(idea.summary) + originals
+        url = await notion.create_idea(idea.title, source, idea.tags, blocks, to_blocks(idea.details))
     except Exception as e:
         log.exception("save failed")
         await status.edit_text(f"❌ Не получилось сохранить: {e}"[:4000])
@@ -127,11 +137,36 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _save(update, "Текст", text=update.message.text)
 
 
+async def _download_image(msg: Message) -> bytes:
+    file = await (msg.photo[-1] if msg.photo else msg.document).get_file()
+    return bytes(await file.download_as_bytearray())
+
+
+# Альбом приходит в Telegram пачкой отдельных сообщений с общим media_group_id: собираем их и сохраняем одной заметкой
+ALBUM_WAIT = 2.0
+_albums: dict[str, list[Update]] = {}
+
+
+async def _flush_album(group_id: str) -> None:
+    size = -1
+    while size != len(_albums[group_id]):  # ждём, пока перестанут приходить новые фото
+        size = len(_albums[group_id])
+        await asyncio.sleep(ALBUM_WAIT)
+    updates = sorted(_albums.pop(group_id), key=lambda u: u.message.message_id)
+    images = [await _download_image(u.message) for u in updates]
+    caption = "\n".join(u.message.caption for u in updates if u.message.caption)
+    await _save(updates[0], "Фото", text=caption, images=images)
+
+
 async def on_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
-    file = await (msg.photo[-1] if msg.photo else msg.document).get_file()
-    image = bytes(await file.download_as_bytearray())
-    await _save(update, "Фото", text=msg.caption or "", image=image)
+    if msg.media_group_id:
+        first = msg.media_group_id not in _albums
+        _albums.setdefault(msg.media_group_id, []).append(update)
+        if first:
+            await _flush_album(msg.media_group_id)
+        return
+    await _save(update, "Фото", text=msg.caption or "", images=[await _download_image(msg)])
 
 
 async def on_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:

@@ -61,15 +61,19 @@ def _parse(raw: str, fallback: str) -> Idea:
     return Idea(title=title or "Заметка", summary=summary, details=parts["ДЕТАЛИ"], tags=tags)
 
 
-async def structure(text: str = "", image: bytes | None = None) -> Idea:
+async def structure(text: str = "", images: list[bytes] | None = None) -> Idea:
+    """images: одно фото или альбом, страницы по порядку."""
+    images = images or []
     content: list[dict] = []
-    if image:
+    for image in images:
         b64 = base64.b64encode(image).decode()
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-        note = f"Подпись к фото: {text}" if text else "Заметка на фото."
+    if images:
+        about = "Заметка на фото." if len(images) == 1 else f"Заметка на {len(images)} фото, это страницы по порядку. В деталях раздели их заголовками «## Фото 1», «## Фото 2» и т.д."
+        note = f"{about}\nПодпись: {text}" if text else about
     else:
         note = f"Заметка:\n{text}"
-    prompt = PROMPT.format(details=DETAILS_PHOTO if image else DETAILS_TEXT)
+    prompt = PROMPT.format(details=DETAILS_PHOTO if images else DETAILS_TEXT)
     # Инструкцию кладём в сообщение пользователя: не все модели принимают роль system
     content.append({"type": "text", "text": f"{prompt}\n\n{note}"})
 
@@ -80,7 +84,7 @@ async def structure(text: str = "", image: bytes | None = None) -> Idea:
         temperature=0.2,
     )
     idea = _parse(response.choices[0].message.content or "", fallback=text)
-    if not image:
+    if not images:
         # Для текста и голоса оригинал у нас уже есть: кладём его в детали целиком, а не пересказ модели
         idea.details = text
     return idea

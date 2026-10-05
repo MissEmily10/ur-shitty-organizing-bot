@@ -8,6 +8,8 @@ from .markdown import toggle
 API = "https://api.notion.com/v1"
 DB_TITLE = "Входящие идеи"
 DETAILS_TITLE = "📝 Полный текст и детали"
+# Загрузка файлов появилась в более новой версии API, остальные запросы остаются на 2022-06-28
+FILES_VERSION = "2026-03-11"
 
 
 class NotionError(RuntimeError):
@@ -104,8 +106,28 @@ def _title(page: dict) -> str:
     return _plain(page["properties"][c.P_TITLE]["title"]) or "Без названия"
 
 
+async def upload_image(data: bytes, filename: str) -> str:
+    """Загружает картинку в Notion, возвращает id для блока image. На бесплатном Notion лимит 5 МБ на файл."""
+    headers = {"Authorization": f"Bearer {c.NOTION_TOKEN}", "Notion-Version": FILES_VERSION}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(f"{API}/file_uploads", headers=headers, json={"filename": filename, "content_type": "image/jpeg"})
+        if r.is_error:
+            raise NotionError(r.status_code, r.text)
+        upload_id = r.json()["id"]
+        r = await client.post(
+            f"{API}/file_uploads/{upload_id}/send", headers=headers, files={"file": (filename, data, "image/jpeg")}
+        )
+        if r.is_error:
+            raise NotionError(r.status_code, r.text)
+    return upload_id
+
+
+def image_block(upload_id: str) -> dict:
+    return {"object": "block", "type": "image", "image": {"type": "file_upload", "file_upload": {"id": upload_id}}}
+
+
 async def create_idea(title: str, source: str, tags: list[str], blocks: list[dict], details: list[dict]) -> str:
-    """blocks видны сразу, details прячутся в свёрнутый блок «Полный текст и детали»."""
+    """blocks видны сразу (сюда же идут картинки-оригиналы), details прячутся в свёрнутый блок «Полный текст и детали»."""
     props = {
         c.P_TITLE: {"title": [{"text": {"content": title[:200]}}]},
         c.P_STATUS: {"select": {"name": c.STATUS_NEW}},
