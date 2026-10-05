@@ -88,3 +88,32 @@ async def structure(text: str = "", images: list[bytes] | None = None) -> Idea:
         # Для текста и голоса оригинал у нас уже есть: кладём его в детали целиком, а не пересказ модели
         idea.details = text
     return idea
+
+
+ASK_PROMPT = """Ты личный ассистент. Ниже заметка пользователя{photos}. Выполни его запрос, опираясь только на заметку.
+Отвечай на языке запроса, по делу. Списки — через "- ", задачи — "- [ ] ", таблицы — в Markdown.
+Если в заметке не хватает данных для ответа, так и скажи, ничего не выдумывай.
+
+=== ЗАМЕТКА ===
+{note}
+=== КОНЕЦ ЗАМЕТКИ ==="""
+
+# Сколько текста заметки отдаём модели за раз (большие объёмы — часть 2г)
+ASK_MAX_CHARS = 30000
+
+
+async def ask(note: str, question: str, images: list[bytes] | None = None, history: str = "") -> str:
+    images = images or []
+    content: list[dict] = []
+    for image in images:
+        b64 = base64.b64encode(image).decode()
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    photos = " и оригиналы фото: сверяй с ними цифры и детали" if images else ""
+    text = ASK_PROMPT.format(photos=photos, note=note[:ASK_MAX_CHARS])
+    if history:
+        text += f"\n\nПредыдущий ответ, который пользователь уточняет:\n{history[:6000]}"
+    content.append({"type": "text", "text": f"{text}\n\nЗапрос: {question}"})
+    response = await _client().chat_completion(
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": content}], max_tokens=3000, temperature=0.3
+    )
+    return (response.choices[0].message.content or "").strip() or "🤷 Модель вернула пустой ответ."

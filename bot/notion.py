@@ -180,6 +180,10 @@ def _item(p: dict) -> dict:
     }
 
 
+async def page_info(page_id: str) -> dict:
+    return _item(await _call("GET", f"/pages/{page_id}"))
+
+
 async def page_project(page_id: str) -> str | None:
     page = await _call("GET", f"/pages/{page_id}")
     project = page["properties"][c.P_PROJECT]["select"]
@@ -315,3 +319,17 @@ async def set_type(page_id: str, type_name: str) -> None:
 async def trash(page_id: str) -> None:
     """В корзину Notion: оттуда можно восстановить в течение 30 дней."""
     await _call("PATCH", f"/pages/{page_id}", {"archived": True})
+
+
+async def add_answer(page_id: str, question: str, blocks: list[dict]) -> None:
+    """Ответ ИИ дописывается в заметку свёрнутым блоком «🤖 <запрос>»."""
+    added = await _call("PATCH", f"/blocks/{page_id}/children", {"children": [toggle(f"🤖 {question[:150]}", blocks)]})
+    await _append(added["results"][-1]["id"], blocks[100:])
+
+
+async def download(url: str) -> bytes:
+    """Оригиналы фото лежат по временным ссылкам Notion, авторизация не нужна."""
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.content

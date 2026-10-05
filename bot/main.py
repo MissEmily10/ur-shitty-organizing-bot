@@ -11,7 +11,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from . import ai, notion, remind
 from . import config as c
-from .markdown import to_blocks
+from .markdown import tg_html, to_blocks
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -180,6 +180,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
         await update.message.reply_text(await _add_projects_text(update.message.text))
         return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (page_id := _ai_page(reply)):
+        # Ответ на вопрос «🤖 Что сделать с заметкой?» или уточнение к ответу ИИ
+        history = reply.text if reply.text.startswith(AI_ANSWER_MARK) else ""
+        await _ask_ai(update.message, page_id, update.message.text, history)
+        return
     await _save(update, "Текст", text=update.message.text)
 
 
@@ -268,7 +273,13 @@ async def _review_view(k: int, show_projects: bool = False) -> tuple[str, Inline
     buttons = [Btn(t, callback_data=f"t:{item['id']}:{i}:{k}") for i, t in enumerate(await notion.types())]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     project_label = f"📁 {item['project']} ✓" if item["project"] else "📁 В проект"
-    rows.append([Btn(project_label, callback_data=f"pj:{item['id']}:{k}"), Btn("👁 Целиком", callback_data=f"v:{item['id']}")])
+    rows.append(
+        [
+            Btn(project_label, callback_data=f"pj:{item['id']}:{k}"),
+            Btn("🤖 ИИ", callback_data=f"a:{item['id']}"),
+            Btn("👁 Целиком", callback_data=f"v:{item['id']}"),
+        ]
+    )
     nav = [Btn("🗑", callback_data=f"d:{item['id']}:{k}")]
     if k > 0:
         nav.append(Btn("◀️", callback_data=f"r:{k - 1}"))
@@ -289,6 +300,111 @@ async def show_note(message: Message, page_id: str) -> None:
             await message.reply_photo(url)
         except Exception:
             log.exception("send photo failed")
+
+
+# ---------- 🤖 Спросить ИИ по заметке ----------
+# callback_data: a:<page_id> (начать)  |  aq:<page_id>:<номер> (быстрое действие)
+# Какая заметка имеется в виду, бот узнаёт по ссылке на Notion внутри своего сообщения:
+# так ответ и уточнения работают, даже если бот успел заснуть и проснуться.
+
+AI_PROMPT_MARK = "🤖 Что сделать с заметкой"
+AI_ANSWER_MARK = "🤖 «"
+PRESETS = [
+    ("📝 Кратко", "Кратко перескажи главное, 3–5 пунктов."),
+    ("✅ Задачи", "Вытащи все задачи и действия чек-листом, со сроками, если они есть."),
+    ("📊 Таблицей", "Сведи данные заметки в таблицу, если есть что сводить."),
+    ("🌐 Перевести", "Переведи заметку на английский, а если она на английском — на русский."),
+]
+
+
+def _ai_page(message: Message) -> str | None:
+    """Ищет в сообщении бота ссылку на заметку в Notion и достаёт из неё id страницы."""
+    if not message.text or not message.text.startswith(("🤖", "✍️")):
+        return None
+    for entity in message.entities or []:
+        if entity.url and "notion" in entity.url:
+            if m := re.search(r"([0-9a-f]{32})(?:\?|$)", entity.url.replace("-", "")):
+                return m.group(1)
+    return None
+
+
+def _chunks(html_text: str, limit: int = 3800) -> list[str]:
+    """Режет HTML на сообщения по строкам, не разрывая блоки <pre>."""
+    parts = re.split(r"(<pre>.*?</pre>)", html_text, flags=re.S)
+    pieces = []
+    for part in parts:
+        pieces += [part] if part.startswith("<pre>") else part.split("\n")
+    chunks, current = [], ""
+    for piece in pieces:
+        candidate = f"{current}\n{piece}" if current else piece
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = piece
+        else:
+            current = candidate
+    return [c for c in chunks + [current] if c.strip()]
+
+
+async def start_ai(message: Message, page_id: str) -> None:
+    item = await notion.page_info(page_id)
+    link = f'<a href="{item["url"]}">{escape(item["title"])}</a>'
+    buttons = [Btn(label, callback_data=f"aq:{page_id}:{i}") for i, (label, _) in enumerate(PRESETS)]
+    await message.reply_text(
+        f"{AI_PROMPT_MARK} {link}?\nНажмите быстрое действие или напишите свой запрос ответом на это сообщение.",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([buttons[:2], buttons[2:]]),
+    )
+    await message.reply_text(
+        f"✍️ Свой запрос к {link}:",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=ForceReply(input_field_placeholder="например: посчитай общую сумму"),
+    )
+
+
+async def _ask_ai(message: Message, page_id: str, question: str, history: str = "", label: str = "") -> None:
+    label = label or question
+    status = await message.reply_text("🤖 Думаю…")
+    try:
+        item = await notion.page_info(page_id)
+        note = await notion.read_note(page_id)
+        images = []
+        for url in note["images"][:4]:  # оригиналы фото, чтобы ИИ сверил цифры
+            try:
+                images.append(await notion.download(url))
+            except Exception:
+                log.exception("image download failed")
+        context = "\n\n".join(p for p in (f"# {item['title']}", note["summary"], note["details"]) if p)
+        answer = await ai.ask(context, question, images, history)
+        await notion.add_answer(page_id, label, to_blocks(answer))
+    except Exception as e:
+        log.exception("ask failed")
+        await status.edit_text(f"❌ ИИ не ответил: {e}"[:4000])
+        return
+    header = f'{AI_ANSWER_MARK}{escape(label[:100])}» · <a href="{item["url"]}">{escape(item["title"])}</a>\n\n'
+    footer = "\n\n↩️ Ответьте на это сообщение, чтобы уточнить. Ответ сохранён в заметке."
+    chunks = _chunks(tg_html(answer))
+    for i, chunk in enumerate(chunks):
+        # Ссылка на заметку в каждом куске: уточнять можно ответом на любой из них
+        text = header + chunk + (footer if i == len(chunks) - 1 else "")
+        if i == 0:
+            await status.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        else:
+            await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def on_ai_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != c.OWNER_ID:
+        return
+    action, page_id, *rest = q.data.split(":")
+    if action == "a":
+        await start_ai(q.message, page_id)
+    else:
+        label, question = PRESETS[int(rest[0])]
+        await _ask_ai(q.message, page_id, question, label=label)
 
 
 # ---------- проекты ----------
@@ -494,6 +610,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addproject", addproject, filters=owner))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|pj|p|d|v):"))
     app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^n[px]?:"))
+    app.add_handler(CallbackQueryHandler(on_ai_button, pattern=r"^aq?:"))
     app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^p[akl]"))
     app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(owner & (filters.PHOTO | filters.Document.IMAGE), on_photo))
