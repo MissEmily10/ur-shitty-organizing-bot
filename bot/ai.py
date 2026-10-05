@@ -39,8 +39,12 @@ class Idea:
     tags: list[str] = field(default_factory=list)
 
 
+# Дольше ждать ответа модели нет смысла: лучше честно сказать об ошибке, чем висеть
+AI_TIMEOUT = 120
+
+
 def _client() -> AsyncInferenceClient:
-    return AsyncInferenceClient(api_key=c.HF_TOKEN)
+    return AsyncInferenceClient(api_key=c.HF_TOKEN, timeout=AI_TIMEOUT)
 
 
 async def transcribe(audio: bytes) -> str:
@@ -120,87 +124,157 @@ async def ask(note: str, question: str, images: list[bytes] | None = None, histo
     return (response.choices[0].message.content or "").strip() or "🤷 Модель вернула пустой ответ."
 
 
-# ---------- ✨ расширение заметки под её тип ----------
+# ---------- ✨ раскрытие заметки под её тип: вопрос за вопросом ----------
 
-TEMPLATES = {
-    "Идея": "## Суть\n## Зачем, в чём ценность\n## Как реализовать (шаги)\n## Что нужно: ресурсы, люди\n## Риски и сомнения\n## Следующий шаг",
-    "Задача": "## Что сделать\n## Подзадачи (чек-лист - [ ])\n## Критерий готовности\n## Срок и приоритет\n## Что нужно, от кого зависит",
-    "Быстрая": "## Факт, кратко и точно\n## Контекст: откуда и зачем пригодится",
-    "Напомин": "## О чём напомнить\n## Когда\n## Где, кому, что взять с собой",
-    "Референс": "## Что на референсе\n## Что берём: цвет, композиция, типографика, свет, фактуры, настроение\n## Палитра (HEX-коды, если есть изображение)\n## Как применить в проекте\n## Источник, ссылка",
-    "Обсудить": "## Вопрос\n## Контекст\n## Варианты решения\n## С кем обсудить\n## Что нужно решить в итоге",
-    "Событие": "## Что\n## Когда и где\n## Кто участвует\n## Подготовка (чек-лист - [ ])",
+# Для каждого типа: цель, стороны, которые нужно раскрыть вопросами, и структура итогового описания.
+# Тип узнаётся по ключевому слову в названии, поэтому эмодзи и мелкие правки названий в Notion не мешают.
+GUIDES = {
+    "идея": (
+        "превратить сырую мысль в идею, которую можно оценить и начать делать",
+        "в чём суть; какую проблему решает или зачем это мне; для кого; как это может выглядеть; "
+        "что нужно для реализации; что может помешать; какой первый маленький шаг",
+        "## Суть\n## Зачем и для кого\n## Как это может выглядеть\n## Что нужно\n## Риски и сомнения\n## Первый шаг",
+    ),
+    "задач": (
+        "превратить задачу в понятный план действий",
+        "что именно должно получиться (результат); из каких шагов состоит; когда срок и насколько срочно; "
+        "что нужно и от кого зависит; как понять, что готово",
+        "## Результат\n## Шаги (чек-лист - [ ])\n## Срок и приоритет\n## Что нужно, от кого зависит\n## Критерий готовности",
+    ),
+    "быстр": (
+        "сохранить факт так, чтобы его легко найти и понять через полгода",
+        "что это за факт точно; откуда он; в какой ситуации пригодится",
+        "## Факт\n## Откуда\n## Когда пригодится",
+    ),
+    "напомин": (
+        "сделать напоминание, которое невозможно понять неправильно",
+        "о чём именно напомнить; когда (дата, время); где; кому или с кем; что подготовить или взять с собой",
+        "## О чём\n## Когда\n## Где и с кем\n## Что подготовить",
+    ),
+    "референс": (
+        "разобрать референс так, чтобы из него можно было взять конкретные решения в работу",
+        "что на референсе и откуда он; что именно в нём цепляет; что берём: цвет, композиция, типографика, свет, "
+        "фактуры, настроение, обработка; куда в проекте это пойдёт; чего брать не нужно",
+        "## Что на референсе\n## Что цепляет\n## Что берём (цвет, композиция, типографика, свет, фактуры, обработка)\n"
+        "## Палитра (HEX-коды, если есть изображение)\n## Куда применить в проекте\n## Чего не берём\n## Источник",
+    ),
+    "обсуд": (
+        "подготовить тему к обсуждению так, чтобы разговор закончился решением",
+        "какой именно вопрос нужно решить; почему он важен сейчас; что уже известно и что пробовали; какие есть "
+        "варианты и их плюсы и минусы; с кем обсудить; к какому сроку нужно решение; что считается итогом разговора",
+        "## Вопрос\n## Почему сейчас\n## Что уже известно\n## Варианты (плюсы и минусы)\n## С кем и когда\n## Нужный итог",
+    ),
+    "событ": (
+        "собрать всё о событии, чтобы ничего не забыть",
+        "что за событие; когда и где; кто участвует; зачем мне туда; что подготовить заранее; что после",
+        "## Что\n## Когда и где\n## Кто\n## Зачем\n## Подготовка (чек-лист - [ ])\n## После",
+    ),
 }
-TEMPLATE_DEFAULT = "## Суть\n## Детали\n## Следующий шаг"
+GUIDE_DEFAULT = (
+    "раскрыть заметку подробнее",
+    "в чём суть; зачем это; какие детали важны; какой следующий шаг",
+    "## Суть\n## Зачем\n## Детали\n## Следующий шаг",
+)
+MAX_QUESTIONS = 7
 
-EXPAND_PROMPT = """Ты помогаешь развить заметку пользователя в полноценное описание типа «{type}».
+NEXT_QUESTION_PROMPT = """Ты помогаешь раскрыть заметку пользователя типа «{type}», задавая вопросы по одному.
+Цель: {goal}.
+Что нужно раскрыть для этого типа: {aspects}.
+
 Проект: {project}.{project_notes}
 
-Структура описания для этого типа:
+=== ЗАМЕТКА{photos} ===
+{note}
+=== КОНЕЦ ЗАМЕТКИ ===
+
+Уже заданные вопросы и ответы:
+{qa}
+
+Задай ОДИН следующий вопрос — о самой важной стороне из списка, которая ещё не раскрыта ни заметкой, ни ответами.
+Вопрос короткий и конкретный, привязанный к содержанию заметки, на языке заметки; можно предложить варианты ответа в скобках.
+Не повторяй уже заданное и не спрашивай то, что есть в заметке.
+Если всё важное уже раскрыто, ответь одним словом: ГОТОВО"""
+
+COMPOSE_PROMPT = """Собери подробное описание заметки типа «{type}».
+Цель: {goal}.
+Проект: {project}.{project_notes}
+
+Структура:
 {template}
 
-Правила:
-- Опирайся на заметку{photos}. Ничего не выдумывай: где данных нет, оставь пункт с пометкой «уточнить» и задай об этом вопрос.
-- Адаптируй содержание под тип и под проект.
-- Пиши на языке заметки, Markdown: заголовки ##, списки -, задачи - [ ].
-
-=== ЗАМЕТКА ===
+=== ЗАМЕТКА{photos} ===
 {note}
-=== КОНЕЦ ЗАМЕТКИ ==={refine}
+=== КОНЕЦ ЗАМЕТКИ ===
 
-Ответь строго в формате, без пояснений:
-===ОПИСАНИЕ===
-описание по структуре
-===ВОПРОСЫ===
-до 3 коротких уточняющих вопросов, каждый с новой строки; если всё ясно — оставь пустым"""
+Ответы пользователя на вопросы:
+{qa}{draft}
 
-
-def _template(type_name: str) -> str:
-    return next((t for key, t in TEMPLATES.items() if key.lower() in type_name.lower()), TEMPLATE_DEFAULT)
+Правила: опирайся только на заметку{photos_rule} и ответы, ничего не выдумывай. Раздел, для которого нет данных, пропусти.
+Пиши на языке заметки, Markdown: заголовки ##, списки -, задачи - [ ]. Без вступлений и пояснений, только описание."""
 
 
-async def expand(
+def guide(type_name: str) -> tuple[str, str, str]:
+    name = type_name.lower()
+    return next((g for key, g in GUIDES.items() if key in name), GUIDE_DEFAULT)
+
+
+def _qa_text(qa: list[tuple[str, str]]) -> str:
+    return "\n".join(f"— {q}\n  Ответ: {a}" for q, a in qa) or "(пока ничего)"
+
+
+def _with_images(images: list[bytes], text: str) -> list[dict]:
+    content = [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(i).decode()}"}} for i in images
+    ]
+    return content + [{"type": "text", "text": text}]
+
+
+def _common(type_name: str, note: str, project: str | None, titles: list[str], images: list[bytes]) -> dict:
+    goal, aspects, template = guide(type_name)
+    return {
+        "type": type_name,
+        "goal": goal,
+        "aspects": aspects,
+        "template": template,
+        "project": project or "не указан",
+        "project_notes": ("\nДругие заметки проекта: " + "; ".join(titles[:15])) if titles else "",
+        "photos": " (и оригиналы фото выше)" if images else "",
+        "photos_rule": ", оригиналы фото" if images else "",
+        "note": note[:ASK_MAX_CHARS],
+    }
+
+
+async def next_question(
+    type_name: str, note: str, project: str | None, titles: list[str], images: list[bytes], qa: list[tuple[str, str]]
+) -> str | None:
+    """Следующий вопрос или None, если всё раскрыто."""
+    if len(qa) >= MAX_QUESTIONS:
+        return None
+    text = NEXT_QUESTION_PROMPT.format(**_common(type_name, note, project, titles, images), qa=_qa_text(qa))
+    response = await _client().chat_completion(
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": _with_images(images, text)}], max_tokens=300, temperature=0.4
+    )
+    answer = (response.choices[0].message.content or "").strip().strip('"«»')
+    if not answer or answer.upper().startswith("ГОТОВО"):
+        return None
+    return answer.splitlines()[0].strip() if len(answer) > 400 else answer
+
+
+async def compose(
     type_name: str,
     note: str,
     project: str | None,
-    project_titles: list[str],
-    images: list[bytes] | None = None,
+    titles: list[str],
+    images: list[bytes],
+    qa: list[tuple[str, str]],
     draft: str = "",
-    answers: str = "",
-) -> tuple[str, list[str]]:
-    """Возвращает (описание в Markdown, уточняющие вопросы)."""
-    images = images or []
-    content: list[dict] = []
-    for image in images:
-        b64 = base64.b64encode(image).decode()
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-    project_notes = ("\nДругие заметки проекта: " + "; ".join(project_titles[:15])) if project_titles else ""
-    refine = (
-        f"\n\nТекущий черновик описания:\n{draft[:8000]}\n\nОтветы пользователя на уточняющие вопросы:\n{answers}\n"
-        "Обнови черновик с учётом ответов и задай новые вопросы, только если что-то важное всё ещё неясно."
-        if draft
-        else ""
-    )
-    text = EXPAND_PROMPT.format(
-        type=type_name,
-        project=project or "не указан",
-        project_notes=project_notes,
-        template=_template(type_name),
-        photos=" и оригиналы фото" if images else "",
-        note=note[:ASK_MAX_CHARS],
-        refine=refine,
-    )
-    content.append({"type": "text", "text": text})
+) -> str:
+    extra = f"\n\nПредыдущий вариант описания (обнови его с учётом ответов):\n{draft[:8000]}" if draft else ""
+    text = COMPOSE_PROMPT.format(**_common(type_name, note, project, titles, images), qa=_qa_text(qa), draft=extra)
     response = await _client().chat_completion(
-        model=c.VISION_MODEL, messages=[{"role": "user", "content": content}], max_tokens=2500, temperature=0.3
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": _with_images(images, text)}], max_tokens=2500, temperature=0.3
     )
-    raw = response.choices[0].message.content or ""
-    m = re.search(r"===\s*ОПИСАНИЕ\s*===(.*?)(?:===\s*ВОПРОСЫ\s*===(.*))?\Z", raw, re.S)
-    if not m:
-        return raw.strip(), []
-    questions = [q.strip(" -•\t") for q in (m.group(2) or "").splitlines()]
-    questions = [re.sub(r"^\d+[.)]\s*", "", q) for q in questions if q.strip(" -•\t")]
-    return m.group(1).strip(), questions[:3]
+    return (response.choices[0].message.content or "").strip() or "🤷 Модель вернула пустое описание."
 
 
 # ---------- 🔎 вопрос по многим заметкам ----------

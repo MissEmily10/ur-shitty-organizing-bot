@@ -7,6 +7,7 @@ from telegram import InlineKeyboardButton as Btn
 from aiohttp import web
 from telegram import ForceReply, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from . import ai, documents, notion, remind
@@ -199,7 +200,7 @@ async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await q.edit_message_reply_markup(_panel(page_id, await notion.page_project(page_id)))
     except Exception as e:
         log.exception("panel failed")
-        await q.answer(f"Ошибка: {e}"[:200], show_alert=True)
+        await _fail(q, e)
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -207,10 +208,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
         await update.message.reply_text(await _add_projects_text(update.message.text))
         return
-    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(EXPAND_MARK):
-        if page_id := _ai_page(reply):
-            await expand_note(update.message, page_id, reply=reply, answers=update.message.text)
-            return
+    if (not reply or (reply.text or "").startswith(EXPAND_MARK)) and await interview_answer(update.message):
+        return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (scope := _scope_from(reply.text or "")):
         # Вопрос по заметкам проекта или периода, либо уточнение к ответу
         history = reply.text if reply.text.startswith(NOTES_ANSWER_MARK) else ""
@@ -599,29 +598,47 @@ async def _ask_notes(message: Message, scope: tuple[str, str | int], question: s
             await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
-# ---------- ✨ Расширение заметки под её тип ----------
-# callback_data: x:<page_id>:<номер> (из разбора)  |  xs:<page_id> (сохранить)  |  xc:<page_id> (не надо)
+# ---------- ✨ Раскрытие заметки под её тип: вопрос за вопросом ----------
+# После выбора типа бот задаёт вопросы по одному. Ответ — просто следующее сообщение (или ответ на вопрос).
+# Когда всё раскрыто или нажато «Хватит», ИИ собирает описание, его можно сохранить в заметку.
+# callback_data: x:<page_id>:<номер> (начать из разбора)  |  xi:skip / xi:done / xi:stop / xi:more
+#                xs:<page_id> (сохранить описание)  |  xc:<page_id> (не сохранять)
 
 EXPAND_MARK = "✨ "
-QUESTIONS_MARK = "❓ Уточните:"
-# Черновики по id сообщения: точный Markdown. Если бот перезапустился, берём текст из самого сообщения.
+# Идущие интервью по id чата: заметка, тип, вопросы-ответы, оригиналы фото
+_interviews: dict[int, dict] = {}
+# Собранные описания по id сообщения: (тип, Markdown). Если бот перезапустился, берём текст из сообщения.
 _drafts: dict[int, tuple[str, str]] = {}
 
 
 def _draft_from_message(message: Message) -> tuple[str, str]:
-    """(тип, черновик) из сообщения бота: первая строка «✨ <тип> · <заметка>», дальше черновик до вопросов."""
+    """(тип, описание) из сообщения бота: первая строка «✨ <тип> · <заметка>», дальше описание."""
     if message.message_id in _drafts:
         return _drafts[message.message_id]
-    first, _, rest = message.text.partition("\n")
-    type_name = first.removeprefix(EXPAND_MARK).split(" · ")[0]
-    return type_name, rest.split(QUESTIONS_MARK)[0].split("↩️")[0].strip()
+    first, _, rest = (message.text or "").partition("\n")
+    return first.removeprefix(EXPAND_MARK).split(" · ")[0], rest.strip()
 
 
-async def expand_note(message: Message, page_id: str, reply: Message | None = None, answers: str = "") -> None:
-    status = await message.reply_text("✨ Расширяю…" if not reply else "✨ Дополняю…")
+async def _send_html(message: Message, text: str, status: Message | None = None, **kwargs) -> Message:
+    """Отправляет или правит сообщение с HTML. Если Telegram не принял разметку — отправляет простым текстом,
+    чтобы ответ не потерялся молча."""
+    try:
+        if status:
+            return await status.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kwargs)
+        return await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kwargs)
+    except BadRequest as e:
+        if "parse" not in str(e).lower() and "entit" not in str(e).lower():
+            raise
+        plain = re.sub(r"<[^>]+>", "", text).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        if status:
+            return await status.edit_text(plain, disable_web_page_preview=True, **kwargs)
+        return await message.reply_text(plain, disable_web_page_preview=True, **kwargs)
+
+
+async def start_interview(message: Message, page_id: str) -> None:
+    status = await message.reply_text("✨ Читаю заметку…")
     try:
         item = await notion.page_info(page_id)
-        type_name, draft = _draft_from_message(reply) if reply else (item["type"] or "Заметка", "")
         note = await notion.read_note(page_id)
         images = []
         for url in note["images"][:4]:
@@ -630,27 +647,148 @@ async def expand_note(message: Message, page_id: str, reply: Message | None = No
             except Exception:
                 log.exception("image download failed")
         titles = await notion.project_titles(item["project"], page_id) if item["project"] else []
-        context = "\n\n".join(p for p in (f"# {item['title']}", note["summary"], note["details"]) if p)
-        description, questions = await ai.expand(type_name, context, item["project"], titles, images, draft, answers)
     except Exception as e:
-        log.exception("expand failed")
-        await status.edit_text(f"❌ Не получилось расширить: {e}"[:4000])
+        log.exception("interview start failed")
+        await status.edit_text(f"❌ Не получилось прочитать заметку: {e}"[:4000])
         return
-    header = f'{EXPAND_MARK}{escape(type_name)} · <a href="{item["url"]}">{escape(item["title"])}</a>\n\n'
-    tail = ""
-    if questions:
-        tail = f"\n\n<b>{QUESTIONS_MARK}</b>\n" + "\n".join(f"{i}. {escape(q)}" for i, q in enumerate(questions, 1))
-        tail += "\n\n↩️ Ответьте на это сообщение — дополню описание. Или сохраните как есть."
+    _interviews[message.chat_id] = {
+        "page": page_id,
+        "item": item,
+        "type": item["type"] or "Заметка",
+        "note": "\n\n".join(p for p in (f"# {item['title']}", note["summary"], note["details"]) if p),
+        "images": images,
+        "titles": titles,
+        "qa": [],
+        "question": None,
+        "draft": "",
+    }
+    await _next_step(message, status)
+
+
+def _interview_header(state: dict) -> str:
+    item = state["item"]
+    return f'{EXPAND_MARK}{escape(state["type"])} · <a href="{item["url"]}">{escape(item["title"])}</a>\n\n'
+
+
+async def _next_step(message: Message, status: Message | None = None) -> None:
+    state = _interviews.get(message.chat_id)
+    if not state:
+        return
+    if status is None:
+        status = await message.reply_text("✨ Думаю над следующим вопросом…")
+    else:
+        await status.edit_text("✨ Думаю над вопросом…")
+    try:
+        question = await ai.next_question(
+            state["type"], state["note"], state["item"]["project"], state["titles"], state["images"], state["qa"]
+        )
+    except Exception as e:
+        log.exception("next question failed")
+        await status.edit_text(
+            f"❌ ИИ не ответил: {e}"[:3500],
+            reply_markup=InlineKeyboardMarkup(
+                [[Btn("🔄 Ещё раз", callback_data="xi:retry"), Btn("✅ Собрать по тому, что есть", callback_data="xi:done")]]
+            ),
+        )
+        return
+    if question is None:
+        await _compose(message, status)
+        return
+    state["question"] = question
+    n = len(state["qa"]) + 1
+    await _send_html(
+        message,
+        _interview_header(state)
+        + f"<b>Вопрос {n}:</b> {escape(question)}\n\n✍️ Просто напишите ответ следующим сообщением.",
+        status=status,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [Btn("⏭ Пропустить", callback_data="xi:skip"), Btn("✅ Хватит, собрать", callback_data="xi:done")],
+                [Btn("✖️ Стоп", callback_data="xi:stop")],
+            ]
+        ),
+    )
+
+
+async def _compose(message: Message, status: Message | None = None) -> None:
+    state = _interviews.get(message.chat_id)
+    if not state:
+        return
+    state["question"] = None
+    if status is None:
+        status = await message.reply_text("✨ Собираю описание…")
+    else:
+        await status.edit_text("✨ Собираю описание…")
+    try:
+        description = await ai.compose(
+            state["type"], state["note"], state["item"]["project"], state["titles"], state["images"], state["qa"], state["draft"]
+        )
+    except Exception as e:
+        log.exception("compose failed")
+        await status.edit_text(
+            f"❌ ИИ не собрал описание: {e}"[:3500],
+            reply_markup=InlineKeyboardMarkup([[Btn("🔄 Ещё раз", callback_data="xi:done")]]),
+        )
+        return
+    state["draft"] = description
     body = tg_html(description)
+    header = _interview_header(state)
+    tail = "\n\n✍️ Хотите что-то поправить — напишите следующим сообщением."
     if len(header) + len(body) + len(tail) > 4000:
-        body = body[: 4000 - len(header) - len(tail) - 40].rsplit("\n", 1)[0] + "\n… (полностью — после сохранения в Notion)"
-    keyboard = InlineKeyboardMarkup(
-        [[Btn("✅ Сохранить в заметку", callback_data=f"xs:{page_id}"), Btn("✖️ Не надо", callback_data=f"xc:{page_id}")]]
+        body = body[: 4000 - len(header) - len(tail) - 60].rsplit("\n", 1)[0] + "\n… (полностью — после сохранения в Notion)"
+        body = re.sub(r"<pre>(?![\s\S]*</pre>)[\s\S]*$", "", body)  # не оставляем незакрытый <pre>
+    sent = await _send_html(
+        message,
+        header + body + tail,
+        status=status,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [Btn("✅ Сохранить в заметку", callback_data=f"xs:{state['page']}")],
+                [Btn("❓ Ещё вопрос", callback_data="xi:more"), Btn("✖️ Не надо", callback_data=f"xc:{state['page']}")],
+            ]
+        ),
     )
-    sent = await status.edit_text(
-        header + body + tail, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard
-    )
-    _drafts[sent.message_id if hasattr(sent, "message_id") else status.message_id] = (type_name, description)
+    _drafts[getattr(sent, "message_id", status.message_id)] = (state["type"], description)
+
+
+async def interview_answer(message: Message) -> bool:
+    """Если идёт интервью, сообщение — это ответ на вопрос или правка собранного описания. True, если обработали."""
+    state = _interviews.get(message.chat_id)
+    if not state:
+        return False
+    if state["question"]:
+        state["qa"].append((state["question"], message.text))
+        state["question"] = None
+        await _next_step(message)
+    else:
+        state["qa"].append(("Правка к описанию", message.text))
+        await _compose(message)
+    return True
+
+
+async def on_interview_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != c.OWNER_ID:
+        return
+    action = q.data.removeprefix("xi:")
+    state = _interviews.get(q.message.chat_id)
+    if not state:
+        await q.edit_message_reply_markup(None)
+        await q.message.reply_text("Этот разговор уже закончился. Начните заново из разбора: тип → «✨ Раскрыть».")
+        return
+    await q.edit_message_reply_markup(None)
+    if action == "stop":
+        _interviews.pop(q.message.chat_id, None)
+        await q.message.reply_text("Ок, остановились. Заметка осталась как была.")
+    elif action == "skip":
+        state["qa"].append((state["question"] or "вопрос", "(пропущено)"))
+        state["question"] = None
+        await _next_step(q.message)
+    elif action in ("more", "retry"):
+        await _next_step(q.message)
+    else:  # done
+        await _compose(q.message)
 
 
 async def on_expand_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -662,6 +800,7 @@ async def on_expand_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
     if action == "xc":
         await q.answer()
         _drafts.pop(q.message.message_id, None)
+        _interviews.pop(q.message.chat_id, None)
         await q.edit_message_reply_markup(None)
         return
     try:
@@ -669,10 +808,11 @@ async def on_expand_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
         await notion.add_expansion(page_id, type_name, to_blocks(draft))
     except Exception as e:
         log.exception("save expansion failed")
-        await q.answer(f"Ошибка: {e}"[:200], show_alert=True)
+        await _fail(q, e)
         return
     await q.answer("Сохранено ✓")
     _drafts.pop(q.message.message_id, None)
+    _interviews.pop(q.message.chat_id, None)
     await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("✅ Сохранено в заметке", callback_data="noop")]]))
 
 
@@ -743,7 +883,7 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
         text, kb = await _projects_view()
     except Exception as e:
         log.exception("project button failed")
-        await q.answer(f"Ошибка: {e}"[:200], show_alert=True)
+        await _fail(q, e)
         return
     await q.edit_message_text(text, reply_markup=kb)
 
@@ -772,21 +912,21 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 item = await notion.page_info(page_id)
                 await q.edit_message_text(
                     f'<a href="{item["url"]}">{escape(item["title"])}</a> → {escape(names[idx])} ✓\n\n'
-                    "Расширить описание под этот тип? ИИ дополнит заметку с учётом проекта и задаст пару уточняющих вопросов.",
+                    "Раскрыть заметку под этот тип? ИИ задаст несколько вопросов по одному и соберёт подробное описание.",
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                     reply_markup=InlineKeyboardMarkup(
-                        [[Btn("✨ Расширить", callback_data=f"x:{page_id}:{k}"), Btn("⏭ Следующая", callback_data=f"r:{k}")]]
+                        [[Btn("✨ Раскрыть", callback_data=f"x:{page_id}:{k}"), Btn("⏭ Следующая", callback_data=f"r:{k}")]]
                     ),
                 )
                 return
         elif action == "x":
             # Карточка сразу переходит к следующей заметке, а черновик описания приходит отдельными сообщениями ниже
             page_id, k = args[0], int(args[1])
-            await q.answer("✨ Расширяю…")
-            text, kb = await _review_view(k)
-            await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            await expand_note(q.message, page_id)
+            # Карточка разбора ждёт, пока идёт разговор: после него вернётесь к ней кнопкой
+            await q.answer()
+            await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("⏭ К следующей заметке", callback_data=f"r:{k}")]]))
+            await start_interview(q.message, page_id)
             return
         elif action == "pj":
             page_id, k = args[0], int(args[1])
@@ -814,7 +954,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         text, kb = await _review_view(k, show_projects)
     except Exception as e:
         log.exception("button failed")
-        await q.answer(f"Ошибка: {e}"[:200], show_alert=True)
+        await _fail(q, e)
         return
     await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
@@ -885,10 +1025,34 @@ async def serve(app: Application) -> None:
             await app.stop()
 
 
-def main() -> None:
-    c.require("TELEGRAM_TOKEN", "HF_TOKEN", "NOTION_TOKEN")
+async def _fail(q, error: Exception) -> None:
+    """Показывает ошибку кнопки: всплывающим окном, а если на нажатие уже ответили — сообщением в чат."""
+    try:
+        await q.answer(f"Ошибка: {error}"[:200], show_alert=True)
+    except Exception:
+        await q.message.reply_text(f"❌ Ошибка: {error}"[:4000])
+
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Последняя линия: любая необработанная ошибка приходит владелице в чат, а не теряется молча."""
+    log.error("unhandled error", exc_info=ctx.error)
+    if not c.OWNER_ID:
+        return
+    where = ""
+    if isinstance(update, Update):
+        if update.callback_query:
+            where = f" (кнопка {update.callback_query.data.split(':')[0]})"
+        elif update.message:
+            where = " (сообщение)"
+    try:
+        await ctx.bot.send_message(c.OWNER_ID, f"⚠️ Что-то пошло не так{where}: {type(ctx.error).__name__}: {ctx.error}"[:4000])
+    except Exception:
+        log.exception("could not report error")
+
+
+def build_app(webhook: bool) -> Application:
     builder = Application.builder().token(c.TELEGRAM_TOKEN).concurrent_updates(True).post_init(set_commands)
-    if c.WEBHOOK_BASE:
+    if webhook:
         builder = builder.updater(None)  # обновления приходят в наш сервер, встроенный не нужен
     app = builder.build()
     app.add_handler(CommandHandler(["start", "help"], start))
@@ -901,6 +1065,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addproject", addproject, filters=owner))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|x|pj|p|d|v):"))
     app.add_handler(CallbackQueryHandler(on_expand_button, pattern=r"^x[sc]:"))
+    app.add_handler(CallbackQueryHandler(on_interview_button, pattern=r"^xi:"))
     app.add_handler(CallbackQueryHandler(lambda u, _: u.callback_query.answer(), pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^n[px]?:"))
     app.add_handler(CallbackQueryHandler(on_ai_button, pattern=r"^aq?:"))
@@ -909,7 +1074,13 @@ def main() -> None:
     app.add_handler(MessageHandler(owner & (filters.PHOTO | filters.Document.IMAGE), on_photo))
     app.add_handler(MessageHandler(owner & (filters.VOICE | filters.AUDIO), on_voice))
     app.add_handler(MessageHandler(owner & filters.Document.ALL & ~filters.Document.IMAGE, on_document))
+    app.add_error_handler(on_error)
+    return app
 
+
+def main() -> None:
+    c.require("TELEGRAM_TOKEN", "HF_TOKEN", "NOTION_TOKEN")
+    app = build_app(webhook=bool(c.WEBHOOK_BASE))
     if c.WEBHOOK_BASE:
         asyncio.run(serve(app))
     else:
