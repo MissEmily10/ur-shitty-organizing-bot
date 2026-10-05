@@ -9,7 +9,7 @@ from telegram import ForceReply, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from . import ai, notion, remind
+from . import ai, documents, notion, remind
 from . import config as c
 from .markdown import tg_html, to_blocks
 
@@ -96,19 +96,33 @@ async def remindlink(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(_remind_text())
 
 
-async def _save(update: Update, source: str, *, text: str = "", images: list[bytes] | None = None) -> None:
+async def _save(
+    update: Update,
+    source: str,
+    *,
+    text: str = "",
+    images: list[bytes] | None = None,
+    attachment: tuple[bytes, str, str] | None = None,
+    full_text: str | None = None,
+    status: Message | None = None,
+) -> None:
+    """attachment — (данные, имя, MIME) оригинала документа; full_text — полный текст документа для деталей,
+    когда в ИИ ушёл только фрагмент."""
     images = images or []
-    status = await update.message.reply_text("⏳ Обрабатываю…" if len(images) < 2 else f"⏳ Обрабатываю альбом из {len(images)} фото…")
+    if status is None:
+        status = await update.message.reply_text("⏳ Обрабатываю…" if len(images) < 2 else f"⏳ Обрабатываю альбом из {len(images)} фото…")
     note = ""
     try:
         try:
             idea = await ai.structure(text=text, images=images)
+            if full_text is not None:
+                idea.details = full_text
         except Exception as e:
             if images:
                 raise
             # ИИ недоступен: текст всё равно не теряем, кладём как есть
             log.exception("AI failed, saving raw text")
-            idea = ai.Idea(title=text.splitlines()[0][:60], summary=text)
+            idea = ai.Idea(title=(text.splitlines() or ["Заметка"])[0][:60], summary=text, details=full_text or "")
             note = f"\n\n⚠️ Сохранено без обработки ИИ: {escape(str(e)[:500])}"
         originals = []
         for i, image in enumerate(images, 1):
@@ -118,6 +132,14 @@ async def _save(update: Update, source: str, *, text: str = "", images: list[byt
                 # Заметку всё равно сохраняем, просто без оригинала
                 log.exception("image upload failed")
                 note = f"\n\n⚠️ Фото {i} не прикрепилось к Notion: {escape(str(e)[:300])}"
+        if attachment:
+            data, filename, mime = attachment
+            try:
+                kind = "pdf" if mime == "application/pdf" else "file"
+                originals.append(notion.file_block(await notion.upload_file(data, filename, mime), kind))
+            except Exception as e:
+                log.exception("file upload failed")
+                note = f"\n\n⚠️ Файл не прикрепился к Notion (на бесплатном Notion лимит 5 МБ): {escape(str(e)[:300])}"
         blocks = to_blocks(idea.summary) + originals
         page_id, url = await notion.create_idea(idea.title, source, idea.tags, blocks, to_blocks(idea.details))
     except Exception as e:
@@ -222,6 +244,51 @@ async def on_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await _flush_album(msg.media_group_id)
         return
     await _save(update, "Фото", text=msg.caption or "", images=[await _download_image(msg)])
+
+
+# Сколько текста документа отдаём ИИ для краткой сути и сколько сохраняем в детали заметки
+DOC_AI_CHARS = 30000
+DOC_SAVE_CHARS = 150000
+
+
+async def on_document(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    doc = msg.document
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await msg.reply_text("❌ Файл больше 20 МБ: Telegram не даёт ботам скачивать такие.")
+        return
+    status = await msg.reply_text("⏳ Читаю документ…")
+    try:
+        data = bytes(await (await doc.get_file()).download_as_bytearray())
+        extracted = documents.extract(data, doc.file_name or "file", doc.mime_type)
+    except documents.Unsupported as e:
+        await status.edit_text(f"🤷 {e}")
+        return
+    except Exception as e:
+        log.exception("document read failed")
+        await status.edit_text(f"❌ Не получилось прочитать документ: {e}"[:4000])
+        return
+    filename = doc.file_name or "file"
+    attachment = (data, filename, doc.mime_type or "application/octet-stream")
+    caption = f"Подпись: {msg.caption}\n" if msg.caption else ""
+    if extracted.scans:
+        # Скан без текстового слоя: страницы идут в ИИ как фото
+        await status.edit_text(f"⏳ Это скан, распознаю {len(extracted.scans)} стр…")
+        await _save(update, "Документ", text=caption, images=extracted.scans, attachment=attachment, status=status)
+        return
+    if not extracted.text.strip():
+        await status.edit_text("🤷 В документе не нашлось текста.")
+        return
+    full = extracted.text
+    if len(full) > DOC_SAVE_CHARS:
+        full = full[:DOC_SAVE_CHARS] + "\n\n… (дальше — в прикреплённом файле)"
+    excerpt = extracted.text[:DOC_AI_CHARS]
+    if len(extracted.text) > DOC_AI_CHARS:
+        excerpt += "\n\n(Документ длинный, это его начало.)"
+    size = f"{len(extracted.text):,}".replace(",", " ")
+    await status.edit_text(f"⏳ Обрабатываю: {extracted.kind}, {size} символов…")
+    text = f"{caption}{extracted.kind} «{filename}»:\n\n{excerpt}"
+    await _save(update, "Документ", text=text, attachment=attachment, full_text=full, status=status)
 
 
 async def on_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -717,6 +784,7 @@ def main() -> None:
     app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(owner & (filters.PHOTO | filters.Document.IMAGE), on_photo))
     app.add_handler(MessageHandler(owner & (filters.VOICE | filters.AUDIO), on_voice))
+    app.add_handler(MessageHandler(owner & filters.Document.ALL & ~filters.Document.IMAGE, on_document))
 
     if c.WEBHOOK_BASE:
         asyncio.run(serve(app))

@@ -138,24 +138,33 @@ def _select(page: dict, prop: str) -> str | None:
     return ((page["properties"].get(prop) or {}).get("select") or {}).get("name")
 
 
-async def upload_image(data: bytes, filename: str) -> str:
-    """Загружает картинку в Notion, возвращает id для блока image. На бесплатном Notion лимит 5 МБ на файл."""
+async def upload_file(data: bytes, filename: str, content_type: str) -> str:
+    """Загружает файл в Notion, возвращает id для блока. На бесплатном Notion лимит 5 МБ на файл."""
     headers = {"Authorization": f"Bearer {c.NOTION_TOKEN}", "Notion-Version": FILES_VERSION}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{API}/file_uploads", headers=headers, json={"filename": filename, "content_type": "image/jpeg"})
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(f"{API}/file_uploads", headers=headers, json={"filename": filename, "content_type": content_type})
         if r.is_error:
             raise NotionError(r.status_code, r.text)
         upload_id = r.json()["id"]
         r = await client.post(
-            f"{API}/file_uploads/{upload_id}/send", headers=headers, files={"file": (filename, data, "image/jpeg")}
+            f"{API}/file_uploads/{upload_id}/send", headers=headers, files={"file": (filename, data, content_type)}
         )
         if r.is_error:
             raise NotionError(r.status_code, r.text)
     return upload_id
 
 
+async def upload_image(data: bytes, filename: str) -> str:
+    return await upload_file(data, filename, "image/jpeg")
+
+
+def file_block(upload_id: str, kind: str = "file") -> dict:
+    """kind: image — картинка, pdf — PDF с просмотром прямо в Notion, file — любой другой файл."""
+    return {"object": "block", "type": kind, kind: {"type": "file_upload", "file_upload": {"id": upload_id}}}
+
+
 def image_block(upload_id: str) -> dict:
-    return {"object": "block", "type": "image", "image": {"type": "file_upload", "file_upload": {"id": upload_id}}}
+    return file_block(upload_id, "image")
 
 
 async def create_idea(title: str, source: str, tags: list[str], blocks: list[dict], details: list[dict]) -> tuple[str, str]:
