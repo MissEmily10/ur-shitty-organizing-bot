@@ -19,7 +19,8 @@ async def send(bot: Bot, force: bool = False) -> str:
     if _last_sent == today and not force:
         return "Сегодня уже проверяли"
     count = len(await notion.unsorted())
-    _last_sent = today
+    if not force:  # ручная проверка не должна отменять вечерний пуш
+        _last_sent = today
     if not count:
         return "Неразобранного нет"
     await bot.send_message(
