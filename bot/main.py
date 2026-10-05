@@ -28,7 +28,7 @@ MENU = (
     "<b>Команды</b>\n"
     "/razbor — разобрать входящие\n"
     "/projects — список проектов и удаление\n"
-    "/addproject Название — добавить проект (несколько через запятую)\n"
+    "/addproject — добавить проект (бот спросит название)\n"
     "/remindlink — ссылка для вечернего напоминания\n"
     "/start — это меню\n\n"
     "Или жми кнопку 👇"
@@ -69,12 +69,16 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             text, kb = await _projects_view()
             await q.message.reply_text(text, reply_markup=kb)
         elif action == "add":
-            await q.message.reply_text(ADD_PROMPT, reply_markup=ForceReply(input_field_placeholder="Сайт, Логотипы, Фоны"))
+            await _ask_project_names(q.message)
         elif action == "remind":
             await q.message.reply_text(_remind_text())
     except Exception as e:
         log.exception("menu failed")
         await q.message.reply_text(f"❌ Ошибка: {e}"[:4000])
+
+
+async def _ask_project_names(message) -> None:
+    await message.reply_text(ADD_PROMPT, reply_markup=ForceReply(input_field_placeholder="Сайт, Логотипы, Фоны"))
 
 
 def _remind_text() -> str:
@@ -204,6 +208,9 @@ async def _add_projects_text(raw: str) -> str:
 
 async def addproject(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     raw = re.sub(r"^/addproject(@\w+)?", "", update.message.text, count=1)
+    if not raw.strip():
+        await _ask_project_names(update.message)
+        return
     await update.message.reply_text(await _add_projects_text(raw))
 
 
@@ -281,7 +288,7 @@ COMMANDS = [
     ("start", "Меню всех команд"),
     ("razbor", "Разобрать входящие"),
     ("projects", "Список проектов"),
-    ("addproject", "Добавить проект: /addproject Название"),
+    ("addproject", "Добавить проект"),
     ("remindlink", "Ссылка для вечернего напоминания"),
 ]
 
