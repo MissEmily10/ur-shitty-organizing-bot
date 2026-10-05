@@ -27,6 +27,9 @@ ASR_MODEL = env("ASR_MODEL", "openai/whisper-large-v3")
 WEBHOOK_BASE = env("WEBHOOK_URL") or env("RENDER_EXTERNAL_URL")
 PORT = int(env("PORT", "8080"))
 
+# Сколько заметок в день может отправить участник (на владельца лимит не действует): ИИ работает на токене владельца
+MEMBER_DAILY_LIMIT = int(env("MEMBER_DAILY_LIMIT", "30"))
+
 
 
 def secret(purpose: str) -> str:
@@ -40,5 +43,7 @@ P_STATUS = "Статус"
 P_PROJECT = "Проект"
 P_SOURCE = "Источник"
 P_TAGS = "Теги"
+P_AUTHOR = "Автор"
+P_AUTHOR_ID = "Автор ID"
 STATUS_NEW = "Неразобрано"
 STATUS_DONE = "Разобрано"
