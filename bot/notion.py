@@ -1,6 +1,4 @@
 import asyncio
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -48,8 +46,23 @@ SCHEMA = {
             "options": [{"name": "идея", "color": "yellow"}, {"name": "задача", "color": "pink"}, {"name": "дизайн", "color": "blue"}]
         }
     },
+    c.P_TYPE: {
+        "select": {
+            "options": [
+                {"name": "💡 Идея", "color": "yellow"},
+                {"name": "📋 Задача", "color": "pink"},
+                {"name": "⚡ Быстрая заметка", "color": "gray"},
+                {"name": "⏰ Напоминание", "color": "red"},
+                {"name": "🎨 Референс", "color": "purple"},
+                {"name": "❓ Обсудить", "color": "orange"},
+                {"name": "📅 Событие", "color": "blue"},
+            ]
+        }
+    },
     "Создано": {"created_time": {}},
 }
+# Колонки, которых не было в первой версии таблицы: бот дописывает их в существующую таблицу сам
+ADDED_LATER = (c.P_TYPE,)
 
 _db_id: str | None = None
 _db_lock = asyncio.Lock()
@@ -73,18 +86,21 @@ async def db_id() -> str:
     async with _db_lock:
         if _db_id:
             return _db_id
+        found = None
         if c.NOTION_DATABASE_ID:
             try:
-                await _call("GET", f"/databases/{c.NOTION_DATABASE_ID}")
-                _db_id = c.NOTION_DATABASE_ID
-                return _db_id
+                found = await _call("GET", f"/databases/{c.NOTION_DATABASE_ID}")
             except NotionError as e:
                 if e.status != 404:
                     raise
-        for db in await _search("database", DB_TITLE):
-            if _plain(db["title"]) == DB_TITLE:
-                _db_id = db["id"]
-                return _db_id
+        if not found:
+            found = next((db for db in await _search("database", DB_TITLE) if _plain(db["title"]) == DB_TITLE), None)
+        if found:
+            missing = {name: SCHEMA[name] for name in ADDED_LATER if name not in found["properties"]}
+            if missing:
+                await _call("PATCH", f"/databases/{found['id']}", {"properties": missing})
+            _db_id = found["id"]
+            return _db_id
         pages = [p for p in await _search("page") if p["parent"]["type"] in ("workspace", "page_id")]
         if not pages:
             raise RuntimeError(
@@ -153,11 +169,6 @@ async def _append(block_id: str, blocks: list[dict]) -> None:
         await _call("PATCH", f"/blocks/{block_id}/children", {"children": blocks[i : i + 100]})
 
 
-def _today_start() -> str:
-    tz = ZoneInfo(c.TIMEZONE)
-    return datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-
-
 def _item(p: dict) -> dict:
     project = p["properties"][c.P_PROJECT]["select"]
     return {
@@ -165,7 +176,7 @@ def _item(p: dict) -> dict:
         "title": _title(p),
         "url": p["url"],
         "project": project["name"] if project else None,
-        "done": (p["properties"][c.P_STATUS]["select"] or {}).get("name") == c.STATUS_DONE,
+        "type": ((p["properties"].get(c.P_TYPE) or {}).get("select") or {}).get("name"),
     }
 
 
@@ -176,15 +187,16 @@ async def page_project(page_id: str) -> str | None:
 
 
 async def review_items() -> list[dict]:
-    """Для вечернего разбора: все заметки за сегодня (и разобранные, и нет) плюс неразобранное с прошлых дней. Старые первыми."""
+    """Для вечернего разбора: все заметки, которым ещё не выбран тип (проект может уже стоять). Старые первыми.
+    Заметки со статусом «Разобрано» из времён до типов тоже считаются разобранными."""
     data = await _call(
         "POST",
         f"/databases/{await db_id()}/query",
         {
             "filter": {
-                "or": [
-                    {"property": c.P_STATUS, "select": {"equals": c.STATUS_NEW}},
-                    {"timestamp": "created_time", "created_time": {"on_or_after": _today_start()}},
+                "and": [
+                    {"property": c.P_TYPE, "select": {"is_empty": True}},
+                    {"property": c.P_STATUS, "select": {"does_not_equal": c.STATUS_DONE}},
                 ]
             },
             "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
@@ -282,10 +294,21 @@ async def preview(page_id: str, limit: int = 600) -> str:
 
 
 async def file_to_project(page_id: str, project: str) -> None:
+    """Только проект: из разбора заметка уходит, когда ей выбран тип."""
+    await _call("PATCH", f"/pages/{page_id}", {"properties": {c.P_PROJECT: {"select": {"name": project}}}})
+
+
+async def types() -> list[str]:
+    db = await _call("GET", f"/databases/{await db_id()}")
+    return [o["name"] for o in db["properties"][c.P_TYPE]["select"]["options"]]
+
+
+async def set_type(page_id: str, type_name: str) -> None:
+    """Тип выбран — заметка разобрана."""
     await _call(
         "PATCH",
         f"/pages/{page_id}",
-        {"properties": {c.P_PROJECT: {"select": {"name": project}}, c.P_STATUS: {"select": {"name": c.STATUS_DONE}}}},
+        {"properties": {c.P_TYPE: {"select": {"name": type_name}}, c.P_STATUS: {"select": {"name": c.STATUS_DONE}}}},
     )
 
 

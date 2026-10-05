@@ -231,46 +231,50 @@ async def on_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------- вечерний разбор ----------
-# Все заметки за сегодня (и уже отправленные в проект) + неразобранное с прошлых дней.
-# callback_data: r:<номер>  |  p:<page_id>:<проект>:<номер>  |  d:<page_id>:<номер>  |  v:<page_id>
+# В разборе все заметки без типа. Тип выбран — заметка разобрана и больше в разбор не попадает.
+# Проект можно поставить раньше (кнопкой под заметкой или здесь), он сам по себе из разбора не убирает.
+# callback_data: r:<номер>  |  t:<page_id>:<тип>:<номер>  |  pj:<page_id>:<номер> (раскрыть проекты)
+#                p:<page_id>:<проект>:<номер>  |  d:<page_id>:<номер>  |  v:<page_id>
 
 
-async def _review_view(k: int) -> tuple[str, InlineKeyboardMarkup | None]:
+async def _review_view(k: int, show_projects: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
     items = await notion.review_items()
     if not items:
-        return "🎉 Сегодня заметок нет, и всё старое разобрано!", None
+        return "🎉 Всё разобрано!", None
     if k >= len(items):
-        left = sum(not i["project"] for i in items)
-        tail = f"Без проекта осталось: {left}." if left else "Всё разложено по проектам ✨"
-        return f"Это все заметки за сегодня. {tail}", InlineKeyboardMarkup([[Btn("↩️ Сначала", callback_data="r:0")]])
+        return f"Остальное пропущено. В разборе ещё: {len(items)}.", InlineKeyboardMarkup(
+            [[Btn("↩️ Сначала", callback_data="r:0")]]
+        )
     k = max(k, 0)
     item = items[k]
-    projects = await notion.projects()
     body = await notion.preview(item["id"])
     where = f"📁 {escape(item['project'])} ✓" if item["project"] else "📭 Без проекта"
     text = (
         f"<b>Заметка {k + 1} из {len(items)}</b> · {where}\n\n"
         f'<a href="{item["url"]}">{escape(item["title"])}</a>\n\n{escape(body)}\n\n'
-        + ("Перенести в другой проект?" if item["project"] else "Куда отправить?")
     )
-    buttons = [
-        Btn(f"📁 {p} ✓" if p == item["project"] else f"📁 {p}", callback_data=f"p:{item['id']}:{i}:{k}")
-        for i, p in enumerate(projects)
-    ]
+    if show_projects:
+        projects = await notion.projects()
+        text += "В какой проект?"
+        buttons = [
+            Btn(f"📁 {p} ✓" if p == item["project"] else f"📁 {p}", callback_data=f"p:{item['id']}:{i}:{k}")
+            for i, p in enumerate(projects)
+        ]
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([Btn("↩️ Назад", callback_data=f"r:{k}")])
+        return text, InlineKeyboardMarkup(rows)
+
+    text += "Что это?"
+    buttons = [Btn(t, callback_data=f"t:{item['id']}:{i}:{k}") for i, t in enumerate(await notion.types())]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-    rows.append([Btn("👁 Показать целиком", callback_data=f"v:{item['id']}")])
-    nav = [Btn("🗑 Удалить", callback_data=f"d:{item['id']}:{k}")]
+    project_label = f"📁 {item['project']} ✓" if item["project"] else "📁 В проект"
+    rows.append([Btn(project_label, callback_data=f"pj:{item['id']}:{k}"), Btn("👁 Целиком", callback_data=f"v:{item['id']}")])
+    nav = [Btn("🗑", callback_data=f"d:{item['id']}:{k}")]
     if k > 0:
         nav.append(Btn("◀️", callback_data=f"r:{k - 1}"))
-    nav.append(Btn("⏭ Дальше", callback_data=f"r:{k + 1}"))
+    nav.append(Btn("⏭ Позже", callback_data=f"r:{k + 1}"))
     rows.append(nav)
     return text, InlineKeyboardMarkup(rows)
-
-
-async def _next_after(page_id: str, k: int) -> int:
-    """После решения по заметке идём к следующей. Сегодняшняя заметка остаётся в списке, старая из него уходит."""
-    ids = [i["id"] for i in await notion.review_items()]
-    return ids.index(page_id) + 1 if page_id in ids else k
 
 
 async def show_note(message: Message, page_id: str) -> None:
@@ -370,8 +374,21 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer()
         return
     action, *args = q.data.split(":")
+    show_projects = False
     try:
-        if action == "p":
+        if action == "t":
+            page_id, idx, k = args[0], int(args[1]), int(args[2])
+            names = await notion.types()
+            if idx >= len(names):
+                await q.answer("Список типов изменился, попробуйте ещё раз")
+            else:
+                await notion.set_type(page_id, names[idx])
+                await q.answer(f"{names[idx]} ✓")
+        elif action == "pj":
+            page_id, k = args[0], int(args[1])
+            show_projects = True
+            await q.answer()
+        elif action == "p":
             page_id, idx, k = args[0], int(args[1]), int(args[2])
             projects = await notion.projects()
             if idx >= len(projects):
@@ -379,7 +396,6 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 await notion.file_to_project(page_id, projects[idx])
                 await q.answer(f"→ {projects[idx]}")
-                k = await _next_after(page_id, k)
         elif action == "d":
             page_id, k = args[0], int(args[1])
             await notion.trash(page_id)
@@ -391,7 +407,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             k = int(args[0])
             await q.answer()
-        text, kb = await _review_view(k)
+        text, kb = await _review_view(k, show_projects)
     except Exception as e:
         log.exception("button failed")
         await q.answer(f"Ошибка: {e}"[:200], show_alert=True)
@@ -476,7 +492,7 @@ def main() -> None:
     app.add_handler(CommandHandler("remindlink", remindlink, filters=owner))
     app.add_handler(CommandHandler("projects", projects_cmd, filters=owner))
     app.add_handler(CommandHandler("addproject", addproject, filters=owner))
-    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^[rpdv]:"))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|pj|p|d|v):"))
     app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^n[px]?:"))
     app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^p[akl]"))
     app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, on_text))

@@ -23,8 +23,7 @@ async def send(bot: Bot, force: bool = False) -> str:
         _last_sent = today
     if not items:
         return "Разбирать нечего"
-    loose = sum(not i["project"] for i in items)
-    text = f"🌙 Вечерний разбор: заметок {len(items)}" + (f", без проекта {loose}" if loose else ", все уже в проектах")
+    text = f"🌙 Вечерний разбор: заметок без категории {len(items)}"
     await bot.send_message(
         c.OWNER_ID, text, reply_markup=InlineKeyboardMarkup([[Btn("Разобрать", callback_data="r:0")]])
     )

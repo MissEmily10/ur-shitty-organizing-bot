@@ -27,9 +27,6 @@ ASR_MODEL = env("ASR_MODEL", "openai/whisper-large-v3")
 WEBHOOK_BASE = env("WEBHOOK_URL") or env("RENDER_EXTERNAL_URL")
 PORT = int(env("PORT", "8080"))
 
-# Часовой пояс: от него зависит, что считается «сегодня» в вечернем разборе
-TIMEZONE = env("TIMEZONE", "Europe/Moscow")
-
 
 
 def secret(purpose: str) -> str:
@@ -43,5 +40,6 @@ P_STATUS = "Статус"
 P_PROJECT = "Проект"
 P_SOURCE = "Источник"
 P_TAGS = "Теги"
+P_TYPE = "Тип"
 STATUS_NEW = "Неразобрано"
 STATUS_DONE = "Разобрано"
