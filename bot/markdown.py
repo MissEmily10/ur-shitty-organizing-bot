@@ -34,3 +34,8 @@ def to_blocks(md: str) -> list[dict]:
         else:
             blocks.append(_block("paragraph", line))
     return blocks
+
+
+def toggle(title: str, children: list[dict]) -> dict:
+    """Свёрнутый блок. Notion принимает не больше 100 вложенных блоков за раз, остальное дописывает create_idea."""
+    return {"object": "block", "type": "toggle", "toggle": {"rich_text": _rich(title), "children": children[:100]}}

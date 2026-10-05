@@ -43,9 +43,9 @@ async def _save(update: Update, source: str, *, text: str = "", image: bytes | N
                 raise
             # ИИ недоступен: текст всё равно не теряем, кладём как есть
             log.exception("AI failed, saving raw text")
-            idea = ai.Idea(title=text.splitlines()[0][:60], markdown=text)
+            idea = ai.Idea(title=text.splitlines()[0][:60], summary=text)
             note = f"\n\n⚠️ Сохранено без обработки ИИ: {escape(str(e)[:500])}"
-        url = await notion.create_idea(idea.title, source, idea.tags, to_blocks(idea.markdown))
+        url = await notion.create_idea(idea.title, source, idea.tags, to_blocks(idea.summary), to_blocks(idea.details))
     except Exception as e:
         log.exception("save failed")
         await status.edit_text(f"❌ Не получилось сохранить: {e}"[:4000])

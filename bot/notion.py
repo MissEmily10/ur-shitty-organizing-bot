@@ -3,9 +3,11 @@ import asyncio
 import httpx
 
 from . import config as c
+from .markdown import toggle
 
 API = "https://api.notion.com/v1"
 DB_TITLE = "Входящие идеи"
+DETAILS_TITLE = "📝 Полный текст и детали"
 
 
 class NotionError(RuntimeError):
@@ -102,7 +104,8 @@ def _title(page: dict) -> str:
     return _plain(page["properties"][c.P_TITLE]["title"]) or "Без названия"
 
 
-async def create_idea(title: str, source: str, tags: list[str], blocks: list[dict]) -> str:
+async def create_idea(title: str, source: str, tags: list[str], blocks: list[dict], details: list[dict]) -> str:
+    """blocks видны сразу, details прячутся в свёрнутый блок «Полный текст и детали»."""
     props = {
         c.P_TITLE: {"title": [{"text": {"content": title[:200]}}]},
         c.P_STATUS: {"select": {"name": c.STATUS_NEW}},
@@ -114,9 +117,16 @@ async def create_idea(title: str, source: str, tags: list[str], blocks: list[dic
         "/pages",
         {"parent": {"database_id": await db_id()}, "properties": props, "children": blocks[:100]},
     )
-    for i in range(100, len(blocks), 100):
-        await _call("PATCH", f"/blocks/{page['id']}/children", {"children": blocks[i : i + 100]})
+    await _append(page["id"], blocks[100:])
+    if details:
+        added = await _call("PATCH", f"/blocks/{page['id']}/children", {"children": [toggle(DETAILS_TITLE, details)]})
+        await _append(added["results"][-1]["id"], details[100:])
     return page["url"]
+
+
+async def _append(block_id: str, blocks: list[dict]) -> None:
+    for i in range(0, len(blocks), 100):
+        await _call("PATCH", f"/blocks/{block_id}/children", {"children": blocks[i : i + 100]})
 
 
 async def unsorted() -> list[dict]:
@@ -143,7 +153,7 @@ async def preview(page_id: str, limit: int = 600) -> str:
     data = await _call("GET", f"/blocks/{page_id}/children?page_size=30")
     lines = []
     for b in data["results"]:
-        rich = b.get(b["type"], {}).get("rich_text")
+        rich = b["type"] != "toggle" and b.get(b["type"], {}).get("rich_text")
         if rich:
             text = "".join(r["plain_text"] for r in rich)
             lines.append(f"• {text}" if "list_item" in b["type"] or b["type"] == "to_do" else text)
