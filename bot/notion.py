@@ -1,8 +1,17 @@
+import asyncio
+
 import httpx
 
 from . import config as c
 
 API = "https://api.notion.com/v1"
+DB_TITLE = "Входящие идеи"
+
+
+class NotionError(RuntimeError):
+    def __init__(self, status: int, text: str):
+        super().__init__(f"Notion {status}: {text[:300]}")
+        self.status = status
 
 
 async def _call(method: str, path: str, json: dict | None = None) -> dict:
@@ -13,13 +22,84 @@ async def _call(method: str, path: str, json: dict | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.request(method, f"{API}{path}", headers=headers, json=json)
     if r.is_error:
-        raise RuntimeError(f"Notion {r.status_code}: {r.text[:300]}")
+        raise NotionError(r.status_code, r.text)
     return r.json()
 
 
+# ---------- поиск или создание таблицы ----------
+
+SCHEMA = {
+    c.P_TITLE: {"title": {}},
+    c.P_STATUS: {"select": {"options": [{"name": c.STATUS_NEW, "color": "red"}, {"name": c.STATUS_DONE, "color": "green"}]}},
+    c.P_PROJECT: {"select": {"options": [{"name": "Пример проекта", "color": "blue"}]}},
+    c.P_SOURCE: {
+        "select": {
+            "options": [{"name": "Текст", "color": "gray"}, {"name": "Фото", "color": "orange"}, {"name": "Голос", "color": "purple"}]
+        }
+    },
+    c.P_TAGS: {
+        "multi_select": {
+            "options": [{"name": "идея", "color": "yellow"}, {"name": "задача", "color": "pink"}, {"name": "дизайн", "color": "blue"}]
+        }
+    },
+    "Создано": {"created_time": {}},
+}
+
+_db_id: str | None = None
+_db_lock = asyncio.Lock()
+
+
+def _plain(rich: list[dict]) -> str:
+    return "".join(r["plain_text"] for r in rich)
+
+
+async def _search(kind: str, query: str = "") -> list[dict]:
+    body = {"filter": {"property": "object", "value": kind}, "page_size": 50}
+    if query:
+        body["query"] = query
+    return [r for r in (await _call("POST", "/search", body))["results"] if not r.get("archived")]
+
+
+async def db_id() -> str:
+    """ID таблицы: из NOTION_DATABASE_ID, иначе ищем «Входящие идеи» среди доступного интеграции,
+    иначе создаём таблицу на первой странице, к которой подключена интеграция."""
+    global _db_id
+    async with _db_lock:
+        if _db_id:
+            return _db_id
+        if c.NOTION_DATABASE_ID:
+            try:
+                await _call("GET", f"/databases/{c.NOTION_DATABASE_ID}")
+                _db_id = c.NOTION_DATABASE_ID
+                return _db_id
+            except NotionError as e:
+                if e.status != 404:
+                    raise
+        for db in await _search("database", DB_TITLE):
+            if _plain(db["title"]) == DB_TITLE:
+                _db_id = db["id"]
+                return _db_id
+        pages = [p for p in await _search("page") if p["parent"]["type"] in ("workspace", "page_id")]
+        if not pages:
+            raise RuntimeError(
+                "Интеграция Notion не видит ни одной страницы. "
+                "Откройте нужную страницу → ••• → Connections → подключите интеграцию."
+            )
+        db = await _call(
+            "POST",
+            "/databases",
+            {
+                "parent": {"type": "page_id", "page_id": pages[0]["id"]},
+                "title": [{"type": "text", "text": {"content": DB_TITLE}}],
+                "properties": SCHEMA,
+            },
+        )
+        _db_id = db["id"]
+        return _db_id
+
+
 def _title(page: dict) -> str:
-    parts = page["properties"][c.P_TITLE]["title"]
-    return "".join(p["plain_text"] for p in parts) or "Без названия"
+    return _plain(page["properties"][c.P_TITLE]["title"]) or "Без названия"
 
 
 async def create_idea(title: str, source: str, tags: list[str], blocks: list[dict]) -> str:
@@ -32,7 +112,7 @@ async def create_idea(title: str, source: str, tags: list[str], blocks: list[dic
     page = await _call(
         "POST",
         "/pages",
-        {"parent": {"database_id": c.NOTION_DATABASE_ID}, "properties": props, "children": blocks[:100]},
+        {"parent": {"database_id": await db_id()}, "properties": props, "children": blocks[:100]},
     )
     for i in range(100, len(blocks), 100):
         await _call("PATCH", f"/blocks/{page['id']}/children", {"children": blocks[i : i + 100]})
@@ -43,7 +123,7 @@ async def unsorted() -> list[dict]:
     """Неразобранные идеи, старые первыми."""
     data = await _call(
         "POST",
-        f"/databases/{c.NOTION_DATABASE_ID}/query",
+        f"/databases/{await db_id()}/query",
         {
             "filter": {"property": c.P_STATUS, "select": {"equals": c.STATUS_NEW}},
             "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
@@ -55,7 +135,7 @@ async def unsorted() -> list[dict]:
 
 async def projects() -> list[str]:
     """Проекты = варианты поля «Проект». Добавили вариант в Notion — появилась кнопка в боте."""
-    db = await _call("GET", f"/databases/{c.NOTION_DATABASE_ID}")
+    db = await _call("GET", f"/databases/{await db_id()}")
     return [o["name"] for o in db["properties"][c.P_PROJECT]["select"]["options"]]
 
 

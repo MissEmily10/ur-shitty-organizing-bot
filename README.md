@@ -33,9 +33,9 @@
 ### 2. Notion
 1. [notion.so/profile/integrations](https://www.notion.so/profile/integrations) → **New integration** → тип *Internal* → сохранить.
 2. Скопируйте *Internal Integration Secret*. Это `NOTION_TOKEN`.
-3. Откройте страницу **«Организатор мыслей»** → `•••` → **Connections** → добавьте свою интеграцию. Без этого шага бот не увидит таблицу.
+3. Создайте обычную страницу (например, «Бот») → `•••` → **Connections** → подключите свою интеграцию.
 
-`NOTION_DATABASE_ID` уже прописан: `253fac34a9674889b6e4035acc27828d`.
+Таблицу «Входящие идеи» бот при первом сообщении найдёт сам, а если её нет, создаст на этой странице. `NOTION_DATABASE_ID` указывать не нужно, переменная оставлена только для ручного выбора таблицы.
 
 ### 3. Render (сам бот)
 1. [dashboard.render.com](https://dashboard.render.com) → **New → Blueprint** → подключите этот репозиторий.
@@ -44,8 +44,8 @@
 4. Впишите ID в `OWNER_ID` (Render → сервис → Environment) и сохраните, сервис перезапустится. Теперь бот слушается только вас.
 
 ### 4. GitHub (вечерний пуш)
-Репозиторий → Settings → Secrets and variables → Actions → **New repository secret**, четыре штуки:
-`TELEGRAM_TOKEN`, `OWNER_ID`, `NOTION_TOKEN`, `NOTION_DATABASE_ID`.
+Репозиторий → Settings → Secrets and variables → Actions → **New repository secret**, три штуки:
+`TELEGRAM_TOKEN`, `OWNER_ID`, `NOTION_TOKEN`.
 
 Проверить сразу: вкладка Actions → «Вечерний пуш» → **Run workflow**.
 Время меняется в `remind.yml`. Cron там в UTC: 20:00 МСК = `0 17 * * *`.

@@ -9,7 +9,7 @@ from . import notion
 
 
 async def main() -> None:
-    c.require("TELEGRAM_TOKEN", "OWNER_ID", "NOTION_TOKEN", "NOTION_DATABASE_ID")
+    c.require("TELEGRAM_TOKEN", "OWNER_ID", "NOTION_TOKEN")
     count = len(await notion.unsorted())
     if not count:
         print("Неразобранного нет, пуш не нужен")

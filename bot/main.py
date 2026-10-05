@@ -144,7 +144,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    c.require("TELEGRAM_TOKEN", "HF_TOKEN", "NOTION_TOKEN", "NOTION_DATABASE_ID")
+    c.require("TELEGRAM_TOKEN", "HF_TOKEN", "NOTION_TOKEN")
     app = Application.builder().token(c.TELEGRAM_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("razbor", razbor, filters=owner))
