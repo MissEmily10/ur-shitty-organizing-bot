@@ -143,10 +143,40 @@ async def unsorted() -> list[dict]:
     return [{"id": p["id"].replace("-", ""), "title": _title(p), "url": p["url"]} for p in data["results"]]
 
 
-async def projects() -> list[str]:
-    """Проекты = варианты поля «Проект». Добавили вариант в Notion — появилась кнопка в боте."""
+async def _project_options() -> list[dict]:
     db = await _call("GET", f"/databases/{await db_id()}")
-    return [o["name"] for o in db["properties"][c.P_PROJECT]["select"]["options"]]
+    return db["properties"][c.P_PROJECT]["select"]["options"]
+
+
+async def _set_project_options(options: list[dict]) -> None:
+    # Notion заменяет список вариантов целиком: существующие передаём с их id, иначе они удалятся
+    await _call("PATCH", f"/databases/{await db_id()}", {"properties": {c.P_PROJECT: {"select": {"options": options}}}})
+
+
+async def projects() -> list[str]:
+    """Проекты = варианты поля «Проект». Добавили вариант в Notion или через /addproject — появилась кнопка в боте."""
+    return [o["name"] for o in await _project_options()]
+
+
+async def add_projects(names: list[str]) -> list[str]:
+    """Добавляет новые проекты, возвращает те, которых ещё не было."""
+    options = await _project_options()
+    taken = {o["name"].lower() for o in options}
+    new = []
+    for name in names:
+        if name.lower() not in taken:
+            taken.add(name.lower())
+            new.append(name)
+    if new:
+        keep = [{"id": o["id"], "name": o["name"], "color": o["color"]} for o in options]
+        await _set_project_options(keep + [{"name": n} for n in new])
+    return new
+
+
+async def delete_project(name: str) -> None:
+    options = await _project_options()
+    keep = [{"id": o["id"], "name": o["name"], "color": o["color"]} for o in options if o["name"] != name]
+    await _set_project_options(keep)
 
 
 async def preview(page_id: str, limit: int = 600) -> str:
