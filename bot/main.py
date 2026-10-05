@@ -5,7 +5,7 @@ from html import escape
 
 from telegram import InlineKeyboardButton as Btn
 from aiohttp import web
-from telegram import InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -20,6 +20,30 @@ log = logging.getLogger("bot")
 owner = filters.User(user_id=c.OWNER_ID)
 
 
+# ---------- меню ----------
+
+MENU = (
+    "Я складываю твои мысли в Notion.\n\n"
+    "✍️ Просто пиши, присылай фото блокнота или голосовые: всё, что не начинается с «/», становится заметкой.\n\n"
+    "<b>Команды</b>\n"
+    "/razbor — разобрать входящие\n"
+    "/projects — список проектов и удаление\n"
+    "/addproject Название — добавить проект (несколько через запятую)\n"
+    "/remindlink — ссылка для вечернего напоминания\n"
+    "/start — это меню\n\n"
+    "Или жми кнопку 👇"
+)
+MENU_KB = InlineKeyboardMarkup(
+    [
+        [Btn("🗂 Разобрать входящие", callback_data="m:razbor")],
+        [Btn("📁 Проекты", callback_data="m:projects"), Btn("➕ Добавить проект", callback_data="m:add")],
+        [Btn("🔔 Ссылка напоминания", callback_data="m:remind")],
+    ]
+)
+# Ответ на это сообщение бота — названия проектов, а не заметка
+ADD_PROMPT = "Напишите названия проектов ответом на это сообщение: через запятую или каждый с новой строки."
+
+
 # ---------- приём заметок ----------
 
 
@@ -28,24 +52,44 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if uid != c.OWNER_ID:
         await update.message.reply_text(f"Ваш Telegram ID: {uid}\nВпишите его в переменную OWNER_ID и перезапустите бота.")
         return
-    await update.message.reply_text(
-        "Присылайте текст, фото блокнота или голосовое — я разложу всё в Notion.\n"
-        "/razbor — разобрать входящие прямо сейчас.\n"
-        "/projects — проекты, /addproject Название — добавить проект.\n"
-        "/remindlink — ссылка для вечернего напоминания."
-    )
+    await update.message.reply_text(MENU, reply_markup=MENU_KB, parse_mode=ParseMode.HTML)
 
 
-async def remindlink(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    if not c.WEBHOOK_BASE:
-        await update.message.reply_text("Ссылка появится, когда бот запущен на хостинге (Render).")
+async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != c.OWNER_ID:
         return
+    action = q.data.removeprefix("m:")
+    try:
+        if action == "razbor":
+            text, kb = await _review_view(0)
+            await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        elif action == "projects":
+            text, kb = await _projects_view()
+            await q.message.reply_text(text, reply_markup=kb)
+        elif action == "add":
+            await q.message.reply_text(ADD_PROMPT, reply_markup=ForceReply(input_field_placeholder="Сайт, Логотипы, Фоны"))
+        elif action == "remind":
+            await q.message.reply_text(_remind_text())
+    except Exception as e:
+        log.exception("menu failed")
+        await q.message.reply_text(f"❌ Ошибка: {e}"[:4000])
+
+
+def _remind_text() -> str:
+    if not c.WEBHOOK_BASE:
+        return "Ссылка появится, когда бот запущен на хостинге (Render)."
     url = f"{c.WEBHOOK_BASE.rstrip('/')}/remind/{c.secret('remind')}"
-    await update.message.reply_text(
+    return (
         f"Ссылка для cron-job.org:\n{url}\n\n"
         f"Проверить прямо сейчас (пуш придёт, даже если сегодня уже был):\n{url}?force=1\n\n"
         "Никому её не показывайте."
     )
+
+
+async def remindlink(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(_remind_text())
 
 
 async def _save(update: Update, source: str, *, text: str = "", image: bytes | None = None) -> None:
@@ -71,7 +115,11 @@ async def _save(update: Update, source: str, *, text: str = "", image: bytes | N
     )
 
 
-async def on_text(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    reply = update.message.reply_to_message
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
+        await update.message.reply_text(await _add_projects_text(update.message.text))
+        return
     await _save(update, "Текст", text=update.message.text)
 
 
@@ -141,19 +189,22 @@ async def projects_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, reply_markup=kb)
 
 
-async def addproject(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    raw = re.sub(r"^/addproject(@\w+)?", "", update.message.text, count=1)
+async def _add_projects_text(raw: str) -> str:
     # Проекты разделяются переносом строки или запятой (запятую Notion в названии всё равно не разрешает)
     names = [n.strip()[:100] for n in re.split(r"[\n,]", raw) if n.strip()]
     if not names:
-        await update.message.reply_text("Напишите название после команды, например:\n/addproject Сайт-портфолио")
-        return
+        return "Напишите название после команды, например:\n/addproject Сайт-портфолио"
     added = await notion.add_projects(names)
     skipped = [n for n in names if n not in added]
     text = ("✅ Добавлено: " + ", ".join(added)) if added else "Ничего нового не добавлено."
     if skipped:
         text += "\nУже были: " + ", ".join(skipped)
-    await update.message.reply_text(text + "\n\n/projects — список проектов")
+    return text + "\n\n/projects — список проектов"
+
+
+async def addproject(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = re.sub(r"^/addproject(@\w+)?", "", update.message.text, count=1)
+    await update.message.reply_text(await _add_projects_text(raw))
 
 
 async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -227,6 +278,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- запуск ----------
 
 COMMANDS = [
+    ("start", "Меню всех команд"),
     ("razbor", "Разобрать входящие"),
     ("projects", "Список проектов"),
     ("addproject", "Добавить проект: /addproject Название"),
@@ -294,7 +346,8 @@ def main() -> None:
     if c.WEBHOOK_BASE:
         builder = builder.updater(None)  # обновления приходят в наш сервер, встроенный не нужен
     app = builder.build()
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler(["start", "help"], start))
+    app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
     app.add_handler(CommandHandler("razbor", razbor, filters=owner))
     app.add_handler(CommandHandler("remindlink", remindlink, filters=owner))
     app.add_handler(CommandHandler("projects", projects_cmd, filters=owner))
