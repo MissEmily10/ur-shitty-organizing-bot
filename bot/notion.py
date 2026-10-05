@@ -1,4 +1,6 @@
 import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -126,7 +128,7 @@ def image_block(upload_id: str) -> dict:
     return {"object": "block", "type": "image", "image": {"type": "file_upload", "file_upload": {"id": upload_id}}}
 
 
-async def create_idea(title: str, source: str, tags: list[str], blocks: list[dict], details: list[dict]) -> str:
+async def create_idea(title: str, source: str, tags: list[str], blocks: list[dict], details: list[dict]) -> tuple[str, str]:
     """blocks видны сразу (сюда же идут картинки-оригиналы), details прячутся в свёрнутый блок «Полный текст и детали»."""
     props = {
         c.P_TITLE: {"title": [{"text": {"content": title[:200]}}]},
@@ -143,7 +145,7 @@ async def create_idea(title: str, source: str, tags: list[str], blocks: list[dic
     if details:
         added = await _call("PATCH", f"/blocks/{page['id']}/children", {"children": [toggle(DETAILS_TITLE, details)]})
         await _append(added["results"][-1]["id"], details[100:])
-    return page["url"]
+    return page["id"].replace("-", ""), page["url"]
 
 
 async def _append(block_id: str, blocks: list[dict]) -> None:
@@ -151,18 +153,84 @@ async def _append(block_id: str, blocks: list[dict]) -> None:
         await _call("PATCH", f"/blocks/{block_id}/children", {"children": blocks[i : i + 100]})
 
 
-async def unsorted() -> list[dict]:
-    """Неразобранные идеи, старые первыми."""
+def _today_start() -> str:
+    tz = ZoneInfo(c.TIMEZONE)
+    return datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def _item(p: dict) -> dict:
+    project = p["properties"][c.P_PROJECT]["select"]
+    return {
+        "id": p["id"].replace("-", ""),
+        "title": _title(p),
+        "url": p["url"],
+        "project": project["name"] if project else None,
+        "done": (p["properties"][c.P_STATUS]["select"] or {}).get("name") == c.STATUS_DONE,
+    }
+
+
+async def page_project(page_id: str) -> str | None:
+    page = await _call("GET", f"/pages/{page_id}")
+    project = page["properties"][c.P_PROJECT]["select"]
+    return project["name"] if project else None
+
+
+async def review_items() -> list[dict]:
+    """Для вечернего разбора: все заметки за сегодня (и разобранные, и нет) плюс неразобранное с прошлых дней. Старые первыми."""
     data = await _call(
         "POST",
         f"/databases/{await db_id()}/query",
         {
-            "filter": {"property": c.P_STATUS, "select": {"equals": c.STATUS_NEW}},
+            "filter": {
+                "or": [
+                    {"property": c.P_STATUS, "select": {"equals": c.STATUS_NEW}},
+                    {"timestamp": "created_time", "created_time": {"on_or_after": _today_start()}},
+                ]
+            },
             "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
             "page_size": 100,
         },
     )
-    return [{"id": p["id"].replace("-", ""), "title": _title(p), "url": p["url"]} for p in data["results"]]
+    return [_item(p) for p in data["results"]]
+
+
+async def _children(block_id: str) -> list[dict]:
+    blocks, cursor = [], None
+    while True:
+        query = f"?page_size=100" + (f"&start_cursor={cursor}" if cursor else "")
+        data = await _call("GET", f"/blocks/{block_id}/children{query}")
+        blocks += data["results"]
+        if not data.get("has_more"):
+            return blocks
+        cursor = data["next_cursor"]
+
+
+def _block_text(b: dict) -> str | None:
+    rich = b.get(b["type"], {}).get("rich_text")
+    if rich is None:
+        return None
+    text = _plain(rich)
+    if b["type"] in ("bulleted_list_item", "numbered_list_item"):
+        return f"• {text}"
+    if b["type"] == "to_do":
+        return ("☑ " if b["to_do"].get("checked") else "☐ ") + text
+    if b["type"].startswith("heading_"):
+        return f"\n{text}"
+    return text
+
+
+async def read_note(page_id: str) -> dict:
+    """Заметка целиком: суть, подробности из свёрнутого блока, ссылки на оригиналы фото."""
+    summary, details, images = [], [], []
+    for b in await _children(page_id):
+        if b["type"] == "image":
+            image = b["image"]
+            images.append(image.get(image["type"], {}).get("url"))
+        elif b["type"] == "toggle" and _plain(b["toggle"]["rich_text"]) == DETAILS_TITLE:
+            details = [t for t in map(_block_text, await _children(b["id"])) if t is not None]
+        elif (text := _block_text(b)) is not None:
+            summary.append(text)
+    return {"summary": "\n".join(summary).strip(), "details": "\n".join(details).strip(), "images": [u for u in images if u]}
 
 
 async def _project_options() -> list[dict]:

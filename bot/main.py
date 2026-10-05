@@ -119,14 +119,60 @@ async def _save(update: Update, source: str, *, text: str = "", images: list[byt
                 log.exception("image upload failed")
                 note = f"\n\n⚠️ Фото {i} не прикрепилось к Notion: {escape(str(e)[:300])}"
         blocks = to_blocks(idea.summary) + originals
-        url = await notion.create_idea(idea.title, source, idea.tags, blocks, to_blocks(idea.details))
+        page_id, url = await notion.create_idea(idea.title, source, idea.tags, blocks, to_blocks(idea.details))
     except Exception as e:
         log.exception("save failed")
         await status.edit_text(f"❌ Не получилось сохранить: {e}"[:4000])
         return
     await status.edit_text(
-        f'✅ <a href="{url}">{escape(idea.title)}</a>{note}', parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        f'✅ <b>{escape(idea.title)}</b>\n📄 <a href="{url}">Заметка — тут</a>{note}',
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=_panel(page_id),
     )
+
+
+# ---------- кнопка «В проект» под заметкой ----------
+# callback_data: n:<page_id> (показать проекты)  |  np:<page_id>:<проект>  |  nx:<page_id> (свернуть)
+
+
+def _panel(page_id: str, project: str | None = None) -> InlineKeyboardMarkup:
+    label = f"📁 {project} ✓" if project else "📁 В проект"
+    return InlineKeyboardMarkup([[Btn(label, callback_data=f"n:{page_id}")]])
+
+
+async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if q.from_user.id != c.OWNER_ID:
+        await q.answer()
+        return
+    action, page_id, *rest = q.data.split(":")
+    try:
+        if action == "n":
+            projects = await notion.projects()
+            if not projects:
+                await q.answer("Проектов пока нет: /addproject", show_alert=True)
+                return
+            buttons = [Btn(f"📁 {p}", callback_data=f"np:{page_id}:{i}") for i, p in enumerate(projects)]
+            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+            rows.append([Btn("✖️ Свернуть", callback_data=f"nx:{page_id}")])
+            await q.answer()
+            await q.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+        elif action == "np":
+            projects = await notion.projects()
+            idx = int(rest[0])
+            if idx >= len(projects):
+                await q.answer("Список проектов изменился, попробуйте ещё раз")
+                return
+            await notion.file_to_project(page_id, projects[idx])
+            await q.answer(f"→ {projects[idx]}")
+            await q.edit_message_reply_markup(_panel(page_id, projects[idx]))
+        else:
+            await q.answer()
+            await q.edit_message_reply_markup(_panel(page_id, await notion.page_project(page_id)))
+    except Exception as e:
+        log.exception("panel failed")
+        await q.answer(f"Ошибка: {e}"[:200], show_alert=True)
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -185,29 +231,60 @@ async def on_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------- вечерний разбор ----------
-# callback_data: r:<номер>  |  p:<page_id>:<проект>:<номер>  |  d:<page_id>:<номер>
+# Все заметки за сегодня (и уже отправленные в проект) + неразобранное с прошлых дней.
+# callback_data: r:<номер>  |  p:<page_id>:<проект>:<номер>  |  d:<page_id>:<номер>  |  v:<page_id>
 
 
 async def _review_view(k: int) -> tuple[str, InlineKeyboardMarkup | None]:
-    items = await notion.unsorted()
+    items = await notion.review_items()
     if not items:
-        return "🎉 Всё разобрано!", None
+        return "🎉 Сегодня заметок нет, и всё старое разобрано!", None
     if k >= len(items):
-        return f"Остальное пропущено. Неразобранных: {len(items)}.", InlineKeyboardMarkup(
-            [[Btn("↩️ Начать сначала", callback_data="r:0")]]
-        )
+        left = sum(not i["project"] for i in items)
+        tail = f"Без проекта осталось: {left}." if left else "Всё разложено по проектам ✨"
+        return f"Это все заметки за сегодня. {tail}", InlineKeyboardMarkup([[Btn("↩️ Сначала", callback_data="r:0")]])
+    k = max(k, 0)
     item = items[k]
     projects = await notion.projects()
     body = await notion.preview(item["id"])
+    where = f"📁 {escape(item['project'])} ✓" if item["project"] else "📭 Без проекта"
     text = (
-        f"<b>Идея {k + 1} из {len(items)}</b>\n\n"
+        f"<b>Заметка {k + 1} из {len(items)}</b> · {where}\n\n"
         f'<a href="{item["url"]}">{escape(item["title"])}</a>\n\n{escape(body)}\n\n'
-        "Куда отправить?"
+        + ("Перенести в другой проект?" if item["project"] else "Куда отправить?")
     )
-    buttons = [Btn(f"📁 {p}", callback_data=f"p:{item['id']}:{i}:{k}") for i, p in enumerate(projects)]
+    buttons = [
+        Btn(f"📁 {p} ✓" if p == item["project"] else f"📁 {p}", callback_data=f"p:{item['id']}:{i}:{k}")
+        for i, p in enumerate(projects)
+    ]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-    rows.append([Btn("🗑 Удалить", callback_data=f"d:{item['id']}:{k}"), Btn("⏭ Позже", callback_data=f"r:{k + 1}")])
+    rows.append([Btn("👁 Показать целиком", callback_data=f"v:{item['id']}")])
+    nav = [Btn("🗑 Удалить", callback_data=f"d:{item['id']}:{k}")]
+    if k > 0:
+        nav.append(Btn("◀️", callback_data=f"r:{k - 1}"))
+    nav.append(Btn("⏭ Дальше", callback_data=f"r:{k + 1}"))
+    rows.append(nav)
     return text, InlineKeyboardMarkup(rows)
+
+
+async def _next_after(page_id: str, k: int) -> int:
+    """После решения по заметке идём к следующей. Сегодняшняя заметка остаётся в списке, старая из него уходит."""
+    ids = [i["id"] for i in await notion.review_items()]
+    return ids.index(page_id) + 1 if page_id in ids else k
+
+
+async def show_note(message: Message, page_id: str) -> None:
+    """👁 Заметка целиком прямо в чате, без захода в Notion."""
+    note = await notion.read_note(page_id)
+    parts = [p for p in (note["summary"], note["details"] and f"📝 Полный текст и детали\n\n{note['details']}") if p]
+    text = "\n\n".join(parts) or "Заметка пустая."
+    for i in range(0, len(text), 4000):  # лимит Telegram на одно сообщение
+        await message.reply_text(text[i : i + 4000])
+    for url in note["images"][:10]:
+        try:
+            await message.reply_photo(url)
+        except Exception:
+            log.exception("send photo failed")
 
 
 # ---------- проекты ----------
@@ -302,10 +379,15 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 await notion.file_to_project(page_id, projects[idx])
                 await q.answer(f"→ {projects[idx]}")
+                k = await _next_after(page_id, k)
         elif action == "d":
             page_id, k = args[0], int(args[1])
             await notion.trash(page_id)
             await q.answer("Удалено (можно восстановить из корзины Notion)")
+        elif action == "v":
+            await q.answer()
+            await show_note(q.message, args[0])
+            return
         else:
             k = int(args[0])
             await q.answer()
@@ -394,7 +476,8 @@ def main() -> None:
     app.add_handler(CommandHandler("remindlink", remindlink, filters=owner))
     app.add_handler(CommandHandler("projects", projects_cmd, filters=owner))
     app.add_handler(CommandHandler("addproject", addproject, filters=owner))
-    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^[rpd]:"))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^[rpdv]:"))
+    app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^n[px]?:"))
     app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^p[akl]"))
     app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(owner & (filters.PHOTO | filters.Document.IMAGE), on_photo))

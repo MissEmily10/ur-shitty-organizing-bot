@@ -2,3 +2,4 @@ python-telegram-bot==21.*
 aiohttp>=3.9,<4
 huggingface_hub>=0.30,<3
 httpx>=0.27
+tzdata>=2024.1

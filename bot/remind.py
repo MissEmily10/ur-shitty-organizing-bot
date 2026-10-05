@@ -1,4 +1,4 @@
-"""Вечерний пуш «У тебя есть неразобранное». Его дёргает cron-job.org по секретной ссылке /remind/<секрет>."""
+"""Вечерний пуш с приглашением в разбор. Его дёргает cron-job.org по секретной ссылке /remind/<секрет>."""
 
 from datetime import datetime, timezone
 
@@ -18,14 +18,14 @@ async def send(bot: Bot, force: bool = False) -> str:
     today = datetime.now(timezone.utc).date()
     if _last_sent == today and not force:
         return "Сегодня уже проверяли"
-    count = len(await notion.unsorted())
+    items = await notion.review_items()
     if not force:  # ручная проверка не должна отменять вечерний пуш
         _last_sent = today
-    if not count:
-        return "Неразобранного нет"
+    if not items:
+        return "Разбирать нечего"
+    loose = sum(not i["project"] for i in items)
+    text = f"🌙 Вечерний разбор: заметок {len(items)}" + (f", без проекта {loose}" if loose else ", все уже в проектах")
     await bot.send_message(
-        c.OWNER_ID,
-        f"🌙 У тебя есть неразобранное: {count}",
-        reply_markup=InlineKeyboardMarkup([[Btn("Разобрать", callback_data="r:0")]]),
+        c.OWNER_ID, text, reply_markup=InlineKeyboardMarkup([[Btn("Разобрать", callback_data="r:0")]])
     )
-    return f"Пуш отправлен, неразобранных: {count}"
+    return f"Пуш отправлен: {text}"
