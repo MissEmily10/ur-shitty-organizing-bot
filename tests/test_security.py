@@ -70,7 +70,7 @@ async def run():
 
     # участница жмёт кнопки владелицы
     before = len(h.sent)
-    for data in ["mr:77", "mk:77", "mi:x", "pa:0", "pk:0", "m:members", "m:invite", "m:remind"]:
+    for data in ["mr:77", "mk:77", "mi:x", "pa:0", "pk:0", "m:members", "m:invite"]:
         await app.process_update(h.callback(data, user=ANYA))
     assert 77 in main.member.user_ids
     leaked = [d for e, d in h.sent[before:] if e == "sendMessage" and ("remind/" in d.get("text", "") or "Участники" in d.get("text", ""))]

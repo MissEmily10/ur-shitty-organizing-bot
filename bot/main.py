@@ -81,7 +81,7 @@ MENU = (
     "Или жми кнопку 👇"
 )
 OWNER_COMMANDS = (
-    "/invite — пригласить участника\n/members — участники и приглашения\n/remindlink — ссылка для вечернего напоминания\n"
+    "/invite — пригласить участника\n/members — участники и приглашения\n"
 )
 
 
@@ -93,7 +93,6 @@ def menu(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     ]
     if is_owner(uid):
         rows.append([Btn("👥 Участники", callback_data="m:members"), Btn("🎟 Пригласить", callback_data="m:invite")])
-        rows.append([Btn("🔔 Ссылка напоминания", callback_data="m:remind")])
     return MENU.format(owner_commands=OWNER_COMMANDS if is_owner(uid) else ""), InlineKeyboardMarkup(rows)
 # Ответ на это сообщение бота — названия проектов, а не заметка
 ADD_PROMPT = "Напишите названия проектов ответом на это сообщение: через запятую или каждый с новой строки."
@@ -291,8 +290,6 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await q.message.reply_text(text, reply_markup=kb)
         elif action == "add":
             await _ask_project_names(q.message)
-        elif action == "remind" and is_owner(uid):
-            await q.message.reply_text(_remind_text())
         elif action == "members" and is_owner(uid):
             text, kb = await _members_view()
             await q.message.reply_text(text, reply_markup=kb)
@@ -308,21 +305,6 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _ask_project_names(message) -> None:
     await message.reply_text(ADD_PROMPT, reply_markup=ForceReply(input_field_placeholder="Сайт, Логотипы, Фоны"))
-
-
-def _remind_text() -> str:
-    if not c.WEBHOOK_BASE:
-        return "Ссылка появится, когда бот запущен на хостинге (Render)."
-    url = f"{c.WEBHOOK_BASE.rstrip('/')}/remind/{c.secret('remind')}"
-    return (
-        f"Ссылка для cron-job.org:\n{url}\n\n"
-        f"Проверить прямо сейчас (пуш придёт, даже если сегодня уже был):\n{url}?force=1\n\n"
-        "Никому её не показывайте."
-    )
-
-
-async def remindlink(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(_remind_text())
 
 
 async def note_allowed(update: Update) -> bool:
@@ -1255,7 +1237,6 @@ COMMANDS = [
 OWNER_EXTRA = [
     ("invite", "Пригласить участника"),
     ("members", "Участники и приглашения"),
-    ("remindlink", "Ссылка для вечернего напоминания"),
 ]
 
 
@@ -1371,7 +1352,6 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("projects", projects_cmd, filters=member))
     app.add_handler(CommandHandler("ask", ask_cmd, filters=member))
     app.add_handler(CommandHandler("addproject", addproject, filters=member))
-    app.add_handler(CommandHandler("remindlink", remindlink, filters=owner))
     app.add_handler(CommandHandler("invite", invite_cmd, filters=owner))
     app.add_handler(CommandHandler("members", members_cmd, filters=owner))
     app.add_handler(CallbackQueryHandler(on_member_button, pattern=r"^m[rkil]"))
