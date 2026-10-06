@@ -26,13 +26,21 @@ def _message(text: str, **extra) -> dict:
     return {"message_id": next(_ids), "date": 0, "chat": CHAT, "from": BOT_USER, "text": text, **extra}
 
 
+def _message_for(data: dict) -> dict:
+    chat_id = int(data.get("chat_id") or CHAT["id"])
+    return _message(data.get("text", ""), chat={"id": chat_id, "type": "private"})
+
+
 async def _fake_post(self, endpoint, data=None, *args, **kwargs):
     data = {k: (json.loads(v) if isinstance(v, str) and v[:1] in "[{" else v) for k, v in (data or {}).items()}
     sent.append((endpoint, data))
     if endpoint == "getMe":
         return BOT_USER
     if endpoint in ("sendMessage", "editMessageText"):
-        return _message(data.get("text", ""), **({"message_id": data["message_id"]} if "message_id" in data else {}))
+        msg = _message_for(data)
+        if "message_id" in data:
+            msg["message_id"] = data["message_id"]
+        return msg
     if endpoint == "editMessageReplyMarkup":
         return _message("", message_id=data.get("message_id", next(_ids)))
     return True
@@ -51,20 +59,32 @@ async def make_app():
     return APP
 
 
-def callback(data: str, message_text: str = "карточка") -> Update:
-    msg = _message(message_text)
+def callback(data: str, message_text: str = "карточка", user: dict | None = None) -> Update:
+    user = user or OWNER
+    msg = _message(message_text, chat={"id": user["id"], "type": "private"})
     return Update.de_json(
-        {"update_id": next(_ids), "callback_query": {"id": str(next(_ids)), "from": OWNER, "chat_instance": "c", "data": data, "message": msg}},
+        {"update_id": next(_ids), "callback_query": {"id": str(next(_ids)), "from": user, "chat_instance": "c", "data": data, "message": msg}},
         APP.bot,
     )
 
 
-def text(value: str, reply_to: dict | None = None) -> Update:
-    msg = {"message_id": next(_ids), "date": 0, "chat": CHAT, "from": OWNER, "text": value}
+def person(uid: int, name: str, username: str | None = None) -> dict:
+    return {"id": uid, "is_bot": False, "first_name": name, **({"username": username} if username else {})}
+
+
+def text(value: str, reply_to: dict | None = None, user: dict | None = None) -> Update:
+    user = user or OWNER
+    chat = {"id": user["id"], "type": "private"}
+    entities = [{"type": "bot_command", "offset": 0, "length": len(value.split()[0])}] if value.startswith("/") else []
+    msg = {"message_id": next(_ids), "date": 0, "chat": chat, "from": user, "text": value, "entities": entities}
     if reply_to:
         msg["reply_to_message"] = reply_to
     return Update.de_json({"update_id": next(_ids), "message": msg}, APP.bot)
 
 
-def texts(endpoint: str | None = None) -> list[str]:
-    return [d.get("text", "") for e, d in sent if endpoint in (None, e) and "text" in d]
+def texts(endpoint: str | None = None, chat: int | None = None) -> list[str]:
+    return [
+        d.get("text", "")
+        for e, d in sent
+        if endpoint in (None, e) and "text" in d and (chat is None or int(d.get("chat_id", 0) or 0) == chat)
+    ]

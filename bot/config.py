@@ -27,6 +27,11 @@ ASR_MODEL = env("ASR_MODEL", "openai/whisper-large-v3")
 WEBHOOK_BASE = env("WEBHOOK_URL") or env("RENDER_EXTERNAL_URL")
 PORT = int(env("PORT", "8080"))
 
+# Командный режим. ИИ работает на токене владелицы, поэтому у участников дневные лимиты (на владелицу не действуют).
+MEMBER_DAILY_LIMIT = int(env("MEMBER_DAILY_LIMIT", "30"))  # заметок в день
+MEMBER_AI_LIMIT = int(env("MEMBER_AI_LIMIT", "20"))  # запросов к ИИ в день: 🤖, ✨ раскрытие, /ask
+INVITE_DAYS = int(env("INVITE_DAYS", "7"))  # сколько дней действует код приглашения
+
 
 
 def secret(purpose: str) -> str:
@@ -41,5 +46,7 @@ P_PROJECT = "Проект"
 P_SOURCE = "Источник"
 P_TAGS = "Теги"
 P_TYPE = "Тип"
+P_AUTHOR = "Автор"
+P_AUTHOR_ID = "Автор ID"
 STATUS_NEW = "Неразобрано"
 STATUS_DONE = "Разобрано"

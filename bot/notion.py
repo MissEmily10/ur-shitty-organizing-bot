@@ -68,10 +68,24 @@ SCHEMA = {
             ]
         }
     },
+    c.P_AUTHOR: {"select": {}},
+    c.P_AUTHOR_ID: {"number": {}},
     "Создано": {"created_time": {}},
 }
 
+MEMBERS_TITLE = "Участники бота"
+# Одна строка — один человек. Пока Telegram ID пуст, а Код заполнен, это неиспользованное приглашение.
+MEMBERS_SCHEMA = {
+    "Имя": {"title": {}},
+    "Telegram ID": {"number": {}},
+    "Username": {"rich_text": {}},
+    "Код": {"rich_text": {}},
+    "Код до": {"date": {}},
+    "Добавлен": {"created_time": {}},
+}
+
 _db_id: str | None = None
+_members_db_id: str | None = None
 _db_lock = asyncio.Lock()
 
 
@@ -168,7 +182,9 @@ def image_block(upload_id: str) -> dict:
     return file_block(upload_id, "image")
 
 
-async def create_idea(title: str, source: str, tags: list[str], blocks: list[dict], details: list[dict]) -> tuple[str, str]:
+async def create_idea(
+    title: str, source: str, tags: list[str], blocks: list[dict], details: list[dict], author_id: int = 0, author: str = ""
+) -> tuple[str, str]:
     """blocks видны сразу (сюда же идут картинки-оригиналы), details прячутся в свёрнутый блок «Полный текст и детали»."""
     props = {
         c.P_TITLE: {"title": [{"text": {"content": title[:200]}}]},
@@ -176,6 +192,9 @@ async def create_idea(title: str, source: str, tags: list[str], blocks: list[dic
         c.P_SOURCE: {"select": {"name": source}},
         c.P_TAGS: {"multi_select": [{"name": t} for t in tags]},
     }
+    if author_id:
+        props[c.P_AUTHOR_ID] = {"number": author_id}
+        props[c.P_AUTHOR] = {"select": {"name": (author or str(author_id)).replace(",", " ")[:100]}}
     body = {"properties": props, "children": blocks[:100]}
     try:
         page = await _call("POST", "/pages", {"parent": {"database_id": await db_id()}, **body})
@@ -214,8 +233,16 @@ async def page_project(page_id: str) -> str | None:
     return _select(await _call("GET", f"/pages/{page_id}"), c.P_PROJECT)
 
 
-async def review_items() -> list[dict]:
-    """Для вечернего разбора: все заметки, которым ещё не выбран тип (проект может уже стоять). Старые первыми.
+def _by_author(user_id: int) -> dict:
+    """Заметки человека. Заметки, сохранённые до командного режима (без автора), принадлежат владелице."""
+    mine = {"property": c.P_AUTHOR_ID, "number": {"equals": user_id}}
+    if user_id != c.OWNER_ID:
+        return mine
+    return {"or": [mine, {"property": c.P_AUTHOR_ID, "number": {"is_empty": True}}]}
+
+
+async def review_items(user_id: int) -> list[dict]:
+    """Для вечернего разбора: заметки человека, которым ещё не выбран тип (проект может уже стоять). Старые первыми.
     Заметки со статусом «Разобрано» из времён до типов тоже считаются разобранными."""
     data = await _call(
         "POST",
@@ -225,6 +252,7 @@ async def review_items() -> list[dict]:
                 "and": [
                     {"property": c.P_TYPE, "select": {"is_empty": True}},
                     {"property": c.P_STATUS, "select": {"does_not_equal": c.STATUS_DONE}},
+                    _by_author(user_id),
                 ]
             },
             "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
@@ -359,13 +387,13 @@ async def download(url: str) -> bytes:
         return r.content
 
 
-async def project_titles(project: str, exclude: str, limit: int = 15) -> list[str]:
-    """Названия других заметок проекта: контекст для ИИ, пока у проекта нет своей страницы с описанием."""
+async def project_titles(project: str, exclude: str, user_id: int, limit: int = 15) -> list[str]:
+    """Названия других своих заметок проекта: контекст для ИИ, пока у проекта нет своей страницы с описанием."""
     data = await _call(
         "POST",
         f"/databases/{await db_id()}/query",
         {
-            "filter": {"property": c.P_PROJECT, "select": {"equals": project}},
+            "filter": {"and": [{"property": c.P_PROJECT, "select": {"equals": project}}, _by_author(user_id)]},
             "sorts": [{"timestamp": "created_time", "direction": "descending"}],
             "page_size": limit + 1,
         },
@@ -379,13 +407,14 @@ async def add_expansion(page_id: str, type_name: str, blocks: list[dict]) -> Non
     await _append(page_id, [heading] + blocks)
 
 
-async def notes_in_scope(project: str | None = None, days: int | None = None, limit: int = 150) -> list[dict]:
-    """Заметки проекта или за последние N дней, новые первыми (не больше limit)."""
+async def notes_in_scope(user_id: int, project: str | None = None, days: int | None = None, limit: int = 150) -> list[dict]:
+    """Свои заметки проекта или за последние N дней, новые первыми (не больше limit)."""
     if project:
-        flt = {"property": c.P_PROJECT, "select": {"equals": project}}
+        scope = {"property": c.P_PROJECT, "select": {"equals": project}}
     else:
         since = (datetime.now(timezone.utc) - timedelta(days=days or 7)).isoformat()
-        flt = {"timestamp": "created_time", "created_time": {"on_or_after": since}}
+        scope = {"timestamp": "created_time", "created_time": {"on_or_after": since}}
+    flt = {"and": [scope, _by_author(user_id)]}
     notes, cursor = [], None
     while len(notes) < limit:
         body = {"filter": flt, "sorts": [{"timestamp": "created_time", "direction": "descending"}], "page_size": 100}
@@ -398,3 +427,143 @@ async def notes_in_scope(project: str | None = None, days: int | None = None, li
             break
         cursor = data["next_cursor"]
     return notes[:limit]
+
+
+async def created_today(user_id: int) -> int:
+    """Сколько заметок человек сохранил за последние сутки: для дневного лимита участников."""
+    since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    data = await _call(
+        "POST",
+        f"/databases/{await db_id()}/query",
+        {
+            "filter": {
+                "and": [
+                    {"property": c.P_AUTHOR_ID, "number": {"equals": user_id}},
+                    {"timestamp": "created_time", "created_time": {"on_or_after": since}},
+                ]
+            },
+            "page_size": 100,
+        },
+    )
+    return len(data["results"])
+
+
+# ---------- участники и приглашения ----------
+
+
+async def members_db_id() -> str:
+    """Таблица «Участники бота»: ищем, иначе создаём рядом с «Входящими идеями». Пропавшие колонки возвращаем."""
+    global _members_db_id
+    if _members_db_id:
+        return _members_db_id
+    ideas = await _call("GET", f"/databases/{await db_id()}")
+    found = next((d for d in await _search("database", MEMBERS_TITLE) if _plain(d["title"]) == MEMBERS_TITLE), None)
+    if found:
+        missing = {n: spec for n, spec in MEMBERS_SCHEMA.items() if n not in found["properties"] and "title" not in spec}
+        if missing:
+            await _call("PATCH", f"/databases/{found['id']}", {"properties": missing})
+        _members_db_id = found["id"]
+    else:
+        parent = ideas["parent"].get("page_id") or await _first_shared_page()
+        db = await _call(
+            "POST",
+            "/databases",
+            {
+                "parent": {"type": "page_id", "page_id": parent},
+                "title": [{"type": "text", "text": {"content": MEMBERS_TITLE}}],
+                "properties": MEMBERS_SCHEMA,
+            },
+        )
+        _members_db_id = db["id"]
+    return _members_db_id
+
+
+async def _first_shared_page() -> str:
+    pages = [p for p in await _search("page") if p["parent"]["type"] in ("workspace", "page_id")]
+    if not pages:
+        raise RuntimeError("Интеграция Notion не видит ни одной страницы.")
+    return pages[0]["id"]
+
+
+def _text_prop(page: dict, name: str) -> str:
+    return _plain((page["properties"].get(name) or {}).get("rich_text") or [])
+
+
+def _person(p: dict) -> dict:
+    props = p["properties"]
+    until = ((props.get("Код до") or {}).get("date") or {}).get("start")
+    return {
+        "page": p["id"],
+        "tg": int((props.get("Telegram ID") or {}).get("number") or 0),
+        "name": _plain((props.get("Имя") or {}).get("title") or []) or "Без имени",
+        "username": _text_prop(p, "Username"),
+        "code": _text_prop(p, "Код"),
+        "until": until,
+    }
+
+
+async def _people() -> list[dict]:
+    data = await _call("POST", f"/databases/{await members_db_id()}/query", {"page_size": 100})
+    return [_person(p) for p in data["results"]]
+
+
+async def members() -> list[dict]:
+    """Участники, которые уже вошли по коду."""
+    return [p for p in await _people() if p["tg"]]
+
+
+def _expired(until: str | None) -> bool:
+    return bool(until) and datetime.fromisoformat(until.replace("Z", "+00:00")) < datetime.now(timezone.utc)
+
+
+async def invites() -> list[dict]:
+    """Неиспользованные и не просроченные приглашения."""
+    return [p for p in await _people() if not p["tg"] and p["code"] and not _expired(p["until"])]
+
+
+async def create_invite(label: str, code: str, days: int) -> str:
+    until = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    await _call(
+        "POST",
+        "/pages",
+        {
+            "parent": {"database_id": await members_db_id()},
+            "properties": {
+                "Имя": {"title": [{"text": {"content": label[:200]}}]},
+                "Код": {"rich_text": [{"text": {"content": code}}]},
+                "Код до": {"date": {"start": until}},
+            },
+        },
+    )
+    return until
+
+
+async def redeem(code: str, tg: int, name: str, username: str | None) -> dict | None:
+    """Код верный и не просрочен — привязываем человека к строке и сжигаем код. Возвращает участника или None."""
+    data = await _call(
+        "POST",
+        f"/databases/{await members_db_id()}/query",
+        {"filter": {"property": "Код", "rich_text": {"equals": code}}, "page_size": 5},
+    )
+    for p in map(_person, data["results"]):
+        if p["tg"] or _expired(p["until"]):
+            continue
+        who = f"@{username} · {name}" if username else name
+        await _call(
+            "PATCH",
+            f"/pages/{p['page']}",
+            {
+                "properties": {
+                    "Telegram ID": {"number": tg},
+                    "Username": {"rich_text": [{"text": {"content": who[:200]}}]},
+                    "Код": {"rich_text": []},
+                }
+            },
+        )
+        return {**p, "tg": tg, "code": ""}
+    return None
+
+
+async def remove_person(page_id: str) -> None:
+    """Убрать участника или отозвать приглашение. Заметки человека остаются в «Входящих идеях»."""
+    await trash(page_id)

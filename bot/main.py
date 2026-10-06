@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import re
+import secrets
+from datetime import datetime, timedelta, timezone
 from html import escape
 
 from telegram import InlineKeyboardButton as Btn
 from aiohttp import web
-from telegram import ForceReply, InlineKeyboardMarkup, Message, Update
+from telegram import BotCommandScopeChat, ForceReply, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -19,62 +21,251 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 owner = filters.User(user_id=c.OWNER_ID)
+# Владелица + участники, вошедшие по коду приглашения. Список подгружается из Notion при запуске
+# и меняется на лету, когда кто-то входит по коду или его убирают.
+member = filters.User(user_id=c.OWNER_ID)
+
+
+def is_owner(uid: int) -> bool:
+    return uid == c.OWNER_ID
+
+
+def is_member(uid: int) -> bool:
+    return uid in member.user_ids
 
 
 # ---------- меню ----------
 
 MENU = (
     "Я складываю твои мысли в Notion.\n\n"
-    "✍️ Просто пиши, присылай фото блокнота или голосовые: всё, что не начинается с «/», становится заметкой.\n\n"
+    "✍️ Просто пиши, присылай фото блокнота, голосовые или документы: всё, что не начинается с «/», становится заметкой.\n\n"
     "<b>Команды</b>\n"
-    "/razbor — разобрать входящие\n"
-    "/projects — список проектов и удаление\n"
+    "/razbor — разобрать свои входящие\n"
+    "/projects — список проектов\n"
     "/addproject — добавить проект (бот спросит название)\n"
-    "/ask — спросить ИИ по проекту или по всем заметкам за период\n"
-    "/remindlink — ссылка для вечернего напоминания\n"
+    "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
+    "{owner_commands}"
     "/start — это меню\n\n"
     "Или жми кнопку 👇"
 )
-MENU_KB = InlineKeyboardMarkup(
-    [
+OWNER_COMMANDS = (
+    "/invite — пригласить участника\n/members — участники и приглашения\n/remindlink — ссылка для вечернего напоминания\n"
+)
+
+
+def menu(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows = [
         [Btn("🗂 Разобрать входящие", callback_data="m:razbor")],
         [Btn("📁 Проекты", callback_data="m:projects"), Btn("➕ Добавить проект", callback_data="m:add")],
         [Btn("🔎 Спросить по заметкам", callback_data="m:ask")],
-        [Btn("🔔 Ссылка напоминания", callback_data="m:remind")],
     ]
-)
+    if is_owner(uid):
+        rows.append([Btn("👥 Участники", callback_data="m:members"), Btn("🎟 Пригласить", callback_data="m:invite")])
+        rows.append([Btn("🔔 Ссылка напоминания", callback_data="m:remind")])
+    return MENU.format(owner_commands=OWNER_COMMANDS if is_owner(uid) else ""), InlineKeyboardMarkup(rows)
 # Ответ на это сообщение бота — названия проектов, а не заметка
 ADD_PROMPT = "Напишите названия проектов ответом на это сообщение: через запятую или каждый с новой строки."
+
+
+# ---------- 🎟 приглашения и участники ----------
+# Владелица создаёт приглашение (/invite) → бот выдаёт одноразовый код и ссылку. Новый человек открывает ссылку
+# или присылает код → получает доступ. Чужие без кода видят только просьбу ввести код, владелице ничего не приходит.
+# callback_data: mr:<tg> (спросить про удаление участника)  |  mk:<tg> (удалить)  |  mi:<page> (отозвать код)  |  ml
+
+INVITE_PROMPT = "🎟 Для кого приглашение? Напишите имя или подпись ответом на это сообщение, например «Аня, дизайнер»."
+CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # без похожих O/0 и I/1
+CODE_RE = re.compile(r"^[A-Z0-9]{4}-?[A-Z0-9]{4}$")
+# Защита от подбора: не больше 5 неверных кодов в час с одного аккаунта
+_bad_codes: dict[int, list[datetime]] = {}
+
+
+def _new_code() -> str:
+    raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def _normalize_code(text: str) -> str | None:
+    code = text.strip().upper().replace(" ", "")
+    if not CODE_RE.match(code):
+        return None
+    return code if "-" in code else f"{code[:4]}-{code[4:]}"
+
+
+async def stranger(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сообщение от человека без доступа: если похоже на код — пробуем его, иначе просим код."""
+    if not update.message:
+        return
+    code = _normalize_code(update.message.text or "")
+    if code:
+        await _try_code(update, ctx, code)
+        return
+    await update.message.reply_text(
+        "Это закрытый бот для заметок. Если у вас есть код приглашения, пришлите его сюда (вида ABCD-2345)."
+    )
+
+
+async def _try_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE, raw: str) -> None:
+    user = update.effective_user
+    now = datetime.now(timezone.utc)
+    recent = [t for t in _bad_codes.get(user.id, []) if now - t < timedelta(hours=1)]
+    if len(recent) >= 5:
+        await update.message.reply_text("Слишком много неверных кодов. Попробуйте через час.")
+        return
+    code = _normalize_code(raw)
+    person = await notion.redeem(code, user.id, user.full_name, user.username) if code else None
+    if not person:
+        _bad_codes[user.id] = recent + [now]
+        await update.message.reply_text("Код не подошёл: он неверный, уже использован или просрочен. Попросите новый.")
+        return
+    member.add_user_ids(user.id)
+    text, kb = menu(user.id)
+    await update.message.reply_text("✅ Добро пожаловать!\n\n" + text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    who = f"@{user.username}" if user.username else user.full_name
+    await ctx.bot.send_message(c.OWNER_ID, f"🎉 {person['name']} ({who}) вошёл(ла) по приглашению. Участники: /members")
+
+
+async def _ask_invite_label(message: Message) -> None:
+    await message.reply_text(INVITE_PROMPT, reply_markup=ForceReply(input_field_placeholder="Аня, дизайнер"))
+
+
+async def _create_invite(message: Message, ctx: ContextTypes.DEFAULT_TYPE, label: str) -> None:
+    label = label.strip()[:100] or "Без подписи"
+    code = _new_code()
+    until = await notion.create_invite(label, code, c.INVITE_DAYS)
+    until_text = datetime.fromisoformat(until).strftime("%d.%m")
+    link = f"https://t.me/{ctx.bot.username}?start={code}"
+    await message.reply_text(
+        f"🎟 Приглашение для «{escape(label)}»\n"
+        f"Код: <code>{code}</code> · действует до {until_text}, одноразовый\n\n"
+        "Перешлите человеку сообщение ниже 👇",
+        parse_mode=ParseMode.HTML,
+    )
+    await message.reply_text(
+        f"Привет! Приглашаю тебя в мой бот для заметок.\n\nОткрой ссылку: {link}\n"
+        f"или напиши боту @{ctx.bot.username} код {code}\n\nКод одноразовый, действует до {until_text}.",
+        disable_web_page_preview=True,
+    )
+
+
+async def invite_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    label = re.sub(r"^/invite(@\w+)?", "", update.message.text, count=1)
+    if label.strip():
+        await _create_invite(update.message, ctx, label)
+    else:
+        await _ask_invite_label(update.message)
+
+
+async def _members_view() -> tuple[str, InlineKeyboardMarkup | None]:
+    people, pending = await notion.members(), await notion.invites()
+    lines, rows = [], []
+    if people:
+        lines.append("👥 Участники:")
+        for m in people:
+            lines.append(f"• {m['name']}" + (f" ({m['username']})" if m["username"] else ""))
+            rows.append([Btn(f"🗑 Убрать {m['name']}", callback_data=f"mr:{m['tg']}")])
+    if pending:
+        lines.append("\n🎟 Неиспользованные приглашения:")
+        for inv in pending:
+            until = inv["until"][:10] if inv["until"] else ""
+            lines.append(f"• {inv['name']}: {inv['code']} (до {until})")
+            rows.append([Btn(f"❌ Отозвать код для {inv['name']}", callback_data=f"mi:{inv['page'].replace('-', '')}")])
+    if not lines:
+        lines.append("Пока только вы.")
+    lines.append("\nПригласить: /invite")
+    return "\n".join(lines), InlineKeyboardMarkup(rows) if rows else None
+
+
+async def members_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = await _members_view()
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def on_member_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_owner(q.from_user.id):
+        await q.answer()
+        return
+    action, _, arg = q.data.partition(":")
+    try:
+        if action == "mr":
+            person = next((m for m in await notion.members() if str(m["tg"]) == arg), None)
+            await q.answer()
+            if not person:
+                await q.edit_message_text("Этого участника уже нет.")
+                return
+            await q.edit_message_text(
+                f"Убрать {person['name']} из бота?\nДоступ закроется, его заметки останутся в Notion.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[Btn("Да, убрать", callback_data=f"mk:{arg}"), Btn("Отмена", callback_data="ml")]]
+                ),
+            )
+            return
+        if action == "mk":
+            person = next((m for m in await notion.members() if str(m["tg"]) == arg), None)
+            if person:
+                await notion.remove_person(person["page"])
+            member.remove_user_ids(int(arg))
+            _interviews.pop(int(arg), None)
+            await q.answer("Участник убран")
+            try:
+                await ctx.bot.send_message(int(arg), "Ваш доступ к боту закрыт владелицей.")
+            except Exception:
+                log.info("could not notify removed member")
+        elif action == "mi":
+            await notion.remove_person(arg)
+            await q.answer("Код отозван")
+        else:
+            await q.answer()
+        text, kb = await _members_view()
+    except Exception as e:
+        log.exception("member button failed")
+        await _fail(q, e)
+        return
+    await q.edit_message_text(text, reply_markup=kb)
 
 
 # ---------- приём заметок ----------
 
 
-async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    if uid != c.OWNER_ID:
+    if not c.OWNER_ID:
         await update.message.reply_text(f"Ваш Telegram ID: {uid}\nВпишите его в переменную OWNER_ID и перезапустите бота.")
         return
-    await update.message.reply_text(MENU, reply_markup=MENU_KB, parse_mode=ParseMode.HTML)
+    if not is_member(uid):
+        # Ссылка-приглашение t.me/<бот>?start=<код> приходит сюда с кодом в аргументе
+        if ctx.args:
+            await _try_code(update, ctx, ctx.args[0])
+        else:
+            await stranger(update, ctx)
+        return
+    text, kb = menu(uid)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if q.from_user.id != c.OWNER_ID:
+    uid = q.from_user.id
+    if not is_member(uid):
         return
     action = q.data.removeprefix("m:")
     try:
         if action == "razbor":
-            text, kb = await _review_view(0)
+            text, kb = await _review_view(uid, 0)
             await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         elif action == "projects":
-            text, kb = await _projects_view()
+            text, kb = await _projects_view(uid)
             await q.message.reply_text(text, reply_markup=kb)
         elif action == "add":
             await _ask_project_names(q.message)
-        elif action == "remind":
+        elif action == "remind" and is_owner(uid):
             await q.message.reply_text(_remind_text())
+        elif action == "members" and is_owner(uid):
+            text, kb = await _members_view()
+            await q.message.reply_text(text, reply_markup=kb)
+        elif action == "invite" and is_owner(uid):
+            await _ask_invite_label(q.message)
         elif action == "ask":
             text, kb = await _ask_scope_view()
             await q.message.reply_text(text, reply_markup=kb)
@@ -118,7 +309,11 @@ async def _save(
     if status is None:
         status = await update.message.reply_text("⏳ Обрабатываю…" if len(images) < 2 else f"⏳ Обрабатываю альбом из {len(images)} фото…")
     note = ""
+    user = update.effective_user
     try:
+        if not is_owner(user.id) and await notion.created_today(user.id) >= c.MEMBER_DAILY_LIMIT:
+            await status.edit_text(f"⛔ Лимит {c.MEMBER_DAILY_LIMIT} заметок в сутки исчерпан, продолжим завтра.")
+            return
         try:
             idea = await ai.structure(text=text, images=images)
             if full_text is not None:
@@ -147,7 +342,9 @@ async def _save(
                 log.exception("file upload failed")
                 note = f"\n\n⚠️ Файл не прикрепился к Notion (на бесплатном Notion лимит 5 МБ): {escape(str(e)[:300])}"
         blocks = to_blocks(idea.summary) + originals
-        page_id, url = await notion.create_idea(idea.title, source, idea.tags, blocks, to_blocks(idea.details))
+        page_id, url = await notion.create_idea(
+            idea.title, source, idea.tags, blocks, to_blocks(idea.details), user.id, user.full_name
+        )
     except Exception as e:
         log.exception("save failed")
         await status.edit_text(f"❌ Не получилось сохранить: {e}"[:4000])
@@ -171,7 +368,7 @@ def _panel(page_id: str, project: str | None = None) -> InlineKeyboardMarkup:
 
 async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if q.from_user.id != c.OWNER_ID:
+    if not is_member(q.from_user.id):
         await q.answer()
         return
     action, page_id, *rest = q.data.split(":")
@@ -205,6 +402,10 @@ async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     reply = update.message.reply_to_message
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == INVITE_PROMPT:
+        if is_owner(update.effective_user.id):
+            await _create_invite(update.message, ctx, update.message.text)
+        return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
         await update.message.reply_text(await _add_projects_text(update.message.text))
         return
@@ -322,8 +523,8 @@ async def on_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 #                p:<page_id>:<проект>:<номер>  |  d:<page_id>:<номер>  |  v:<page_id>
 
 
-async def _review_view(k: int, show_projects: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
-    items = await notion.review_items()
+async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
+    items = await notion.review_items(uid)
     if not items:
         return "🎉 Всё разобрано!", None
     if k >= len(items):
@@ -380,6 +581,24 @@ async def show_note(message: Message, page_id: str) -> None:
             await message.reply_photo(url)
         except Exception:
             log.exception("send photo failed")
+
+
+# ---------- лимит запросов к ИИ для участников ----------
+# Считается в памяти: после перезапуска бота счётчик обнуляется. Для защиты кредитов этого хватает.
+_ai_used: dict[tuple[int, str], int] = {}
+
+
+async def ai_allowed(message: Message) -> bool:
+    """В личном чате id чата — это id человека. Владелица без лимита."""
+    uid = message.chat_id
+    if is_owner(uid):
+        return True
+    key = (uid, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    if _ai_used.get(key, 0) >= c.MEMBER_AI_LIMIT:
+        await message.reply_text(f"⛔ Лимит {c.MEMBER_AI_LIMIT} запросов к ИИ на сегодня исчерпан, продолжим завтра.")
+        return False
+    _ai_used[key] = _ai_used.get(key, 0) + 1
+    return True
 
 
 # ---------- 🤖 Спросить ИИ по заметке ----------
@@ -445,6 +664,8 @@ async def start_ai(message: Message, page_id: str) -> None:
 
 async def _ask_ai(message: Message, page_id: str, question: str, history: str = "", label: str = "") -> None:
     label = label or question
+    if not await ai_allowed(message):
+        return
     status = await message.reply_text("🤖 Думаю…")
     try:
         item = await notion.page_info(page_id)
@@ -477,7 +698,7 @@ async def _ask_ai(message: Message, page_id: str, question: str, history: str = 
 async def on_ai_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if q.from_user.id != c.OWNER_ID:
+    if not is_member(q.from_user.id):
         return
     action, page_id, *rest = q.data.split(":")
     if action == "a":
@@ -530,7 +751,7 @@ async def ask_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_scope_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if q.from_user.id != c.OWNER_ID:
+    if not is_member(q.from_user.id):
         return
     _, kind, value = q.data.split(":")
     if kind == "p":
@@ -565,9 +786,13 @@ def _note_text(item: dict, note: dict) -> str:
 async def _ask_notes(message: Message, scope: tuple[str, str | int], question: str, history: str = "") -> None:
     kind, value = scope
     label = _scope_label(scope)
+    if not await ai_allowed(message):
+        return
     status = await message.reply_text(f"📚 Собираю заметки по {label}…")
     try:
-        items = await notion.notes_in_scope(project=value if kind == "p" else None, days=int(value) if kind == "d" else None)
+        items = await notion.notes_in_scope(
+            message.chat_id, project=value if kind == "p" else None, days=int(value) if kind == "d" else None
+        )
         if not items:
             await status.edit_text(f"🤷 По {label} заметок нет.")
             return
@@ -636,6 +861,8 @@ async def _send_html(message: Message, text: str, status: Message | None = None,
 
 
 async def start_interview(message: Message, page_id: str) -> None:
+    if not await ai_allowed(message):
+        return
     status = await message.reply_text("✨ Читаю заметку…")
     try:
         item = await notion.page_info(page_id)
@@ -646,7 +873,7 @@ async def start_interview(message: Message, page_id: str) -> None:
                 images.append(await notion.download(url))
             except Exception:
                 log.exception("image download failed")
-        titles = await notion.project_titles(item["project"], page_id) if item["project"] else []
+        titles = await notion.project_titles(item["project"], page_id, message.chat_id) if item["project"] else []
     except Exception as e:
         log.exception("interview start failed")
         await status.edit_text(f"❌ Не получилось прочитать заметку: {e}"[:4000])
@@ -769,7 +996,7 @@ async def interview_answer(message: Message) -> bool:
 async def on_interview_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    if q.from_user.id != c.OWNER_ID:
+    if not is_member(q.from_user.id):
         return
     action = q.data.removeprefix("xi:")
     state = _interviews.get(q.message.chat_id)
@@ -793,7 +1020,7 @@ async def on_interview_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> N
 
 async def on_expand_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if q.from_user.id != c.OWNER_ID:
+    if not is_member(q.from_user.id):
         await q.answer()
         return
     action, page_id = q.data.split(":")[:2]
@@ -820,17 +1047,20 @@ async def on_expand_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
 # callback_data: pl  |  pa:<номер> (спросить про удаление)  |  pk:<номер> (удалить)
 
 
-async def _projects_view() -> tuple[str, InlineKeyboardMarkup | None]:
+async def _projects_view(uid: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Проекты общие: добавлять могут все, удалять — только владелица."""
     names = await notion.projects()
     hint = "Добавить: /addproject Название (можно несколько, каждый с новой строки)."
     if not names:
         return f"Проектов пока нет.\n\n{hint}", None
-    rows = [[Btn(f"🗑 {n}", callback_data=f"pa:{i}")] for i, n in enumerate(names)]
-    return "Проекты:\n" + "\n".join(f"📁 {n}" for n in names) + f"\n\n{hint}", InlineKeyboardMarkup(rows)
+    text = "Проекты:\n" + "\n".join(f"📁 {n}" for n in names) + f"\n\n{hint}"
+    if not is_owner(uid):
+        return text, None
+    return text, InlineKeyboardMarkup([[Btn(f"🗑 {n}", callback_data=f"pa:{i}")] for i, n in enumerate(names)])
 
 
 async def projects_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    text, kb = await _projects_view()
+    text, kb = await _projects_view(update.effective_user.id)
     await update.message.reply_text(text, reply_markup=kb)
 
 
@@ -880,7 +1110,7 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
             await q.answer(f"Удалено: {names[int(arg)]}")
         else:
             await q.answer()
-        text, kb = await _projects_view()
+        text, kb = await _projects_view(q.from_user.id)
     except Exception as e:
         log.exception("project button failed")
         await _fail(q, e)
@@ -889,13 +1119,13 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def razbor(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    text, kb = await _review_view(0)
+    text, kb = await _review_view(update.effective_user.id, 0)
     await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if q.from_user.id != c.OWNER_ID:
+    if not is_member(q.from_user.id):
         await q.answer()
         return
     action, *args = q.data.split(":")
@@ -951,7 +1181,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             k = int(args[0])
             await q.answer()
-        text, kb = await _review_view(k, show_projects)
+        text, kb = await _review_view(q.from_user.id, k, show_projects)
     except Exception as e:
         log.exception("button failed")
         await _fail(q, e)
@@ -967,13 +1197,24 @@ COMMANDS = [
     ("projects", "Список проектов"),
     ("addproject", "Добавить проект"),
     ("ask", "Спросить ИИ по заметкам"),
+]
+OWNER_EXTRA = [
+    ("invite", "Пригласить участника"),
+    ("members", "Участники и приглашения"),
     ("remindlink", "Ссылка для вечернего напоминания"),
 ]
 
 
 async def set_commands(app: Application) -> None:
-    """Меню «/» в Telegram."""
+    """Меню «/» в Telegram (у владелицы в нём больше команд) и список участников из Notion."""
     await app.bot.set_my_commands(COMMANDS)
+    if c.OWNER_ID:
+        await app.bot.set_my_commands(COMMANDS + OWNER_EXTRA, scope=BotCommandScopeChat(c.OWNER_ID))
+    try:
+        member.add_user_ids([m["tg"] for m in await notion.members()])
+    except Exception:
+        # Без списка участников бот всё равно работает для владелицы
+        log.exception("could not load members")
 
 
 async def serve(app: Application) -> None:
@@ -990,7 +1231,7 @@ async def serve(app: Application) -> None:
         if request.match_info["secret"] != c.secret("remind"):
             return web.Response(status=404)
         try:
-            result = await remind.send(app.bot, force="force" in request.query)
+            result = await remind.send(app.bot, sorted(member.user_ids), force="force" in request.query)
         except Exception as e:
             log.exception("remind failed")
             return web.Response(status=500, text=str(e))
@@ -1045,7 +1286,11 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         elif update.message:
             where = " (сообщение)"
     try:
-        await ctx.bot.send_message(c.OWNER_ID, f"⚠️ Что-то пошло не так{where}: {type(ctx.error).__name__}: {ctx.error}"[:4000])
+        user = update.effective_user if isinstance(update, Update) else None
+        who = f" у {user.full_name}" if user and not is_owner(user.id) else ""
+        await ctx.bot.send_message(c.OWNER_ID, f"⚠️ Что-то пошло не так{who}{where}: {type(ctx.error).__name__}: {ctx.error}"[:4000])
+        if user and not is_owner(user.id) and is_member(user.id):
+            await ctx.bot.send_message(user.id, "⚠️ Что-то пошло не так. Владелица уже получила сообщение об ошибке.")
     except Exception:
         log.exception("could not report error")
 
@@ -1057,12 +1302,17 @@ def build_app(webhook: bool) -> Application:
     app = builder.build()
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
-    app.add_handler(CommandHandler("razbor", razbor, filters=owner))
+    # Люди без доступа: что бы ни прислали, бот просит код приглашения
+    app.add_handler(MessageHandler(~member, stranger))
+    app.add_handler(CommandHandler("razbor", razbor, filters=member))
+    app.add_handler(CommandHandler("projects", projects_cmd, filters=member))
+    app.add_handler(CommandHandler("ask", ask_cmd, filters=member))
+    app.add_handler(CommandHandler("addproject", addproject, filters=member))
     app.add_handler(CommandHandler("remindlink", remindlink, filters=owner))
-    app.add_handler(CommandHandler("projects", projects_cmd, filters=owner))
-    app.add_handler(CommandHandler("ask", ask_cmd, filters=owner))
+    app.add_handler(CommandHandler("invite", invite_cmd, filters=owner))
+    app.add_handler(CommandHandler("members", members_cmd, filters=owner))
+    app.add_handler(CallbackQueryHandler(on_member_button, pattern=r"^m[rkil]"))
     app.add_handler(CallbackQueryHandler(on_scope_button, pattern=r"^q:"))
-    app.add_handler(CommandHandler("addproject", addproject, filters=owner))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|x|pj|p|d|v):"))
     app.add_handler(CallbackQueryHandler(on_expand_button, pattern=r"^x[sc]:"))
     app.add_handler(CallbackQueryHandler(on_interview_button, pattern=r"^xi:"))
@@ -1070,10 +1320,10 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^n[px]?:"))
     app.add_handler(CallbackQueryHandler(on_ai_button, pattern=r"^aq?:"))
     app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^p[akl]"))
-    app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(MessageHandler(owner & (filters.PHOTO | filters.Document.IMAGE), on_photo))
-    app.add_handler(MessageHandler(owner & (filters.VOICE | filters.AUDIO), on_voice))
-    app.add_handler(MessageHandler(owner & filters.Document.ALL & ~filters.Document.IMAGE, on_document))
+    app.add_handler(MessageHandler(member & filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(member & (filters.PHOTO | filters.Document.IMAGE), on_photo))
+    app.add_handler(MessageHandler(member & (filters.VOICE | filters.AUDIO), on_voice))
+    app.add_handler(MessageHandler(member & filters.Document.ALL & ~filters.Document.IMAGE, on_document))
     app.add_error_handler(on_error)
     return app
 

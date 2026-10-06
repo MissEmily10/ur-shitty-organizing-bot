@@ -21,7 +21,7 @@ async def read_note(pid):
     return {"summary": "обсудить бюджет сайта", "details": "", "images": []}
 
 
-async def project_titles(project, exclude):
+async def project_titles(project, exclude, uid=0):
     return ["Hero", "Шрифты"]
 
 
@@ -95,7 +95,7 @@ async def run():
     assert "❌ ИИ не ответил" in last()[0], last()
 
     # необработанная ошибка в любой кнопке доходит до владелицы
-    async def boom():
+    async def boom(*a):
         raise RuntimeError("Notion недоступен")
     notion.review_items = boom
     await app.process_update(h.callback("r:0"))
