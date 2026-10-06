@@ -86,6 +86,7 @@ MEMBERS_SCHEMA = {
 
 _db_id: str | None = None
 _members_db_id: str | None = None
+_service_db_id: str | None = None
 _db_lock = asyncio.Lock()
 
 
@@ -568,3 +569,81 @@ async def redeem(code: str, tg: int, name: str, username: str | None) -> dict | 
 async def remove_person(page_id: str) -> None:
     """Убрать участника или отозвать приглашение. Заметки человека остаются в «Входящих идеях»."""
     await trash(page_id)
+
+
+# ---------- служебная таблица: настройки людей и отметки планировщика ----------
+
+SERVICE_TITLE = "Служебное бота"
+SERVICE_SCHEMA = {"Ключ": {"title": {}}, "Значение": {"rich_text": {}}, "Обновлено": {"last_edited_time": {}}}
+
+
+async def service_db_id() -> str:
+    """«Служебное бота» рядом с «Входящими идеями». Руками её трогать не нужно."""
+    global _service_db_id
+    if _service_db_id:
+        return _service_db_id
+    found = next((d for d in await _search("database", SERVICE_TITLE) if _plain(d["title"]) == SERVICE_TITLE), None)
+    if found:
+        _service_db_id = found["id"]
+    else:
+        ideas = await _call("GET", f"/databases/{await db_id()}")
+        parent = ideas["parent"].get("page_id") or await _first_shared_page()
+        db = await _call(
+            "POST",
+            "/databases",
+            {
+                "parent": {"type": "page_id", "page_id": parent},
+                "title": [{"type": "text", "text": {"content": SERVICE_TITLE}}],
+                "properties": SERVICE_SCHEMA,
+            },
+        )
+        _service_db_id = db["id"]
+    return _service_db_id
+
+
+async def _service_row(key: str) -> dict | None:
+    data = await _call(
+        "POST",
+        f"/databases/{await service_db_id()}/query",
+        {"filter": {"property": "Ключ", "title": {"equals": key}}, "page_size": 1},
+    )
+    return data["results"][0] if data["results"] else None
+
+
+async def get_value(key: str) -> str | None:
+    row = await _service_row(key)
+    return _text_prop(row, "Значение") if row else None
+
+
+async def set_value(key: str, value: str) -> None:
+    row = await _service_row(key)
+    props = {"Значение": {"rich_text": [{"text": {"content": value[:2000]}}]}}
+    if row:
+        await _call("PATCH", f"/pages/{row['id']}", {"properties": props})
+    else:
+        await _call(
+            "POST",
+            "/pages",
+            {"parent": {"database_id": await service_db_id()}, "properties": {"Ключ": {"title": [{"text": {"content": key}}]}, **props}},
+        )
+
+
+async def forget_old_marks(days: int = 14) -> int:
+    """Отметки планировщика старше двух недель больше не нужны: чистим, чтобы таблица не росла."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    data = await _call(
+        "POST",
+        f"/databases/{await service_db_id()}/query",
+        {
+            "filter": {
+                "and": [
+                    {"property": "Ключ", "title": {"starts_with": "done:"}},
+                    {"timestamp": "last_edited_time", "last_edited_time": {"before": since}},
+                ]
+            },
+            "page_size": 100,
+        },
+    )
+    for row in data["results"]:
+        await trash(row["id"])
+    return len(data["results"])

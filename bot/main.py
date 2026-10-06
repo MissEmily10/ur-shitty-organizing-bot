@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, documents, notion, remind
+from . import ai, documents, notion, scheduler
 from . import config as c
 from .markdown import tg_html, to_blocks
 
@@ -76,6 +76,7 @@ MENU = (
     "/projects — список проектов\n"
     "/addproject — добавить проект (бот спросит название)\n"
     "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
+    "/settings — часовой пояс и время вечернего разбора\n"
     "{owner_commands}"
     "/start — это меню\n\n"
     "Или жми кнопку 👇"
@@ -89,7 +90,7 @@ def menu(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     rows = [
         [Btn("🗂 Разобрать входящие", callback_data="m:razbor")],
         [Btn("📁 Проекты", callback_data="m:projects"), Btn("➕ Добавить проект", callback_data="m:add")],
-        [Btn("🔎 Спросить по заметкам", callback_data="m:ask")],
+        [Btn("🔎 Спросить по заметкам", callback_data="m:ask"), Btn("⚙️ Настройки", callback_data="m:settings")],
     ]
     if is_owner(uid):
         rows.append([Btn("👥 Участники", callback_data="m:members"), Btn("🎟 Пригласить", callback_data="m:invite")])
@@ -255,6 +256,111 @@ async def on_member_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await q.edit_message_text(text, reply_markup=kb)
 
 
+# ---------- ⚙️ настройки ----------
+# callback_data: st:tz (выбор пояса)  |  st:tz:<номер>  |  st:ev (выбор времени)  |  st:ev:<ЧЧ:ММ>  |  st:back
+
+TIMEZONES = [
+    ("Калининград", "Europe/Kaliningrad"),
+    ("Москва", "Europe/Moscow"),
+    ("Самара", "Europe/Samara"),
+    ("Екатеринбург", "Asia/Yekaterinburg"),
+    ("Омск", "Asia/Omsk"),
+    ("Новосибирск", "Asia/Novosibirsk"),
+    ("Иркутск", "Asia/Irkutsk"),
+    ("Владивосток", "Asia/Vladivostok"),
+]
+EVENING_TIMES = ["18:00", "19:00", "20:00", "21:00", "22:00", "23:00"]
+TZ_PROMPT = "🌍 Напишите часовой пояс ответом на это сообщение: например «Europe/Berlin», «Asia/Almaty» или «UTC+5»."
+TIME_PROMPT = "🌙 Во сколько присылать вечерний разбор? Напишите время ответом, например «21:30»."
+
+
+def _tz_label(tz: str) -> str:
+    name = next((n for n, z in TIMEZONES if z == tz), tz)
+    offset = scheduler.local_now({"tz": tz}).strftime("%z")
+    return f"{name} (UTC{offset[:3]}{':' + offset[3:] if offset[3:] != '00' else ''})"
+
+
+async def _settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    st = await scheduler.get_settings(uid)
+    now = scheduler.local_now(st).strftime("%H:%M")
+    text = (
+        "⚙️ Настройки\n\n"
+        f"🌍 Часовой пояс: {_tz_label(st['tz'])}, у вас сейчас {now}\n"
+        f"🌙 Вечерний разбор: {st['evening']}"
+    )
+    return text, InlineKeyboardMarkup(
+        [[Btn("🌍 Часовой пояс", callback_data="st:tz"), Btn("🌙 Время разбора", callback_data="st:ev")]]
+    )
+
+
+async def settings_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = await _settings_view(update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    parts = q.data.split(":")
+    try:
+        if parts[1] == "tz" and len(parts) == 2:
+            buttons = [Btn(name, callback_data=f"st:tz:{i}") for i, (name, _) in enumerate(TIMEZONES)]
+            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+            rows.append([Btn("✍️ Другой", callback_data="st:tzx"), Btn("↩️ Назад", callback_data="st:back")])
+            await q.answer()
+            await q.edit_message_text("🌍 Выберите часовой пояс:", reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if parts[1] == "tz":
+            await scheduler.update_settings(uid, tz=TIMEZONES[int(parts[2])][1])
+            await q.answer("Сохранено ✓")
+        elif parts[1] == "tzx":
+            await q.answer()
+            await q.message.reply_text(TZ_PROMPT, reply_markup=ForceReply(input_field_placeholder="Europe/Berlin"))
+            return
+        elif parts[1] == "ev" and len(parts) == 2:
+            buttons = [Btn(t, callback_data=f"st:ev:{t.replace(':', '')}") for t in EVENING_TIMES]
+            rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+            rows.append([Btn("✍️ Своё время", callback_data="st:evx"), Btn("↩️ Назад", callback_data="st:back")])
+            await q.answer()
+            await q.edit_message_text("🌙 Во сколько присылать вечерний разбор?", reply_markup=InlineKeyboardMarkup(rows))
+            return
+        elif parts[1] == "ev":
+            await scheduler.update_settings(uid, evening=f"{parts[2][:2]}:{parts[2][2:]}")
+            await q.answer("Сохранено ✓")
+        elif parts[1] == "evx":
+            await q.answer()
+            await q.message.reply_text(TIME_PROMPT, reply_markup=ForceReply(input_field_placeholder="21:30"))
+            return
+        else:
+            await q.answer()
+        text, kb = await _settings_view(uid)
+    except Exception as e:
+        log.exception("settings failed")
+        await _fail(q, e)
+        return
+    await q.edit_message_text(text, reply_markup=kb)
+
+
+async def _settings_reply(message: Message, prompt: str) -> None:
+    uid = message.chat_id
+    if prompt == TZ_PROMPT:
+        if not scheduler.parse_tz(message.text):
+            await message.reply_text("Не понял часовой пояс. Пример: «Europe/Berlin» или «UTC+5».")
+            return
+        await scheduler.update_settings(uid, tz=message.text.strip())
+    else:
+        value = scheduler.parse_time(message.text)
+        if not value:
+            await message.reply_text("Не понял время. Пример: «21:30».")
+            return
+        await scheduler.update_settings(uid, evening=value)
+    text, kb = await _settings_view(uid)
+    await message.reply_text("Сохранено ✓\n\n" + text, reply_markup=kb)
+
+
 # ---------- приём заметок ----------
 
 
@@ -297,6 +403,9 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await _ask_invite_label(q.message)
         elif action == "ask":
             text, kb = await _ask_scope_view()
+            await q.message.reply_text(text, reply_markup=kb)
+        elif action == "settings":
+            text, kb = await _settings_view(uid)
             await q.message.reply_text(text, reply_markup=kb)
     except Exception as e:
         log.exception("menu failed")
@@ -429,6 +538,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == INVITE_PROMPT:
         if is_owner(update.effective_user.id):
             await _create_invite(update.message, ctx, update.message.text)
+        return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text in (TZ_PROMPT, TIME_PROMPT):
+        await _settings_reply(update.message, reply.text)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
         await update.message.reply_text(await _add_projects_text(update.message.text))
@@ -1233,6 +1345,7 @@ COMMANDS = [
     ("projects", "Список проектов"),
     ("addproject", "Добавить проект"),
     ("ask", "Спросить ИИ по заметкам"),
+    ("settings", "Часовой пояс и время разбора"),
 ]
 OWNER_EXTRA = [
     ("invite", "Пригласить участника"),
@@ -1252,6 +1365,27 @@ async def set_commands(app: Application) -> None:
         log.exception("could not load members")
 
 
+async def _announce_tick_link(app: Application) -> None:
+    """Один раз присылает владелице ссылку планировщика для cron-job.org: команды, которая её показывает, нет."""
+    try:
+        if await notion.get_value("announced:tick") is not None:
+            return
+        url = f"{c.WEBHOOK_BASE.rstrip('/')}/tick/{c.secret('tick')}"
+        await app.bot.send_message(
+            c.OWNER_ID,
+            "⏱ Новый планировщик готов. Одна настройка в cron-job.org:\n\n"
+            f"1. Создайте задачу с адресом:\n{url}\n"
+            "2. Расписание: каждые 5 минут (Every 5 minutes).\n"
+            "3. Две старые задачи на 20:00 и 20:03 удалите.\n\n"
+            "Ссылку никому не показывайте, это сообщение можно удалить после настройки. "
+            "Время разбора и часовой пояс теперь меняются в /settings.",
+            disable_web_page_preview=True,
+        )
+        await notion.set_value("announced:tick", datetime.now(timezone.utc).isoformat())
+    except Exception:
+        log.exception("could not announce tick link")
+
+
 async def serve(app: Application) -> None:
     """Свой веб-сервер вместо run_webhook: кроме Telegram он принимает вечерний пинг от cron-job.org."""
     webhook_secret = c.secret("webhook")
@@ -1263,20 +1397,23 @@ async def serve(app: Application) -> None:
         await app.update_queue.put(Update.de_json(await request.json(), app.bot))
         return web.Response()
 
-    async def remind_hook(request: web.Request) -> web.Response:
-        if not secrets.compare_digest(request.match_info["secret"], c.secret("remind")):
+    async def tick_hook(request: web.Request) -> web.Response:
+        # /tick/<секрет> — планировщик; старая ссылка /remind/<секрет> работает так же, пока её не заменят в cron-job.org
+        purpose = "tick" if request.path.startswith("/tick/") else "remind"
+        if not secrets.compare_digest(request.match_info["secret"], c.secret(purpose)):
             return web.Response(status=404)
-        force = "force" in request.query
+        force = request.query.get("force")
         if force:
-            # Ручная проверка — не чаще раза в минуту, чтобы утёкшей ссылкой нельзя было заспамить участников
+            # Ручная проверка — только для владелицы и не чаще раза в минуту
             now = asyncio.get_running_loop().time()
             if now - last_force[0] < 60:
                 return web.Response(status=429, text="Не чаще раза в минуту")
             last_force[0] = now
+        users = [c.OWNER_ID] if force else sorted(member.user_ids)
         try:
-            result = await remind.send(app.bot, sorted(member.user_ids), force=force)
+            result = await scheduler.tick(app.bot, users, force="evening" if force else None)
         except Exception as e:
-            log.exception("remind failed")
+            log.exception("tick failed")
             return web.Response(status=500, text=str(e))
         return web.Response(text=result)
 
@@ -1287,8 +1424,10 @@ async def serve(app: Application) -> None:
     server.add_routes(
         [
             web.post("/telegram", telegram),
-            web.get("/remind/{secret}", remind_hook),
-            web.post("/remind/{secret}", remind_hook),
+            web.get("/tick/{secret}", tick_hook),
+            web.post("/tick/{secret}", tick_hook),
+            web.get("/remind/{secret}", tick_hook),
+            web.post("/remind/{secret}", tick_hook),
             web.get("/", health),
         ]
     )
@@ -1299,6 +1438,7 @@ async def serve(app: Application) -> None:
             f"{c.WEBHOOK_BASE.rstrip('/')}/telegram", secret_token=webhook_secret, allowed_updates=Update.ALL_TYPES
         )
         await set_commands(app)
+        await _announce_tick_link(app)
         await app.start()
         await web.TCPSite(runner, "0.0.0.0", c.PORT).start()
         log.info("Сервер слушает порт %s", c.PORT)
@@ -1352,6 +1492,8 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("projects", projects_cmd, filters=member))
     app.add_handler(CommandHandler("ask", ask_cmd, filters=member))
     app.add_handler(CommandHandler("addproject", addproject, filters=member))
+    app.add_handler(CommandHandler("settings", settings_cmd, filters=member))
+    app.add_handler(CallbackQueryHandler(on_settings_button, pattern=r"^st:"))
     app.add_handler(CommandHandler("invite", invite_cmd, filters=owner))
     app.add_handler(CommandHandler("members", members_cmd, filters=owner))
     app.add_handler(CallbackQueryHandler(on_member_button, pattern=r"^m[rkil]"))
