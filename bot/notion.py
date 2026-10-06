@@ -222,6 +222,7 @@ def _item(p: dict) -> dict:
         "url": p["url"],
         "project": _select(p, c.P_PROJECT),
         "type": _select(p, c.P_TYPE),
+        "author_id": int((p["properties"].get(c.P_AUTHOR_ID) or {}).get("number") or 0),
     }
 
 

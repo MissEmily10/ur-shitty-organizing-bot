@@ -8,9 +8,18 @@ from html import escape
 from telegram import InlineKeyboardButton as Btn
 from aiohttp import web
 from telegram import BotCommandScopeChat, ForceReply, InlineKeyboardMarkup, Message, Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
 
 from . import ai, documents, notion, remind
 from . import config as c
@@ -32,6 +41,29 @@ def is_owner(uid: int) -> bool:
 
 def is_member(uid: int) -> bool:
     return uid in member.user_ids
+
+
+async def private_only(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Бот работает только в личных чатах: в группе заметки и разбор увидели бы посторонние.
+    Если бота добавили в группу, он из неё выходит."""
+    chat = update.effective_chat
+    if chat and chat.type != ChatType.PRIVATE:
+        if update.callback_query:
+            await update.callback_query.answer()
+        try:
+            await ctx.bot.leave_chat(chat.id)
+        except Exception:
+            log.info("could not leave chat %s", chat.id)
+        raise ApplicationHandlerStop
+
+
+async def own_page(uid: int, page_id: str) -> dict:
+    """Участник может трогать только свои заметки (данные кнопок может подделать модифицированный клиент).
+    Владелица — любые: это её Notion."""
+    item = await notion.page_info(page_id)
+    if is_owner(uid) or item.get("author_id") == uid:
+        return item
+    raise PermissionError("Это не ваша заметка.")
 
 
 # ---------- меню ----------
@@ -293,6 +325,15 @@ async def remindlink(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(_remind_text())
 
 
+async def note_allowed(update: Update) -> bool:
+    """Дневной лимит заметок участника. Проверяется до расшифровки и чтения файлов, чтобы не тратить на них кредиты."""
+    uid = update.effective_user.id
+    if is_owner(uid) or await notion.created_today(uid) < c.MEMBER_DAILY_LIMIT:
+        return True
+    await update.message.reply_text(f"⛔ Лимит {c.MEMBER_DAILY_LIMIT} заметок в сутки исчерпан, продолжим завтра.")
+    return False
+
+
 async def _save(
     update: Update,
     source: str,
@@ -373,6 +414,7 @@ async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     action, page_id, *rest = q.data.split(":")
     try:
+        await own_page(q.from_user.id, page_id)
         if action == "n":
             projects = await notion.projects()
             if not projects:
@@ -464,6 +506,8 @@ DOC_SAVE_CHARS = 150000
 async def on_document(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     doc = msg.document
+    if not await note_allowed(update):
+        return
     if doc.file_size and doc.file_size > 20 * 1024 * 1024:
         await msg.reply_text("❌ Файл больше 20 МБ: Telegram не даёт ботам скачивать такие.")
         return
@@ -503,6 +547,8 @@ async def on_document(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
+    if not await note_allowed(update):
+        return
     file = await (msg.voice or msg.audio).get_file()
     try:
         text = await ai.transcribe(bytes(await file.download_as_bytearray()))
@@ -668,7 +714,7 @@ async def _ask_ai(message: Message, page_id: str, question: str, history: str = 
         return
     status = await message.reply_text("🤖 Думаю…")
     try:
-        item = await notion.page_info(page_id)
+        item = await own_page(message.chat_id, page_id)
         note = await notion.read_note(page_id)
         images = []
         for url in note["images"][:4]:  # оригиналы фото, чтобы ИИ сверил цифры
@@ -701,6 +747,11 @@ async def on_ai_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_member(q.from_user.id):
         return
     action, page_id, *rest = q.data.split(":")
+    try:
+        await own_page(q.from_user.id, page_id)
+    except Exception as e:
+        await q.message.reply_text(f"❌ {e}")
+        return
     if action == "a":
         await start_ai(q.message, page_id)
     else:
@@ -865,7 +916,7 @@ async def start_interview(message: Message, page_id: str) -> None:
         return
     status = await message.reply_text("✨ Читаю заметку…")
     try:
-        item = await notion.page_info(page_id)
+        item = await own_page(message.chat_id, page_id)
         note = await notion.read_note(page_id)
         images = []
         for url in note["images"][:4]:
@@ -1031,6 +1082,7 @@ async def on_expand_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
         await q.edit_message_reply_markup(None)
         return
     try:
+        await own_page(q.from_user.id, page_id)
         type_name, draft = _draft_from_message(q.message)
         await notion.add_expansion(page_id, type_name, to_blocks(draft))
     except Exception as e:
@@ -1131,6 +1183,8 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     action, *args = q.data.split(":")
     show_projects = False
     try:
+        if action != "r":
+            await own_page(q.from_user.id, args[0])
         if action == "t":
             page_id, idx, k = args[0], int(args[1]), int(args[2])
             names = await notion.types()
@@ -1220,18 +1274,26 @@ async def set_commands(app: Application) -> None:
 async def serve(app: Application) -> None:
     """Свой веб-сервер вместо run_webhook: кроме Telegram он принимает вечерний пинг от cron-job.org."""
     webhook_secret = c.secret("webhook")
+    last_force = [-1e9]
 
     async def telegram(request: web.Request) -> web.Response:
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != webhook_secret:
+        if not secrets.compare_digest(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), webhook_secret):
             return web.Response(status=403)
         await app.update_queue.put(Update.de_json(await request.json(), app.bot))
         return web.Response()
 
     async def remind_hook(request: web.Request) -> web.Response:
-        if request.match_info["secret"] != c.secret("remind"):
+        if not secrets.compare_digest(request.match_info["secret"], c.secret("remind")):
             return web.Response(status=404)
+        force = "force" in request.query
+        if force:
+            # Ручная проверка — не чаще раза в минуту, чтобы утёкшей ссылкой нельзя было заспамить участников
+            now = asyncio.get_running_loop().time()
+            if now - last_force[0] < 60:
+                return web.Response(status=429, text="Не чаще раза в минуту")
+            last_force[0] = now
         try:
-            result = await remind.send(app.bot, sorted(member.user_ids), force="force" in request.query)
+            result = await remind.send(app.bot, sorted(member.user_ids), force=force)
         except Exception as e:
             log.exception("remind failed")
             return web.Response(status=500, text=str(e))
@@ -1300,6 +1362,7 @@ def build_app(webhook: bool) -> Application:
     if webhook:
         builder = builder.updater(None)  # обновления приходят в наш сервер, встроенный не нужен
     app = builder.build()
+    app.add_handler(TypeHandler(Update, private_only), group=-1)
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
     # Люди без доступа: что бы ни прислали, бот просит код приглашения
