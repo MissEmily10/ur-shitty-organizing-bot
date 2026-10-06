@@ -70,6 +70,9 @@ SCHEMA = {
     },
     c.P_AUTHOR: {"select": {}},
     c.P_AUTHOR_ID: {"number": {}},
+    c.P_WHEN: {"date": {}},  # срок, время напоминания или события
+    c.P_DONE: {"checkbox": {}},
+    c.P_AI_TYPE: {"select": {}},  # тип, который предложил ИИ; сам тип выбирает человек в разборе
     "Создано": {"created_time": {}},
 }
 
@@ -184,7 +187,15 @@ def image_block(upload_id: str) -> dict:
 
 
 async def create_idea(
-    title: str, source: str, tags: list[str], blocks: list[dict], details: list[dict], author_id: int = 0, author: str = ""
+    title: str,
+    source: str,
+    tags: list[str],
+    blocks: list[dict],
+    details: list[dict],
+    author_id: int = 0,
+    author: str = "",
+    when: str | None = None,
+    ai_type: str | None = None,
 ) -> tuple[str, str]:
     """blocks видны сразу (сюда же идут картинки-оригиналы), details прячутся в свёрнутый блок «Полный текст и детали»."""
     props = {
@@ -193,6 +204,10 @@ async def create_idea(
         c.P_SOURCE: {"select": {"name": source}},
         c.P_TAGS: {"multi_select": [{"name": t} for t in tags]},
     }
+    if when:
+        props[c.P_WHEN] = {"date": {"start": when}}
+    if ai_type:
+        props[c.P_AI_TYPE] = {"select": {"name": ai_type}}
     if author_id:
         props[c.P_AUTHOR_ID] = {"number": author_id}
         props[c.P_AUTHOR] = {"select": {"name": (author or str(author_id)).replace(",", " ")[:100]}}
@@ -224,6 +239,9 @@ def _item(p: dict) -> dict:
         "project": _select(p, c.P_PROJECT),
         "type": _select(p, c.P_TYPE),
         "author_id": int((p["properties"].get(c.P_AUTHOR_ID) or {}).get("number") or 0),
+        "when": ((p["properties"].get(c.P_WHEN) or {}).get("date") or {}).get("start"),
+        "done": bool((p["properties"].get(c.P_DONE) or {}).get("checkbox")),
+        "ai_type": _select(p, c.P_AI_TYPE),
     }
 
 
@@ -303,14 +321,37 @@ async def read_note(page_id: str) -> dict:
     return {"summary": "\n".join(summary).strip(), "details": "\n".join(details).strip(), "images": [u for u in images if u]}
 
 
-async def _project_options() -> list[dict]:
+async def _options(prop: str) -> list[dict]:
     db = await _call("GET", f"/databases/{await db_id()}")
-    return ((db["properties"].get(c.P_PROJECT) or {}).get("select") or {}).get("options", [])
+    return ((db["properties"].get(prop) or {}).get("select") or {}).get("options", [])
 
 
-async def _set_project_options(options: list[dict]) -> None:
+async def _set_options(prop: str, options: list[dict]) -> None:
     # Notion заменяет список вариантов целиком: существующие передаём с их id, иначе они удалятся
-    await _call("PATCH", f"/databases/{await db_id()}", {"properties": {c.P_PROJECT: {"select": {"options": options}}}})
+    await _call("PATCH", f"/databases/{await db_id()}", {"properties": {prop: {"select": {"options": options}}}})
+
+
+async def _add_options(prop: str, names: list[str]) -> list[str]:
+    options = await _options(prop)
+    taken = {o["name"].lower() for o in options}
+    new = []
+    for name in names:
+        if name.lower() not in taken:
+            taken.add(name.lower())
+            new.append(name)
+    if new:
+        keep = [{"id": o["id"], "name": o["name"], "color": o["color"]} for o in options]
+        await _set_options(prop, keep + [{"name": n} for n in new])
+    return new
+
+
+async def _delete_option(prop: str, name: str) -> None:
+    keep = [{"id": o["id"], "name": o["name"], "color": o["color"]} for o in await _options(prop) if o["name"] != name]
+    await _set_options(prop, keep)
+
+
+async def _project_options() -> list[dict]:
+    return await _options(c.P_PROJECT)
 
 
 async def projects() -> list[str]:
@@ -320,23 +361,11 @@ async def projects() -> list[str]:
 
 async def add_projects(names: list[str]) -> list[str]:
     """Добавляет новые проекты, возвращает те, которых ещё не было."""
-    options = await _project_options()
-    taken = {o["name"].lower() for o in options}
-    new = []
-    for name in names:
-        if name.lower() not in taken:
-            taken.add(name.lower())
-            new.append(name)
-    if new:
-        keep = [{"id": o["id"], "name": o["name"], "color": o["color"]} for o in options]
-        await _set_project_options(keep + [{"name": n} for n in new])
-    return new
+    return await _add_options(c.P_PROJECT, names)
 
 
 async def delete_project(name: str) -> None:
-    options = await _project_options()
-    keep = [{"id": o["id"], "name": o["name"], "color": o["color"]} for o in options if o["name"] != name]
-    await _set_project_options(keep)
+    await _delete_option(c.P_PROJECT, name)
 
 
 async def preview(page_id: str, limit: int = 600) -> str:
@@ -357,8 +386,44 @@ async def file_to_project(page_id: str, project: str) -> None:
 
 
 async def types() -> list[str]:
-    db = await _call("GET", f"/databases/{await db_id()}")
-    return [o["name"] for o in ((db["properties"].get(c.P_TYPE) or {}).get("select") or {}).get("options", [])]
+    return [o["name"] for o in await _options(c.P_TYPE)]
+
+
+async def add_types(names: list[str]) -> list[str]:
+    return await _add_options(c.P_TYPE, names)
+
+
+async def delete_type(name: str) -> None:
+    await _delete_option(c.P_TYPE, name)
+
+
+async def set_when(page_id: str, when: str | None) -> None:
+    """Срок заметки (ISO-дата или дата со временем). None — убрать срок. Новый срок снова «не выполнен»."""
+    props = {c.P_WHEN: {"date": {"start": when} if when else None}}
+    if when:
+        props[c.P_DONE] = {"checkbox": False}
+    await _call("PATCH", f"/pages/{page_id}", {"properties": props})
+
+
+async def set_done(page_id: str, done: bool = True) -> None:
+    await _call("PATCH", f"/pages/{page_id}", {"properties": {c.P_DONE: {"checkbox": done}}})
+
+
+async def dated_items(user_id: int, before: str, after: str | None = None) -> list[dict]:
+    """Невыполненные заметки человека со сроком до before (и после after, если указано), ближайшие первыми."""
+    conditions = [
+        {"property": c.P_WHEN, "date": {"on_or_before": before}},
+        {"property": c.P_DONE, "checkbox": {"equals": False}},
+        _by_author(user_id),
+    ]
+    if after:
+        conditions.append({"property": c.P_WHEN, "date": {"on_or_after": after}})
+    data = await _call(
+        "POST",
+        f"/databases/{await db_id()}/query",
+        {"filter": {"and": conditions}, "sorts": [{"property": c.P_WHEN, "direction": "ascending"}], "page_size": 100},
+    )
+    return [_item(p) for p in data["results"]]
 
 
 async def set_type(page_id: str, type_name: str) -> None:

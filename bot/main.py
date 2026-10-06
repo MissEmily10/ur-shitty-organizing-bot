@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, documents, notion, scheduler
+from . import ai, documents, notion, scheduler, whenparse
 from . import config as c
 from .markdown import tg_html, to_blocks
 
@@ -75,6 +75,7 @@ MENU = (
     "/razbor — разобрать свои входящие\n"
     "/projects — список проектов\n"
     "/addproject — добавить проект (бот спросит название)\n"
+    "/types, /addtype — типы записей\n"
     "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
     "/settings — часовой пояс и время вечернего разбора\n"
     "{owner_commands}"
@@ -447,7 +448,8 @@ async def _save(
             await status.edit_text(f"⛔ Лимит {c.MEMBER_DAILY_LIMIT} заметок в сутки исчерпан, продолжим завтра.")
             return
         try:
-            idea = await ai.structure(text=text, images=images)
+            now = scheduler.local_now(await scheduler.get_settings(user.id))
+            idea = await ai.structure(text=text, images=images, types=await notion.types(), now=now)
             if full_text is not None:
                 idea.details = full_text
         except Exception as e:
@@ -475,17 +477,26 @@ async def _save(
                 note = f"\n\n⚠️ Файл не прикрепился к Notion (на бесплатном Notion лимит 5 МБ): {escape(str(e)[:300])}"
         blocks = to_blocks(idea.summary) + originals
         page_id, url = await notion.create_idea(
-            idea.title, source, idea.tags, blocks, to_blocks(idea.details), user.id, user.full_name
+            idea.title,
+            source,
+            idea.tags,
+            blocks,
+            to_blocks(idea.details),
+            user.id,
+            user.full_name,
+            when=idea.when,
+            ai_type=idea.type_guess,
         )
     except Exception as e:
         log.exception("save failed")
         await status.edit_text(f"❌ Не получилось сохранить: {e}"[:4000])
         return
+    when_line = f"\n⏰ Напомню: {escape(await _when_label(user.id, idea.when))}" if idea.when else ""
     await status.edit_text(
-        f'✅ <b>{escape(idea.title)}</b>\n📄 <a href="{url}">Заметка — тут</a>{note}',
+        f'✅ <b>{escape(idea.title)}</b>\n📄 <a href="{url}">Заметка — тут</a>{when_line}{note}',
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
-        reply_markup=_panel(page_id),
+        reply_markup=_panel(page_id, when=idea.when),
     )
 
 
@@ -493,9 +504,19 @@ async def _save(
 # callback_data: n:<page_id> (показать проекты)  |  np:<page_id>:<проект>  |  nx:<page_id> (свернуть)
 
 
-def _panel(page_id: str, project: str | None = None) -> InlineKeyboardMarkup:
+def _panel(page_id: str, project: str | None = None, when: str | None = None) -> InlineKeyboardMarkup:
+    """Под заметкой: «В проект», а если у заметки есть срок — ещё «изменить» и «без срока»."""
     label = f"📁 {project} ✓" if project else "📁 В проект"
-    return InlineKeyboardMarkup([[Btn(label, callback_data=f"n:{page_id}")]])
+    rows = [[Btn(label, callback_data=f"n:{page_id}")]]
+    if when:
+        rows.append([Btn("⏰ Изменить срок", callback_data=f"w:{page_id}:-"), Btn("✖️ Без срока", callback_data=f"wx:{page_id}:-")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _when_label(uid: int, iso: str | None) -> str:
+    if not iso:
+        return ""
+    return whenparse.human(iso, scheduler.local_now(await scheduler.get_settings(uid)))
 
 
 async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -524,10 +545,12 @@ async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             await notion.file_to_project(page_id, projects[idx])
             await q.answer(f"→ {projects[idx]}")
-            await q.edit_message_reply_markup(_panel(page_id, projects[idx]))
+            item = await notion.page_info(page_id)
+            await q.edit_message_reply_markup(_panel(page_id, projects[idx], item["when"]))
         else:
             await q.answer()
-            await q.edit_message_reply_markup(_panel(page_id, await notion.page_project(page_id)))
+            item = await notion.page_info(page_id)
+            await q.edit_message_reply_markup(_panel(page_id, item["project"], item["when"]))
     except Exception as e:
         log.exception("panel failed")
         await _fail(q, e)
@@ -545,6 +568,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
         await update.message.reply_text(await _add_projects_text(update.message.text))
         return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == TYPE_PROMPT:
+        await update.message.reply_text(await _add_types_text(update.message.text))
+        return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(WHEN_PROMPT_MARK):
+        if page_id := _ai_page(reply):
+            await _when_reply(update.message, page_id)
+            return
     if (not reply or (reply.text or "").startswith(EXPAND_MARK)) and await interview_answer(update.message):
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (scope := _scope_from(reply.text or "")):
@@ -675,8 +705,9 @@ async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[s
     item = items[k]
     body = await notion.preview(item["id"])
     where = f"📁 {escape(item['project'])} ✓" if item["project"] else "📭 Без проекта"
+    when = f"\n⏰ Срок: {escape(await _when_label(uid, item['when']))}" if item["when"] else ""
     text = (
-        f"<b>Заметка {k + 1} из {len(items)}</b> · {where}\n\n"
+        f"<b>Заметка {k + 1} из {len(items)}</b> · {where}{when}\n\n"
         f'<a href="{item["url"]}">{escape(item["title"])}</a>\n\n{escape(body)}\n\n'
     )
     if show_projects:
@@ -690,17 +721,22 @@ async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[s
         rows.append([Btn("↩️ Назад", callback_data=f"r:{k}")])
         return text, InlineKeyboardMarkup(rows)
 
-    text += "Что это?"
-    buttons = [Btn(t, callback_data=f"t:{item['id']}:{i}:{k}") for i, t in enumerate(await notion.types())]
+    types = await notion.types()
+    text += "Что это?" + (f" ✨ ИИ думает: {escape(item['ai_type'])}" if item.get("ai_type") in types else "")
+    buttons = [
+        Btn(f"✨ {t}" if t == item.get("ai_type") else t, callback_data=f"t:{item['id']}:{i}:{k}") for i, t in enumerate(types)
+    ]
+    # Предложенный ИИ тип — первой кнопкой
+    buttons.sort(key=lambda b: not b.text.startswith("✨"))
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     project_label = f"📁 {item['project']} ✓" if item["project"] else "📁 В проект"
     rows.append(
         [
             Btn(project_label, callback_data=f"pj:{item['id']}:{k}"),
-            Btn("🤖 ИИ", callback_data=f"a:{item['id']}"),
-            Btn("👁 Целиком", callback_data=f"v:{item['id']}"),
+            Btn("⏰ Срок", callback_data=f"w:{item['id']}:{k}"),
         ]
     )
+    rows.append([Btn("🤖 ИИ", callback_data=f"a:{item['id']}"), Btn("👁 Целиком", callback_data=f"v:{item['id']}")])
     nav = [Btn("🗑", callback_data=f"d:{item['id']}:{k}")]
     if k > 0:
         nav.append(Btn("◀️", callback_data=f"r:{k - 1}"))
@@ -758,7 +794,7 @@ PRESETS = [
 
 def _ai_page(message: Message) -> str | None:
     """Ищет в сообщении бота ссылку на заметку в Notion и достаёт из неё id страницы."""
-    if not message.text or not message.text.startswith(("🤖", "✍️", EXPAND_MARK)):
+    if not message.text or not message.text.startswith(("🤖", "✍️", "⏰", EXPAND_MARK)):
         return None
     for entity in message.entities or []:
         if entity.url and "notion" in entity.url:
@@ -1189,6 +1225,236 @@ async def on_expand_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
     await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("✅ Сохранено в заметке", callback_data="noop")]]))
 
 
+# ---------- ⏰ сроки и напоминания ----------
+# callback_data: w:<page>:<номер|-> (меню срока)  |  wv:<page>:<номер|->:<t|d1|w1> (быстрый срок)
+#                wc:<page>:<номер|-> (своя дата)  |  wx:<page>:<номер|-> (без срока)
+#                dl:ok:<page> (готово)  |  dl:sn:<page> (перенести)  |  dl:p1h / dl:p1d / dl:p7d:<page>  |  ov (просроченные)
+# «номер» — позиция в разборе, куда вернуться; «-» — сообщение после сохранения заметки.
+
+WHEN_PROMPT_MARK = "⏰ Срок для "
+
+
+def _quick_when(code: str, now: datetime, settings: dict, current: str | None = None) -> str:
+    if code == "t":
+        hh, mm = map(int, settings["evening"].split(":"))
+        at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return (at if at > now else now + timedelta(hours=1)).replace(second=0, microsecond=0).isoformat()
+    if code == "p1h":
+        return (now + timedelta(hours=1)).replace(second=0, microsecond=0).isoformat()
+    days = {"d1": 1, "p1d": 1, "w1": 7, "p7d": 7}[code]
+    if current and "T" in current:
+        # У срока было время: переносим на тот же час
+        at = datetime.fromisoformat(current).astimezone(now.tzinfo)
+        return datetime.combine(now.date() + timedelta(days=days), at.time(), now.tzinfo).isoformat()
+    return (now.date() + timedelta(days=days)).isoformat()
+
+
+async def _after_when(q, page_id: str, where: str, uid: int) -> None:
+    """Вернуть экран, откуда пришли: карточку разбора или сообщение о сохранённой заметке."""
+    if where != "-":
+        text, kb = await _review_view(uid, int(where))
+        await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    item = await notion.page_info(page_id)
+    lines = [ln for ln in (q.message.text_html or "").split("\n") if not ln.startswith("⏰")]
+    if item["when"]:
+        lines.insert(min(2, len(lines)), f"⏰ Напомню: {escape(await _when_label(uid, item['when']))}")
+    await q.edit_message_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=_panel(page_id, item["project"], item["when"]),
+    )
+
+
+async def on_when_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    action, page_id, where, *rest = q.data.split(":") + [""]
+    try:
+        item = await own_page(uid, page_id)
+        settings = await scheduler.get_settings(uid)
+        now = scheduler.local_now(settings)
+        if action == "w":
+            await q.answer()
+            rows = [
+                [Btn("Сегодня вечером", callback_data=f"wv:{page_id}:{where}:t"), Btn("Завтра", callback_data=f"wv:{page_id}:{where}:d1")],
+                [Btn("Через неделю", callback_data=f"wv:{page_id}:{where}:w1"), Btn("✍️ Своя дата", callback_data=f"wc:{page_id}:{where}")],
+            ]
+            tail = [Btn("↩️ Назад", callback_data=f"r:{where}" if where != "-" else f"nx:{page_id}")]
+            if item["when"]:
+                tail.insert(0, Btn("✖️ Без срока", callback_data=f"wx:{page_id}:{where}"))
+            rows.append(tail)
+            await q.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+            return
+        if action == "wc":
+            await q.answer()
+            await q.message.reply_text(
+                f'{WHEN_PROMPT_MARK}<a href="{item["url"]}">{escape(item["title"])}</a>: напишите ответом на это сообщение.\n'
+                "Например: «завтра в 15», «пятница 18:00», «15.10», «через 2 часа».",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=ForceReply(input_field_placeholder="пятница 18:00"),
+            )
+            return
+        when = None if action == "wx" else _quick_when(rest[0], now, settings, item["when"])
+        await notion.set_when(page_id, when)
+        await q.answer(f"⏰ {await _when_label(uid, when)}" if when else "Срок убран")
+        await _after_when(q, page_id, where, uid)
+    except Exception as e:
+        log.exception("when button failed")
+        await _fail(q, e)
+
+
+async def _when_reply(message: Message, page_id: str) -> None:
+    """Ответ на «⏰ Срок для …»: разбираем сами, что не поняли — отдаём ИИ."""
+    uid = message.chat_id
+    try:
+        item = await own_page(uid, page_id)
+        now = scheduler.local_now(await scheduler.get_settings(uid))
+        parsed = whenparse.parse(message.text, now)
+        when = parsed.iso() if parsed else await ai.parse_when(message.text, now)
+        if not when:
+            await message.reply_text("Не понял срок. Пример: «завтра в 15», «пятница 18:00», «15.10».")
+            return
+        await notion.set_when(page_id, when)
+    except Exception as e:
+        log.exception("when reply failed")
+        await message.reply_text(f"❌ Не получилось поставить срок: {e}"[:4000])
+        return
+    await message.reply_text(
+        f'⏰ Срок для «{escape(item["title"])}»: {escape(await _when_label(uid, when))} ✓',
+        parse_mode=ParseMode.HTML,
+        reply_markup=_panel(page_id, item["project"], when),
+    )
+
+
+async def on_deadline_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    parts = q.data.split(":")
+    try:
+        if parts[0] == "ov":
+            await q.answer()
+            await send_overdue(q.get_bot(), uid)
+            return
+        action, page_id = parts[1], parts[2]
+        item = await own_page(uid, page_id)
+        if action == "ok":
+            await notion.set_done(page_id)
+            await q.answer("Готово ✓")
+            await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("✅ Готово", callback_data="noop")]]))
+            return
+        if action == "sn":
+            await q.answer()
+            await q.edit_message_reply_markup(
+                InlineKeyboardMarkup(
+                    [
+                        [Btn("+1 час", callback_data=f"dl:p1h:{page_id}"), Btn("Завтра", callback_data=f"dl:p1d:{page_id}")],
+                        [Btn("Через неделю", callback_data=f"dl:p7d:{page_id}"), Btn("✍️ Своя дата", callback_data=f"wc:{page_id}:-")],
+                    ]
+                )
+            )
+            return
+        settings = await scheduler.get_settings(uid)
+        when = _quick_when(action, scheduler.local_now(settings), settings, item["when"])
+        await notion.set_when(page_id, when)
+        label = await _when_label(uid, when)
+        await q.answer(f"Перенесено: {label}")
+        await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn(f"⏰ Перенесено: {label}", callback_data="noop")]]))
+    except Exception as e:
+        log.exception("deadline button failed")
+        await _fail(q, e)
+
+
+async def send_overdue(bot, uid: int) -> None:
+    """Просроченные невыполненные заметки — каждая отдельным сообщением с кнопками."""
+    settings = await scheduler.get_settings(uid)
+    items = await scheduler.overdue(uid, settings)
+    if not items:
+        await bot.send_message(uid, "🎉 Просроченного нет!")
+        return
+    for item in items[:10]:
+        await bot.send_message(
+            uid,
+            f'🔥 <a href="{item["url"]}">{escape(item["title"])}</a> — срок был {escape(await _when_label(uid, item["when"]))}',
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=scheduler.reminder_markup(item["id"]),
+        )
+
+
+# ---------- 🏷 типы (общие, как проекты: добавлять могут все, удалять — только владелица) ----------
+# callback_data: ta:<номер> (спросить про удаление)  |  tk:<номер> (удалить)  |  tl (список)
+
+TYPE_PROMPT = "🏷 Напишите названия новых типов ответом на это сообщение: через запятую, можно с эмодзи, например «🎵 Трек»."
+
+
+async def _types_view(uid: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    names = await notion.types()
+    text = "Типы записей:\n" + "\n".join(f"• {n}" for n in names) + "\n\nДобавить: /addtype"
+    if not is_owner(uid) or not names:
+        return text, None
+    return text, InlineKeyboardMarkup([[Btn(f"🗑 {n}", callback_data=f"ta:{i}")] for i, n in enumerate(names)])
+
+
+async def types_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = await _types_view(update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def _add_types_text(raw: str) -> str:
+    names = [n.strip()[:100] for n in re.split(r"[\n,]", raw) if n.strip()]
+    if not names:
+        return "Напишите название после команды, например: /addtype 🎵 Трек"
+    added = await notion.add_types(names)
+    skipped = [n for n in names if n not in added]
+    text = ("✅ Добавлено: " + ", ".join(added)) if added else "Ничего нового не добавлено."
+    return text + (("\nУже были: " + ", ".join(skipped)) if skipped else "") + "\n\n/types — все типы"
+
+
+async def addtype(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = re.sub(r"^/addtype(@\w+)?", "", update.message.text, count=1)
+    if not raw.strip():
+        await update.message.reply_text(TYPE_PROMPT, reply_markup=ForceReply(input_field_placeholder="🎵 Трек"))
+        return
+    await update.message.reply_text(await _add_types_text(raw))
+
+
+async def on_type_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_owner(q.from_user.id):
+        await q.answer()
+        return
+    action, _, arg = q.data.partition(":")
+    try:
+        names = await notion.types()
+        if action in ("ta", "tk") and int(arg) >= len(names):
+            await q.answer("Список изменился")
+        elif action == "ta":
+            await q.answer()
+            await q.edit_message_text(
+                f"Удалить тип «{names[int(arg)]}»?\nУ заметок с этим типом поле «Тип» станет пустым, и они вернутся в разбор.",
+                reply_markup=InlineKeyboardMarkup([[Btn("Да, удалить", callback_data=f"tk:{arg}"), Btn("Отмена", callback_data="tl")]]),
+            )
+            return
+        elif action == "tk":
+            await notion.delete_type(names[int(arg)])
+            await q.answer(f"Удалено: {names[int(arg)]}")
+        else:
+            await q.answer()
+        text, kb = await _types_view(q.from_user.id)
+    except Exception as e:
+        log.exception("type button failed")
+        await _fail(q, e)
+        return
+    await q.edit_message_text(text, reply_markup=kb)
+
+
 # ---------- проекты ----------
 # callback_data: pl  |  pa:<номер> (спросить про удаление)  |  pk:<номер> (удалить)
 
@@ -1295,6 +1561,11 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                     disable_web_page_preview=True,
                     reply_markup=InlineKeyboardMarkup(
                         [[Btn("✨ Раскрыть", callback_data=f"x:{page_id}:{k}"), Btn("⏭ Следующая", callback_data=f"r:{k}")]]
+                        + (
+                            [[Btn("⏰ Поставить срок", callback_data=f"w:{page_id}:{k}")]]
+                            if not item.get("when") and re.search(r"напомин|событ|задач", names[idx].lower())
+                            else []
+                        )
                     ),
                 )
                 return
@@ -1346,6 +1617,8 @@ COMMANDS = [
     ("addproject", "Добавить проект"),
     ("ask", "Спросить ИИ по заметкам"),
     ("settings", "Часовой пояс и время разбора"),
+    ("types", "Типы записей"),
+    ("addtype", "Добавить тип"),
 ]
 OWNER_EXTRA = [
     ("invite", "Пригласить участника"),
@@ -1493,6 +1766,11 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("ask", ask_cmd, filters=member))
     app.add_handler(CommandHandler("addproject", addproject, filters=member))
     app.add_handler(CommandHandler("settings", settings_cmd, filters=member))
+    app.add_handler(CommandHandler("types", types_cmd, filters=member))
+    app.add_handler(CommandHandler("addtype", addtype, filters=member))
+    app.add_handler(CallbackQueryHandler(on_type_button, pattern=r"^t[akl]"))
+    app.add_handler(CallbackQueryHandler(on_when_button, pattern=r"^w[vcx]?:"))
+    app.add_handler(CallbackQueryHandler(on_deadline_button, pattern=r"^(dl:|ov$)"))
     app.add_handler(CallbackQueryHandler(on_settings_button, pattern=r"^st:"))
     app.add_handler(CommandHandler("invite", invite_cmd, filters=owner))
     app.add_handler(CommandHandler("members", members_cmd, filters=owner))

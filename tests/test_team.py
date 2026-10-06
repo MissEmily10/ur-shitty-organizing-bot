@@ -38,12 +38,12 @@ async def remove_person(page):
     rows[:] = [r for r in rows if r["page"].replace("-", "") != page.replace("-", "")]
 
 
-async def create_idea(title, source, tags, blocks, details, author_id=0, author=""):
+async def create_idea(title, source, tags, blocks, details, author_id=0, author="", **kw):
     created.append((title, author_id, author))
     return ("P" * 32, "https://n/p")
 
 
-async def structure(text="", images=None):
+async def structure(text="", images=None, **kw):
     return ai.Idea(title=text[:20], summary="- " + text)
 
 

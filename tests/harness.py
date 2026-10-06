@@ -48,6 +48,27 @@ async def _fake_post(self, endpoint, data=None, *args, **kwargs):
 
 ExtBot._do_post = _fake_post
 
+# Служебные значения (настройки людей, отметки планировщика) и типы — в памяти, без Notion
+from bot import notion as _notion  # noqa: E402
+
+service: dict[str, str] = {}
+TYPES = ["💡 Идея", "📋 Задача", "⚡ Быстрая заметка", "⏰ Напоминание", "🎨 Референс", "❓ Обсудить", "📅 Событие"]
+
+
+async def _get_value(key):
+    return service.get(key)
+
+
+async def _set_value(key, value):
+    service[key] = value
+
+
+async def _types():
+    return list(TYPES)
+
+
+_notion.get_value, _notion.set_value, _notion.types = _get_value, _set_value, _types
+
 
 APP = None
 

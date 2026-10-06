@@ -10,6 +10,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from html import escape
 from datetime import datetime, time, timedelta, timezone, tzinfo
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -19,6 +20,7 @@ from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup
 
 from . import notion
+from .whenparse import human
 
 log = logging.getLogger("scheduler")
 
@@ -114,16 +116,87 @@ def _evening_due(now: datetime, settings: dict) -> str | None:
     return now.date().isoformat() if now.time() >= time(hh, mm) else None
 
 
+async def overdue(uid: int, settings: dict) -> list[dict]:
+    """Невыполненные заметки, срок которых уже прошёл (дата без времени — просрочена со следующего дня)."""
+    now = local_now(settings)
+    items = await notion.dated_items(uid, before=now.isoformat())
+    return [i for i in items if _deadline(i["when"], now) < now]
+
+
+def _deadline(iso: str, now: datetime) -> datetime:
+    """Момент, после которого срок считается прошедшим: для даты без времени — конец того дня."""
+    if "T" in iso:
+        return datetime.fromisoformat(iso).astimezone(now.tzinfo)
+    return datetime.combine(datetime.fromisoformat(iso).date() + timedelta(days=1), time(0, 0), now.tzinfo)
+
+
 async def _evening_run(bot: Bot, uid: int) -> str:
     items = await notion.review_items(uid)
-    if not items:
+    late = await overdue(uid, await get_settings(uid))
+    if not items and not late:
         return "разбирать нечего"
-    await bot.send_message(
-        uid,
-        f"🌙 Вечерний разбор: заметок без категории {len(items)}",
-        reply_markup=InlineKeyboardMarkup([[Btn("Разобрать", callback_data="r:0")]]),
+    lines, buttons = [], []
+    if items:
+        lines.append(f"🌙 Вечерний разбор: заметок без категории {len(items)}")
+        buttons.append(Btn("Разобрать", callback_data="r:0"))
+    if late:
+        lines.append(f"🔥 Просрочено: {len(late)}")
+        buttons.append(Btn("🔥 Показать", callback_data="ov"))
+    await bot.send_message(uid, "\n".join(lines), reply_markup=InlineKeyboardMarkup([buttons]))
+    return f"пуш: разбор {len(items)}, просрочено {len(late)}"
+
+
+# ---------- напоминания о сроках ----------
+
+
+def reminder_markup(page_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[Btn("✅ Готово", callback_data=f"dl:ok:{page_id}"), Btn("⏰ Перенести", callback_data=f"dl:sn:{page_id}")]]
     )
-    return f"пуш, заметок {len(items)}"
+
+REMINDER_WINDOW = timedelta(hours=3)  # напоминание, пропущенное дольше этого (бот лежал), уже не шлём
+
+
+def reminder_points(item: dict, now: datetime) -> list[tuple[str, datetime, str]]:
+    """Когда и что напомнить: (вид, момент, текст). У «Напоминания» — ровно в срок; у остального — за день и в день."""
+    iso = item["when"]
+    kind = (item.get("type") or item.get("ai_type") or "").lower()
+    if "T" in iso:
+        at = datetime.fromisoformat(iso).astimezone(now.tzinfo)
+        if "напомин" in kind:
+            return [("now", at, "⏰ Напоминание")]
+        return [("day", at - timedelta(days=1), "📌 Завтра срок"), ("hour", at - timedelta(hours=1), "📌 Через час срок")]
+    day = datetime.fromisoformat(iso).date()
+    return [
+        ("day", datetime.combine(day - timedelta(days=1), time(10, 0), now.tzinfo), "📌 Завтра срок"),
+        ("morning", datetime.combine(day, time(9, 0), now.tzinfo), "📌 Сегодня срок"),
+    ]
+
+
+async def _reminders(bot: Bot, uid: int, now: datetime, settings: dict) -> list[str]:
+    local = local_now(settings, now)
+    items = await notion.dated_items(
+        uid, before=(local + timedelta(days=1, hours=1)).isoformat(), after=(local - timedelta(days=2)).isoformat()
+    )
+    sent = []
+    for item in items:
+        for kind, at, label in reminder_points(item, local):
+            if not (at <= local < at + REMINDER_WINDOW):
+                continue
+            # В ключе есть сам срок: если срок перенесли, напоминания по новому сроку придут заново
+            key = f"rem:{item['id']}:{kind}:{item['when']}"
+            if await is_done(key):
+                continue
+            await mark_done(key)
+            await bot.send_message(
+                uid,
+                f'{label}: <a href="{item["url"]}">{escape(item["title"])}</a> — {escape(human(item["when"], local))}',
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=reminder_markup(item["id"]),
+            )
+            sent.append(f"{kind} {item['title'][:20]}")
+    return sent
 
 
 JOBS = [Job("evening", _evening_due, _evening_run)]
@@ -152,6 +225,9 @@ async def tick(bot: Bot, user_ids: list[int], now: datetime | None = None, force
                     # Отметку ставим до отправки: лучше в редком сбое не отправить, чем отправить дважды
                     await mark_done(key)
                     report.append(f"{uid} {job.name}: {await job.run(bot, uid)}")
+                if not force:
+                    for item in await _reminders(bot, uid, now or datetime.now(timezone.utc), settings):
+                        report.append(f"{uid} напоминание: {item}")
             except Exception as e:
                 # Один заблокировавший бота человек или сбой Notion не должен оставить остальных без уведомлений
                 log.exception("tick failed for %s", uid)

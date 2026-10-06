@@ -27,6 +27,10 @@ async def forget_old_marks(days=14):
     return 0
 
 
+async def dated_items(uid, before, after=None):
+    return []
+
+
 class FakeBot:
     async def send_message(self, uid, text, **kw):
         pushes.append(uid)
@@ -43,6 +47,7 @@ def restart():
 
 async def run():
     notion.get_value, notion.set_value, notion.review_items, notion.forget_old_marks = get_value, set_value, review_items, forget_old_marks
+    notion.dated_items = dated_items
     bot = FakeBot()
     store["settings:77"] = '{"tz": "Asia/Vladivostok", "evening": "21:30"}'
 
