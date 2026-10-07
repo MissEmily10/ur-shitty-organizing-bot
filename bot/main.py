@@ -87,7 +87,7 @@ MENU = (
     "/style — как бот с тобой разговаривает: стиль или свой персонаж\n"
     "/artdirector — 🎨 разбор референса: палитра в HEX, свет, цвет, как повторить\n"
     "{owner_commands}"
-    "/start — это меню\n\n"
+    "/start — меню по разделам\n/tour — знакомство с ботом\n/help вопрос — спросить, как что-то сделать\n\n"
     "Или жми кнопку 👇"
 )
 OWNER_COMMANDS = (
@@ -108,12 +108,12 @@ def menu(uid: int, short: bool = False) -> tuple[str, InlineKeyboardMarkup]:
     """short — подпись к картинке-панели (у подписи лимит 1024 символа), полный список команд — кнопкой."""
     rows = [
         [Btn("🗂 Разобрать входящие", callback_data="m:razbor")],
-        [Btn("📁 Проекты", callback_data="m:projects"), Btn("➕ Добавить проект", callback_data="m:add")],
-        [Btn("🔎 Спросить по заметкам", callback_data="m:ask"), Btn("🗓 Расписание", callback_data="m:schedule")],
-        [Btn("⚙️ Настройки", callback_data="m:settings")],
+        [Btn("📥 Заметки", callback_data="m:s:notes"), Btn("📁 Проекты", callback_data="m:s:projects")],
+        [Btn("🤖 ИИ", callback_data="m:s:ai"), Btn("🗓 Планы", callback_data="m:s:plan")],
+        [Btn("⚙️ Настройки", callback_data="m:settings"), Btn("❓ Помощь", callback_data="m:s:help")],
     ]
     if is_owner(uid):
-        rows.append([Btn("👥 Участники", callback_data="m:members"), Btn("🎟 Пригласить", callback_data="m:invite")])
+        rows.append([Btn("👥 Команда", callback_data="m:s:team")])
     if short:
         rows.append([Btn("📜 Все команды", callback_data="m:help")])
         return MENU_SHORT, InlineKeyboardMarkup(rows)
@@ -153,10 +153,13 @@ def _with_home(kb: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup:
 
 async def _show(q, uid: int, section: str, text: str, kb: InlineKeyboardMarkup | None, parse_mode=None, home: bool = True) -> None:
     """Открывает раздел в панели: меняет картинку и подпись. Без картинок или с длинным текстом — обычным сообщением."""
-    if not (await _banners_on(uid) and _fits_caption(text)):
-        await q.message.reply_text(text, reply_markup=kb, parse_mode=parse_mode, disable_web_page_preview=True)
-        return
     kb = _with_home(kb) if home else kb
+    if not (await _banners_on(uid) and _fits_caption(text)):
+        if q.message.text and not q.message.photo:
+            await _edit(q, text, reply_markup=kb, parse_mode=parse_mode, disable_web_page_preview=True)
+        else:
+            await q.message.reply_text(text, reply_markup=kb, parse_mode=parse_mode, disable_web_page_preview=True)
+        return
     image = await banners.get(section)
     if q.message.photo:
         msg = await q.edit_message_media(InputMediaPhoto(image, caption=text, parse_mode=parse_mode), reply_markup=kb)
@@ -227,6 +230,184 @@ async def on_banner_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
         log.exception("banner button failed")
         await _fail(q, e)
 
+
+# ---------- 🧭 навигация: разделы, знакомство, подсказки, справка ----------
+# Меню — разделы, у каждой кнопки раздела строка пояснения. Знакомство (тур) при первом входе и по /tour.
+# Подсказки «❔»: первые HINT_TIMES раз бот сам поясняет шаг, потом только по кнопке «❔».
+# callback_data: m:s:<раздел> | tour:<номер> | tour:end | hp:<подсказка>
+
+def _section(uid: int, name: str) -> tuple[str, list[list[tuple[str, str]]]]:
+    """Текст раздела (по строке на кнопку) и кнопки (подпись, callback)."""
+    if name == "notes":
+        return (
+            "📥 <b>Заметки</b>\nПиши что угодно — всё станет заметкой: текст, фото, голосовые, документы.\n\n"
+            "🗂 <b>Разобрать</b> — решить про каждую заметку, что это и куда её\n"
+            "📌 <b>Куда писать</b> — новые заметки сразу в проект, без разбора\n"
+            "🔥 <b>Просроченное</b> — заметки, у которых прошёл срок\n"
+            "🏷 <b>Типы</b> — виды записей: идея, задача, референс…\n"
+            "☀️ <b>Чек-ины</b> — когда днём спрашивать о неразобранном",
+            [[("🗂 Разобрать", "m:razbor"), ("📌 Куда писать", "st:ap")],
+             [("🔥 Просроченное", "ov"), ("🏷 Типы", "m:types")], [("☀️ Чек-ины", "st:ci")]],
+        )  # fmt: skip
+    if name == "projects":
+        rows = [[("📁 Все проекты", "pl"), ("➕ Новый", "m:add")], [("📰 Лента", "m:feed"), ("🗂 Сферы", "m:areas")]]
+        text = (
+            "📁 <b>Проекты</b>\nПроект — папка для заметок. Сфера — уровень выше: «📷 Фотограф», «🎨 Дизайнер».\n\n"
+            "📁 <b>Все проекты</b> — карточки: описание, закрыть, иконка, «📌 писать сюда»\n"
+            "➕ <b>Новый</b> — ИИ сам нарисует ему иконку\n"
+            "📰 <b>Лента</b> — последние заметки проекта\n"
+            "🗂 <b>Сферы</b> — твои направления, ИИ учитывает их при раскрытии заметок"
+        )
+        if can_create_team(uid):
+            text += "\n👥 <b>Командный</b> — проект, куда пишут несколько участников"
+            rows.append([("👥 Командный", "m:team")])
+        return text, rows
+    if name == "ai":
+        return (
+            "🤖 <b>ИИ</b>\n\n"
+            "🔎 <b>Спросить по заметкам</b> — вопрос по проекту или за период: «что мы решили?»\n"
+            "🎨 <b>Арт-директор</b> — палитра, свет и цвет фото-референса\n"
+            "🎭 <b>Стиль</b> — как я с тобой разговариваю\n\n"
+            "Про одну заметку — кнопка «🤖 Спросить ИИ» в разборе.",
+            [[("🔎 Спросить", "m:ask"), ("🎨 Арт-директор", "m:ad")], [("🎭 Стиль", "m:style")]],
+        )
+    if name == "plan":
+        return (
+            "🗓 <b>Планы</b>\n\n"
+            "🗓 <b>Расписание</b> — обычная неделя словами, календарь в PDF A4\n"
+            "📊 <b>Отчёт</b> — настроение и дела за неделю картинкой",
+            [[("🗓 Расписание", "m:schedule"), ("📊 Отчёт", "m:report")]],
+        )
+    if name == "help":
+        return (
+            "❓ <b>Помощь</b>\n\n"
+            "🧭 <b>Знакомство</b> — 5 коротких экранов о главном\n"
+            "💬 <b>Спросить</b> — напиши вопрос, например «как добавить проект?»\n"
+            "📜 <b>Все команды</b> — полный список",
+            [[("🧭 Знакомство", "tour:0"), ("💬 Спросить", "m:helpq")], [("📜 Все команды", "m:help")]],
+        )
+    if name == "team" and is_owner(uid):
+        return (
+            "👥 <b>Команда</b>\n\n"
+            "🎟 <b>Пригласить</b> — одноразовый код для нового участника\n"
+            "👥 <b>Участники</b> — список, их стили, убрать человека\n"
+            "👥 <b>Командный проект</b> — заметки вместе с участниками\n"
+            "🖼 <b>Баннеры</b> — картинки разделов меню",
+            [[("🎟 Пригласить", "m:invite"), ("👥 Участники", "m:members")],
+             [("👥 Командный проект", "m:team"), ("🖼 Баннеры", "m:banners")]],
+        )  # fmt: skip
+    raise PermissionError("Такого раздела нет.")
+
+
+def _kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[Btn(label, callback_data=data) for label, data in row] for row in rows])
+
+
+TOUR = [
+    "👋 <b>Привет! Я складываю твои мысли в Notion.</b>\n\n"
+    "Пиши, присылай фото блокнота, голосовые и документы — каждое сообщение станет заметкой. "
+    "ИИ сам придумает название и коротко перескажет суть, а полный текст спрячет внутрь.",
+    "🗂 <b>Разбор</b>\n\n"
+    "Вечером я присылаю неразобранные заметки. Для каждой выбираешь, что это — 💡 идея, 📋 задача, ⏰ напоминание, "
+    "🎨 референс… — и в какой 📁 проект. Днём могу спросить, есть ли минутка разобрать (это чек-ины).",
+    "✨ <b>Раскрыть</b>\n\n"
+    "После выбора типа я задам несколько вопросов по одному и соберу подробное описание: для задачи — шаги, "
+    "для референса — что взять и как повторить, для идеи — как развить.",
+    "📁 <b>Проекты и ⏰ сроки</b>\n\n"
+    "Заметку можно сразу положить в проект кнопкой под ней. Если в заметке есть срок («завтра в 15»), я напомню. "
+    "Проект, который закончился, закрывается — заметки остаются.",
+    "🤖 <b>ИИ и настройки</b>\n\n"
+    "/ask — вопрос по всем заметкам проекта или за период. /style — как мне с тобой разговаривать. "
+    "/settings — часовой пояс и время.\n\nНе понятно, что делать? «❔» рядом с кнопками или /help и вопрос.",
+]
+
+HINT_TIMES = 3  # сколько раз бот сам поясняет шаг
+HINTS = {
+    "review": "Выбери, что это за запись: после этого она разобрана. ✨ — тип, который предлагает ИИ. «📁 В проект» и «⏰ Срок» — по желанию. «⏭ Позже» — вернуться потом.",
+    "expand": "«✨ Раскрыть»: ИИ задаст несколько вопросов по одному и допишет в заметку подробное описание под её тип.",
+    "interview": "Отвечай обычным сообщением. «⏭ Пропустить» — без ответа, «✅ Хватит» — собрать описание из того, что уже есть.",
+    "saved": "Заметка уже в Notion. «📁 В проект» — положить в проект сейчас; иначе вечером разберём вместе.",
+}
+HELP_PROMPT = "💬 Что непонятно? Напишите вопрос ответом на это сообщение, например «как добавить проект?»"
+
+
+async def _hint(uid: int, key: str, html: bool = True) -> str:
+    """Пояснение шага — первые HINT_TIMES раз, потом пусто (остаётся кнопка «❔»)."""
+    st = await scheduler.get_settings(uid)
+    seen = dict(st.get("hints") or {})
+    if seen.get(key, 0) >= HINT_TIMES:
+        return ""
+    seen[key] = seen.get(key, 0) + 1
+    await scheduler.update_settings(uid, hints=seen)
+    return "\n\n❔ " + (escape(HINTS[key]) if html else HINTS[key])
+
+
+def _tour_view(n: int) -> tuple[str, InlineKeyboardMarkup]:
+    n = max(0, min(n, len(TOUR) - 1))
+    text = f"{TOUR[n]}\n\n<i>{n + 1} из {len(TOUR)}</i>"
+    if n + 1 < len(TOUR):
+        row = [Btn("Пропустить", callback_data="tour:end"), Btn("Дальше ▶️", callback_data=f"tour:{n + 1}")]
+    else:
+        row = [Btn("🚀 Начать", callback_data="tour:end")]
+    return text, InlineKeyboardMarkup([row])
+
+
+async def send_tour(message: Message, uid: int) -> None:
+    await scheduler.update_settings(uid, toured=True)
+    text, kb = _tour_view(0)
+    await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def tour_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_tour(update.message, update.effective_user.id)
+
+
+async def on_tour_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    await q.answer()
+    if not is_member(uid):
+        return
+    step = q.data.split(":")[1]
+    if step == "end":
+        await scheduler.update_settings(uid, toured=True)
+        if q.message.photo:
+            text, kb = menu(uid, short=True)
+            await _show(q, uid, "menu", text, kb, ParseMode.HTML, home=False)
+        else:
+            await _edit(q, "Готово! Меню всегда здесь: /start", reply_markup=None)
+            await send_menu(q.message, uid)
+        return
+    text, kb = _tour_view(int(step))
+    await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def on_hint_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer(HINTS.get(q.data.split(":")[1], "Подсказки нет")[:200], show_alert=True)
+
+
+async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    question = re.sub(r"^/help(@\w+)?", "", update.message.text, count=1).strip()
+    if not question:
+        text, rows = _section(update.effective_user.id, "help")
+        await update.message.reply_text(text, reply_markup=_kb(rows), parse_mode=ParseMode.HTML)
+        return
+    await _help_answer(update.message, question)
+
+
+async def _help_answer(message: Message, question: str) -> None:
+    if not await ai_allowed(message):
+        return
+    status = await message.reply_text("💬 Смотрю в справке…")
+    try:
+        answer = await ai.help_answer(question)
+    except Exception as e:
+        log.exception("help failed")
+        await status.edit_text(f"❌ ИИ не ответил: {e}\nПолный список команд: /start → «❓ Помощь» → «📜 Все команды»."[:4000])
+        return
+    await _send_html(message, "💬 " + tg_html(answer)[:3900], status=status)
+
 # Ответ на это сообщение бота — названия проектов, а не заметка
 ADD_PROMPT = "Напишите названия проектов ответом на это сообщение: через запятую или каждый с новой строки."
 
@@ -282,8 +463,8 @@ async def _try_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE, raw: str) ->
         await update.message.reply_text("Код не подошёл: он неверный, уже использован или просрочен. Попросите новый.")
         return
     member.add_user_ids(user.id)
-    text, kb = menu(user.id)
-    await update.message.reply_text("✅ Добро пожаловать!\n\n" + text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await update.message.reply_text("✅ Добро пожаловать! Сейчас коротко покажу, как здесь всё устроено.")
+    await send_tour(update.message, user.id)
     who = f"@{user.username}" if user.username else user.full_name
     await ctx.bot.send_message(c.OWNER_ID, f"🎉 {person['name']} ({who}) вошёл(ла) по приглашению. Участники: /members")
 
@@ -594,6 +775,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             await stranger(update, ctx)
         return
+    if not (await scheduler.get_settings(uid)).get("toured"):
+        await send_tour(update.message, uid)
+        return
     await send_menu(update.message, uid)
 
 
@@ -627,12 +811,44 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         elif action == "schedule":
             text, kb = await _schedule_view(uid)
             await _show(q, uid, "schedule", text, kb, ParseMode.HTML)
+        elif action.startswith("s:"):
+            name = action[2:]
+            text, rows = _section(uid, name)
+            await _show(q, uid, name, text, _kb(rows), ParseMode.HTML)
         elif action == "home":
-            text, kb = menu(uid, short=True)
+            text, kb = menu(uid, short=await _banners_on(uid))
             await _show(q, uid, "menu", await styles.wrap(uid, "greeting", text, html=True), kb, ParseMode.HTML, home=False)
+        elif action == "types":
+            text, kb = await _types_view(uid)
+            await _show(q, uid, "notes", text, kb)
+        elif action == "feed":
+            projects = await notion.project_list(uid)
+            projects.sort(key=lambda p: p["kind"] != notion.KIND_TEAM)
+            rows = [[Btn(("👥 " if p["kind"] == notion.KIND_TEAM else "📁 ") + p["name"], callback_data=f"fd:{p['id']}")] for p in projects]
+            await _show(q, uid, "projects", "📰 Ленту какого проекта показать?" if projects else "Проектов пока нет: /addproject",
+                        InlineKeyboardMarkup(rows))  # fmt: skip
+        elif action == "areas":
+            items = await notion.spheres()
+            lines = [f"🗂 <b>{escape(a['name'])}</b>" + (f" — {escape(a['description'])}" if a["description"] else "") for a in items]
+            text = ("Сферы деятельности:\n\n" + "\n".join(lines)) if items else "Сфер пока нет."
+            await _show(q, uid, "projects", text + "\n\nДобавить или обновить описание: /addarea Название — описание", None, ParseMode.HTML)
+        elif action == "team":
+            if can_create_team(uid):
+                await q.message.reply_text(TEAM_PROMPT, reply_markup=ForceReply(input_field_placeholder="Сайт студии"))
+        elif action == "ad":
+            await q.message.reply_text(AD_PROMPT, reply_markup=ForceReply(input_field_placeholder="фото"))
+        elif action == "style":
+            text, kb = await _style_view(uid)
+            await _show(q, uid, "ai", text, kb)
+        elif action == "report":
+            await _show(q, uid, "report", *_report_view())
+        elif action == "banners" and is_owner(uid):
+            rows = [[Btn(f"🎨 {name}", callback_data=f"bn:{key}")] for key, name in banners.SECTIONS.items()]
+            await q.message.reply_text("🖼 Какой баннер нарисовать ИИ?", reply_markup=InlineKeyboardMarkup(rows))
+        elif action == "helpq":
+            await q.message.reply_text(HELP_PROMPT, reply_markup=ForceReply(input_field_placeholder="как добавить проект?"))
         elif action == "help":
-            text, _kb = menu(uid)
-            await q.message.reply_text(text, parse_mode=ParseMode.HTML)
+            await q.message.reply_text(menu(uid)[0], parse_mode=ParseMode.HTML)
     except Exception as e:
         log.exception("menu failed")
         await q.message.reply_text(f"❌ Ошибка: {e}"[:4000])
@@ -727,6 +943,7 @@ async def _save(
             pinned = None
     when_line = f"\n⏰ Напомню: {escape(await _when_label(user.id, idea.when))}" if idea.when else ""
     pin_line = f"\n📌 Сразу в «{escape(pinned['name'])}», без разбора (выключить: /settings)" if pinned else ""
+    note += "" if pinned else await _hint(user.id, "saved")
     await status.edit_text(
         await styles.wrap(user.id, "saved", f'✅ <b>{escape(idea.title)}</b>\n📄 <a href="{url}">Заметка — тут</a>{pin_line}{when_line}{note}', html=True),
         parse_mode=ParseMode.HTML,
@@ -805,6 +1022,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(PROJECT_DESC_MARK):
         await _project_desc_reply(update.message, reply.text)
+        return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == HELP_PROMPT:
+        await _help_answer(update.message, update.message.text)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text in PERSONA_PROMPTS:
         await _persona_step(update.message, reply.text)
@@ -981,7 +1201,8 @@ async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[s
         return text, InlineKeyboardMarkup(rows)
 
     types = await notion.types()
-    text += "Что это?" + (f" ✨ ИИ думает: {escape(item['ai_type'])}" if item.get("ai_type") in types else "")
+    text += "Что это за запись?" + (f" ✨ ИИ думает: {escape(item['ai_type'])}" if item.get("ai_type") in types else "")
+    text += await _hint(uid, "review")
     buttons = [
         Btn(f"✨ {t}" if t == item.get("ai_type") else t, callback_data=f"t:{item['id']}:{i}:{k}") for i, t in enumerate(types)
     ]
@@ -995,12 +1216,13 @@ async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[s
             Btn("⏰ Срок", callback_data=f"w:{item['id']}:{k}"),
         ]
     )
-    rows.append([Btn("🤖 ИИ", callback_data=f"a:{item['id']}"), Btn("👁 Целиком", callback_data=f"v:{item['id']}")])
-    nav = [Btn("🗑", callback_data=f"d:{item['id']}:{k}")]
+    rows.append([Btn("🤖 Спросить ИИ", callback_data=f"a:{item['id']}"), Btn("👁 Показать", callback_data=f"v:{item['id']}")])
+    nav = [Btn("🗑 Удалить", callback_data=f"d:{item['id']}:{k}")]
     if k > 0:
         nav.append(Btn("◀️", callback_data=f"r:{k - 1}"))
     nav.append(Btn("⏭ Позже", callback_data=f"r:{k + 1}"))
     rows.append(nav)
+    rows.append([Btn("❔ Что делать", callback_data="hp:review"), Btn("↩️ В меню", callback_data="m:home")])
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -1353,12 +1575,14 @@ async def _next_step(message: Message, status: Message | None = None) -> None:
     await _send_html(
         message,
         _interview_header(state)
-        + f"<b>Вопрос {n}:</b> {escape(question)}\n\n✍️ Просто напишите ответ следующим сообщением.",
+        + f"<b>Вопрос {n}:</b> {escape(question)}\n\n✍️ Просто напишите ответ следующим сообщением."
+        + ("" if n > 1 else f" Обычно вопросов 3–5, не больше {ai.MAX_QUESTIONS}.")
+        + await _hint(message.chat_id, "interview"),
         status=status,
         reply_markup=InlineKeyboardMarkup(
             [
                 [Btn("⏭ Пропустить", callback_data="xi:skip"), Btn("✅ Хватит, собрать", callback_data="xi:done")],
-                [Btn("✖️ Стоп", callback_data="xi:stop")],
+                [Btn("✖️ Стоп", callback_data="xi:stop"), Btn("❔", callback_data="hp:interview")],
             ]
         ),
     )
@@ -1678,7 +1902,7 @@ def _batch_view(state: dict) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([Btn(f"{mark} {item['title'][:40]}{where}", callback_data=f"bt:{i}")])
     rows.append([Btn("☑️ Все" if len(picked) < len(items) else "⬜ Никто", callback_data="ba")])
     if picked:
-        rows.append([Btn("📁 В проект", callback_data="bp"), Btn("🏷 Тип", callback_data="by"), Btn("🗑 Удалить", callback_data="bd")])
+        rows.append([Btn("📁 В проект", callback_data="bp"), Btn("🏷 Задать тип", callback_data="by"), Btn("🗑 Удалить", callback_data="bd")])
     rows.append([Btn("🔄 Обновить", callback_data="br"), Btn("✖️ Закрыть", callback_data="bx")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
@@ -2018,11 +2242,16 @@ async def _mood_comment(message: Message, prompt: str) -> None:
     await message.reply_text("💬 Записала ✓")
 
 
-async def report_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+def _report_view() -> tuple[str, InlineKeyboardMarkup]:
+    return (
         "📊 Отчёт за какую неделю? Сам он приходит по понедельникам в 10:00 за прошедшую.",
-        reply_markup=InlineKeyboardMarkup([[Btn("Эта неделя", callback_data="rp:cur"), Btn("Прошлая", callback_data="rp:prev")]]),
+        InlineKeyboardMarkup([[Btn("Эта неделя", callback_data="rp:cur"), Btn("Прошлая", callback_data="rp:prev")]]),
     )
+
+
+async def report_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = _report_view()
+    await update.message.reply_text(text, reply_markup=kb)
 
 
 async def on_report_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2955,11 +3184,13 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 item = await notion.page_info(page_id)
                 await _edit(q, 
                     f'<a href="{item["url"]}">{escape(item["title"])}</a> → {escape(names[idx])} ✓\n\n'
-                    "Раскрыть заметку под этот тип? ИИ задаст несколько вопросов по одному и соберёт подробное описание.",
+                    "Раскрыть заметку под этот тип? ИИ задаст несколько вопросов по одному и соберёт подробное описание."
+                    + await _hint(q.from_user.id, "expand"),
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                     reply_markup=InlineKeyboardMarkup(
-                        [[Btn("✨ Раскрыть", callback_data=f"x:{page_id}:{k}"), Btn("⏭ Следующая", callback_data=f"r:{k}")]]
+                        [[Btn("✨ Раскрыть", callback_data=f"x:{page_id}:{k}"), Btn("⏭ Следующая", callback_data=f"r:{k}")],
+                         [Btn("❔ Что такое «раскрыть»", callback_data="hp:expand")]]
                         + (
                             [[Btn("⏰ Поставить срок", callback_data=f"w:{page_id}:{k}")]]
                             if not item.get("when") and re.search(r"напомин|событ|задач", names[idx].lower())
@@ -3011,7 +3242,8 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- запуск ----------
 
 COMMANDS = [
-    ("start", "Меню всех команд"),
+    ("start", "Меню"),
+    ("help", "Помощь: /help и вопрос"),
     ("razbor", "Разобрать входящие"),
     ("projects", "Список проектов"),
     ("addproject", "Добавить проект"),
@@ -3169,7 +3401,7 @@ def build_app(webhook: bool) -> Application:
         builder = builder.updater(None)  # обновления приходят в наш сервер, встроенный не нужен
     app = builder.build()
     app.add_handler(TypeHandler(Update, private_only), group=-1)
-    app.add_handler(CommandHandler(["start", "help"], start))
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
     # Люди без доступа: что бы ни прислали, бот просит код приглашения
     app.add_handler(MessageHandler(~member, stranger))
@@ -3182,6 +3414,10 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_team_button, pattern=r"^(tm|fd|fv|fs):"))
     app.add_handler(CallbackQueryHandler(on_icon_button, pattern=r"^ic:"))
     app.add_handler(CommandHandler("style", style_cmd, filters=member))
+    app.add_handler(CommandHandler("help", help_cmd, filters=member))
+    app.add_handler(CommandHandler("tour", tour_cmd, filters=member))
+    app.add_handler(CallbackQueryHandler(on_tour_button, pattern=r"^tour:"))
+    app.add_handler(CallbackQueryHandler(on_hint_button, pattern=r"^hp:"))
     app.add_handler(CommandHandler(["artdirector", "ad"], artdirector_cmd, filters=member))
     app.add_handler(CallbackQueryHandler(on_ad_button, pattern=r"^ad:"))
     app.add_handler(CommandHandler("banners", banners_cmd, filters=owner))

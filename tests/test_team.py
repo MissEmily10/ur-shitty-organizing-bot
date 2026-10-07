@@ -86,7 +86,7 @@ async def run():
 
     # Аня входит по ссылке /start <код> (код в нижнем регистре и без дефиса тоже подходит)
     await app.process_update(h.text(f"/start {code.replace('-', '').lower()}", user=ANYA))
-    assert "Добро пожаловать" in h.texts(chat=77)[-1]
+    assert "Добро пожаловать" in h.texts(chat=77)[-2] and "1 из 5" in h.texts(chat=77)[-1], "после входа — знакомство"
     assert "/invite" not in h.texts(chat=77)[-1], "у участницы нет команд владелицы"
     assert any("Аня, дизайнер" in t and "вошёл" in t for t in h.texts(chat=42))
     # код одноразовый

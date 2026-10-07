@@ -574,3 +574,19 @@ async def art_director(image: bytes, palette: list[tuple[str, float]], context: 
         model=c.VISION_MODEL, messages=[{"role": "user", "content": _with_images([image], text)}], max_tokens=2500, temperature=0.4
     )
     return (response.choices[0].message.content or "").strip() or "🤷 Модель вернула пустой ответ."
+
+
+# ---------- ❓ справка ----------
+
+GUIDE_FILE = Path(__file__).resolve().parent.parent / "docs" / "GUIDE.md"
+HELP_PROMPT = """Ты справка Telegram-бота для заметок. Ответь на вопрос пользователя коротко, по шагам и только по справке ниже.
+Называй команды и кнопки точно так, как в справке. Если в справке ответа нет, честно скажи и предложи /start.
+
+{guide}
+
+Вопрос: {question}"""
+
+
+async def help_answer(question: str) -> str:
+    guide = GUIDE_FILE.read_text(encoding="utf-8")
+    return await _complete(HELP_PROMPT.format(guide=guide, question=question[:1000]), 1200) or "🤷 Не нашёл ответа. Загляните в /start."

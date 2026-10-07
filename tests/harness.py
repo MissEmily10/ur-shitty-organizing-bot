@@ -102,6 +102,9 @@ main.c.AUTO_ICONS = False
 from bot import scheduler as _scheduler  # noqa: E402
 
 _scheduler.DEFAULT_SETTINGS["banners"] = False
+# Знакомство при первом /start и автоподсказки — тоже выключены (проверяются в test_navigation)
+_scheduler.DEFAULT_SETTINGS["toured"] = True
+main.HINT_TIMES = 0
 
 REAL = {"_load_projects": _notion._load_projects, "spheres": _notion.spheres}
 _notion._load_projects, _notion.spheres = _no_projects, _no_spheres
