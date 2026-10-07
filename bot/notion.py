@@ -694,21 +694,24 @@ async def set_value(key: str, value: str) -> None:
 
 
 async def forget_old_marks(days: int = 14) -> int:
-    """Отметки планировщика старше двух недель больше не нужны: чистим, чтобы таблица не росла."""
+    """Отметки планировщика и дневные флаги старше двух недель больше не нужны: чистим, чтобы таблица не росла."""
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    data = await _call(
-        "POST",
-        f"/databases/{await service_db_id()}/query",
-        {
-            "filter": {
-                "and": [
-                    {"property": "Ключ", "title": {"starts_with": "done:"}},
-                    {"timestamp": "last_edited_time", "last_edited_time": {"before": since}},
-                ]
+    removed = 0
+    for prefix in ("done:", "checkin_off:", "quick:"):
+        data = await _call(
+            "POST",
+            f"/databases/{await service_db_id()}/query",
+            {
+                "filter": {
+                    "and": [
+                        {"property": "Ключ", "title": {"starts_with": prefix}},
+                        {"timestamp": "last_edited_time", "last_edited_time": {"before": since}},
+                    ]
+                },
+                "page_size": 100,
             },
-            "page_size": 100,
-        },
-    )
-    for row in data["results"]:
-        await trash(row["id"])
-    return len(data["results"])
+        )
+        for row in data["results"]:
+            await trash(row["id"])
+        removed += len(data["results"])
+    return removed

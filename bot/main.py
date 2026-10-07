@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import secrets
@@ -77,7 +78,7 @@ MENU = (
     "/addproject — добавить проект (бот спросит название)\n"
     "/types, /addtype — типы записей\n"
     "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
-    "/settings — часовой пояс и время вечернего разбора\n"
+    "/settings — часовой пояс, время разбора и дневных чек-инов\n"
     "{owner_commands}"
     "/start — это меню\n\n"
     "Или жми кнопку 👇"
@@ -273,6 +274,8 @@ TIMEZONES = [
 EVENING_TIMES = ["18:00", "19:00", "20:00", "21:00", "22:00", "23:00"]
 TZ_PROMPT = "🌍 Напишите часовой пояс ответом на это сообщение: например «Europe/Berlin», «Asia/Almaty» или «UTC+5»."
 TIME_PROMPT = "🌙 Во сколько присылать вечерний разбор? Напишите время ответом, например «21:30»."
+CHECKIN_PROMPT = "☀️ Во сколько присылать дневные чек-ины? Напишите время через запятую ответом, например «11, 15:30, 19»."
+CHECKIN_PRESETS = {"12141618": ["12:00", "14:00", "16:00", "18:00"], "1317": ["13:00", "17:00"], "15": ["15:00"], "off": []}
 
 
 def _tz_label(tz: str) -> str:
@@ -284,13 +287,18 @@ def _tz_label(tz: str) -> str:
 async def _settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     st = await scheduler.get_settings(uid)
     now = scheduler.local_now(st).strftime("%H:%M")
+    checkins = ", ".join(st.get("checkins") or []) or "выключены"
     text = (
         "⚙️ Настройки\n\n"
         f"🌍 Часовой пояс: {_tz_label(st['tz'])}, у вас сейчас {now}\n"
-        f"🌙 Вечерний разбор: {st['evening']}"
+        f"🌙 Вечерний разбор: {st['evening']}\n"
+        f"☀️ Дневные чек-ины: {checkins}"
     )
     return text, InlineKeyboardMarkup(
-        [[Btn("🌍 Часовой пояс", callback_data="st:tz"), Btn("🌙 Время разбора", callback_data="st:ev")]]
+        [
+            [Btn("🌍 Часовой пояс", callback_data="st:tz"), Btn("🌙 Время разбора", callback_data="st:ev")],
+            [Btn("☀️ Чек-ины", callback_data="st:ci")],
+        ]
     )
 
 
@@ -335,6 +343,24 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
             await q.answer()
             await q.message.reply_text(TIME_PROMPT, reply_markup=ForceReply(input_field_placeholder="21:30"))
             return
+        elif parts[1] == "ci" and len(parts) == 2:
+            rows = [
+                [Btn("12, 14, 16, 18", callback_data="st:ci:12141618"), Btn("13 и 17", callback_data="st:ci:1317")],
+                [Btn("Только 15:00", callback_data="st:ci:15"), Btn("✍️ Своё время", callback_data="st:cix")],
+                [Btn("🔕 Выключить", callback_data="st:ci:off"), Btn("↩️ Назад", callback_data="st:back")],
+            ]
+            await q.answer()
+            await q.edit_message_text(
+                "☀️ Когда днём спрашивать о неразобранном? Пишу только если оно есть.", reply_markup=InlineKeyboardMarkup(rows)
+            )
+            return
+        elif parts[1] == "ci":
+            await scheduler.update_settings(uid, checkins=CHECKIN_PRESETS[parts[2]])
+            await q.answer("Сохранено ✓")
+        elif parts[1] == "cix":
+            await q.answer()
+            await q.message.reply_text(CHECKIN_PROMPT, reply_markup=ForceReply(input_field_placeholder="11, 15:30, 19"))
+            return
         else:
             await q.answer()
         text, kb = await _settings_view(uid)
@@ -347,7 +373,13 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _settings_reply(message: Message, prompt: str) -> None:
     uid = message.chat_id
-    if prompt == TZ_PROMPT:
+    if prompt == CHECKIN_PROMPT:
+        times = [scheduler.parse_time(t) for t in re.split(r"[,;\s]+", message.text) if t.strip()]
+        if not times or None in times:
+            await message.reply_text("Не понял время. Пример: «11, 15:30, 19».")
+            return
+        await scheduler.update_settings(uid, checkins=sorted(set(times)))
+    elif prompt == TZ_PROMPT:
         if not scheduler.parse_tz(message.text):
             await message.reply_text("Не понял часовой пояс. Пример: «Europe/Berlin» или «UTC+5».")
             return
@@ -562,7 +594,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if is_owner(update.effective_user.id):
             await _create_invite(update.message, ctx, update.message.text)
         return
-    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text in (TZ_PROMPT, TIME_PROMPT):
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text in (TZ_PROMPT, TIME_PROMPT, CHECKIN_PROMPT):
         await _settings_reply(update.message, reply.text)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
@@ -1388,6 +1420,195 @@ async def send_overdue(bot, uid: int) -> None:
         )
 
 
+# ---------- ☀️ дневные чек-ины ----------
+# callback_data: ci:quick / ci:batch / ci:later / ci:off — ответ на чек-ин
+#   ⚡ быстро: kq (следующая карточка) | ka:<page> (актуально) | kn:<page> (неактуально → в корзину)
+#   📦 пачкой: bt:<номер> (галочка) | ba (все/никто) | bp → bpp:<проект> | by → byy:<тип> | bd → bdd (удалить) | br | bx
+
+BATCH_SIZE = 10
+# Состояние «пачки» по сообщению: id заметок списка и отмеченные. Если бот перезапустился — просим открыть заново.
+_batches: dict[tuple[int, int], dict] = {}
+
+
+async def _quick_seen(uid: int) -> tuple[str, list[str]]:
+    """Заметки, уже отмеченные «актуально» сегодня в быстром режиме: второй раз их не показываем."""
+    today = scheduler.local_now(await scheduler.get_settings(uid)).date().isoformat()
+    key = f"quick:{uid}:{today}"
+    return key, json.loads(await notion.get_value(key) or "[]")
+
+
+async def _quick_view(uid: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    _, seen = await _quick_seen(uid)
+    items = [i for i in await notion.review_items(uid) if i["id"] not in seen]
+    if not items:
+        return "⚡ Готово! Всё актуальное ждёт вечернего разбора.", None
+    item = items[0]
+    return (
+        f"⚡ Ещё {len(items)}. Актуально?\n\n<b>{escape(item['title'])}</b>",
+        InlineKeyboardMarkup(
+            [
+                [Btn("✅ Актуально", callback_data=f"ka:{item['id']}"), Btn("🗑 Неактуально", callback_data=f"kn:{item['id']}")],
+                [Btn("⏸ Хватит", callback_data="ci:later")],
+            ]
+        ),
+    )
+
+
+def _batch_view(state: dict) -> tuple[str, InlineKeyboardMarkup]:
+    items, picked = state["items"], state["picked"]
+    lines = [f"📦 Отметьте заметки и выберите, что с ними сделать. Отмечено: {len(picked)}"]
+    rows = []
+    for i, item in enumerate(items):
+        mark = "☑️" if item["id"] in picked else "⬜"
+        where = f" · 📁 {item['project']}" if item["project"] else ""
+        rows.append([Btn(f"{mark} {item['title'][:40]}{where}", callback_data=f"bt:{i}")])
+    rows.append([Btn("☑️ Все" if len(picked) < len(items) else "⬜ Никто", callback_data="ba")])
+    if picked:
+        rows.append([Btn("📁 В проект", callback_data="bp"), Btn("🏷 Тип", callback_data="by"), Btn("🗑 Удалить", callback_data="bd")])
+    rows.append([Btn("🔄 Обновить", callback_data="br"), Btn("✖️ Закрыть", callback_data="bx")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def _new_batch(uid: int) -> dict:
+    return {"items": (await notion.review_items(uid))[:BATCH_SIZE], "picked": set()}
+
+
+async def on_checkin_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    action = q.data.split(":")[1]
+    try:
+        if action == "later":
+            await q.answer("Ок, вечером разберём")
+            await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("🌙 Отложено на вечер", callback_data="noop")]]))
+        elif action == "off":
+            await scheduler.checkins_off_today(uid)
+            await q.answer("Сегодня больше не спрошу")
+            await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("🔕 Сегодня больше не спрашиваю", callback_data="noop")]]))
+        elif action == "quick":
+            await q.answer()
+            text, kb = await _quick_view(uid)
+            await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:  # batch
+            await q.answer()
+            state = await _new_batch(uid)
+            if not state["items"]:
+                await q.message.reply_text("🎉 Разбирать нечего!")
+                return
+            text, kb = _batch_view(state)
+            sent = await q.message.reply_text(text, reply_markup=kb)
+            _batches[(uid, sent.message_id)] = state
+    except Exception as e:
+        log.exception("checkin button failed")
+        await _fail(q, e)
+
+
+async def on_quick_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    action, _, page_id = q.data.partition(":")
+    try:
+        if page_id:
+            await own_page(uid, page_id)
+        if action == "ka":
+            key, seen = await _quick_seen(uid)
+            await notion.set_value(key, json.dumps(seen + [page_id]))
+            await q.answer("Ждёт вечера ✓")
+        elif action == "kn":
+            await notion.trash(page_id)
+            await q.answer("В корзине (можно восстановить в Notion)")
+        else:
+            await q.answer()
+        text, kb = await _quick_view(uid)
+    except Exception as e:
+        log.exception("quick button failed")
+        await _fail(q, e)
+        return
+    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    key = (uid, q.message.message_id)
+    action, _, arg = q.data.partition(":")
+    state = _batches.get(key)
+    try:
+        if action == "bx":
+            _batches.pop(key, None)
+            await q.answer()
+            await q.edit_message_text("📦 Закрыто.")
+            return
+        if state is None or action == "br":
+            # Бот перезапускался или просили обновить — собираем список заново
+            state = _batches[key] = await _new_batch(uid)
+            await q.answer("Список обновлён" if action == "br" else "Список устарел, вот свежий")
+        elif action == "bt":
+            item_id = state["items"][int(arg)]["id"]
+            state["picked"] ^= {item_id}
+            await q.answer()
+        elif action == "ba":
+            all_ids = {i["id"] for i in state["items"]}
+            state["picked"] = set() if state["picked"] == all_ids else all_ids
+            await q.answer()
+        elif action in ("bp", "by"):
+            names = await (notion.projects() if action == "bp" else notion.types())
+            code = "bpp" if action == "bp" else "byy"
+            buttons = [Btn(f"📁 {n}" if action == "bp" else n, callback_data=f"{code}:{i}") for i, n in enumerate(names)]
+            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)] + [[Btn("↩️ Назад", callback_data="bb")]]
+            await q.answer()
+            title = "В какой проект отправить отмеченные?" if action == "bp" else "Какой тип у отмеченных? После этого они разобраны."
+            await q.edit_message_text(title, reply_markup=InlineKeyboardMarkup(rows))
+            return
+        elif action == "bd":
+            await q.answer()
+            await q.edit_message_text(
+                f"Удалить отмеченные ({len(state['picked'])})? Их можно будет восстановить из корзины Notion.",
+                reply_markup=InlineKeyboardMarkup([[Btn("Да, удалить", callback_data="bdd"), Btn("↩️ Назад", callback_data="bb")]]),
+            )
+            return
+        elif action in ("bpp", "byy", "bdd"):
+            picked = list(state["picked"])
+            for page_id in picked:
+                await own_page(uid, page_id)
+            if action == "bpp":
+                name = (await notion.projects())[int(arg)]
+                for page_id in picked:
+                    await notion.file_to_project(page_id, name)
+                await q.answer(f"→ {name}: {len(picked)}")
+            elif action == "byy":
+                name = (await notion.types())[int(arg)]
+                for page_id in picked:
+                    await notion.set_type(page_id, name)
+                await q.answer(f"{name}: {len(picked)} ✓")
+            else:
+                for page_id in picked:
+                    await notion.trash(page_id)
+                await q.answer(f"Удалено: {len(picked)}")
+            state = _batches[key] = await _new_batch(uid)
+        else:  # bb — назад к списку
+            await q.answer()
+        if not state["items"]:
+            _batches.pop(key, None)
+            await q.edit_message_text("🎉 Всё разобрано!")
+            return
+        text, kb = _batch_view(state)
+    except Exception as e:
+        log.exception("batch button failed")
+        await _fail(q, e)
+        return
+    await q.edit_message_text(text, reply_markup=kb)
+
+
 # ---------- 🏷 типы (общие, как проекты: добавлять могут все, удалять — только владелица) ----------
 # callback_data: ta:<номер> (спросить про удаление)  |  tk:<номер> (удалить)  |  tl (список)
 
@@ -1771,6 +1992,9 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_type_button, pattern=r"^t[akl]"))
     app.add_handler(CallbackQueryHandler(on_when_button, pattern=r"^w[vcx]?:"))
     app.add_handler(CallbackQueryHandler(on_deadline_button, pattern=r"^(dl:|ov$)"))
+    app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))
+    app.add_handler(CallbackQueryHandler(on_quick_button, pattern=r"^k[qan]"))
+    app.add_handler(CallbackQueryHandler(on_batch_button, pattern=r"^b(t|a|p|pp|y|yy|d|dd|r|x|b)(:|$)"))
     app.add_handler(CallbackQueryHandler(on_settings_button, pattern=r"^st:"))
     app.add_handler(CommandHandler("invite", invite_cmd, filters=owner))
     app.add_handler(CommandHandler("members", members_cmd, filters=owner))

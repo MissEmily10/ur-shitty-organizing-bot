@@ -160,9 +160,11 @@ async def run():
     # 6. Вечером — просроченное
     pages["d" * 32]["when"] = "2026-10-05"
     await scheduler.tick(bot, [42], now=utc(8, 17, 0))
-    assert "🔥 Просрочено: 1" in h.texts(chat=42)[-1], h.texts(chat=42)[-1]
+    # просрочены «Сдать макет» (5-го) и не отмеченное «Позвонить» (7-го в 18:00)
+    assert "🔥 Просрочено: 2" in h.texts(chat=42)[-1], h.texts(chat=42)[-1]
     await app.process_update(h.callback("ov"))
-    assert "🔥" in h.texts(chat=42)[-1] and "Сдать макет" in h.texts(chat=42)[-1]
+    shown = h.texts(chat=42)[-2:]
+    assert all(t.startswith("🔥") for t in shown) and any("Сдать макет" in t for t in shown), shown
 
     # 7. Готово и перенести
     await app.process_update(h.callback(f"dl:ok:{'d' * 32}"))

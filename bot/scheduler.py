@@ -24,7 +24,7 @@ from .whenparse import human
 
 log = logging.getLogger("scheduler")
 
-DEFAULT_SETTINGS = {"tz": "Europe/Moscow", "evening": "20:00"}
+DEFAULT_SETTINGS = {"tz": "Europe/Moscow", "evening": "20:00", "checkins": ["12:00", "14:00", "16:00", "18:00"]}
 SETTINGS_TTL = 3600  # секунд держим настройки в памяти, чтобы не спрашивать Notion на каждом тике
 
 _settings_cache: dict[int, tuple[float, dict]] = {}
@@ -107,7 +107,7 @@ async def mark_done(key: str) -> None:
 class Job:
     name: str
     due: Callable[[datetime, dict], str | None]  # (местное время, настройки) → ключ периода, если пора, иначе None
-    run: Callable[[Bot, int], Awaitable[str]]  # отправить человеку, вернуть строку для отчёта
+    run: Callable[[Bot, int, datetime], Awaitable[str]]  # (бот, человек, его местное время) → строка для отчёта
 
 
 def _evening_due(now: datetime, settings: dict) -> str | None:
@@ -116,9 +116,9 @@ def _evening_due(now: datetime, settings: dict) -> str | None:
     return now.date().isoformat() if now.time() >= time(hh, mm) else None
 
 
-async def overdue(uid: int, settings: dict) -> list[dict]:
+async def overdue(uid: int, settings: dict, now: datetime | None = None) -> list[dict]:
     """Невыполненные заметки, срок которых уже прошёл (дата без времени — просрочена со следующего дня)."""
-    now = local_now(settings)
+    now = now or local_now(settings)
     items = await notion.dated_items(uid, before=now.isoformat())
     return [i for i in items if _deadline(i["when"], now) < now]
 
@@ -130,9 +130,9 @@ def _deadline(iso: str, now: datetime) -> datetime:
     return datetime.combine(datetime.fromisoformat(iso).date() + timedelta(days=1), time(0, 0), now.tzinfo)
 
 
-async def _evening_run(bot: Bot, uid: int) -> str:
+async def _evening_run(bot: Bot, uid: int, now: datetime) -> str:
     items = await notion.review_items(uid)
-    late = await overdue(uid, await get_settings(uid))
+    late = await overdue(uid, await get_settings(uid), now)
     if not items and not late:
         return "разбирать нечего"
     lines, buttons = [], []
@@ -199,7 +199,59 @@ async def _reminders(bot: Bot, uid: int, now: datetime, settings: dict) -> list[
     return sent
 
 
-JOBS = [Job("evening", _evening_due, _evening_run)]
+# ---------- ☀️ дневные чек-ины ----------
+
+CHECKIN_WINDOW = timedelta(hours=1)  # чек-ин, пропущенный дольше часа (бот лежал), уже не шлём
+
+
+def _minutes(hhmm: str) -> int:
+    hh, mm = map(int, hhmm.split(":"))
+    return hh * 60 + mm
+
+
+def _checkin_due(now: datetime, settings: dict) -> str | None:
+    """Последний наступивший слот чек-ина за последний час. Слот рядом с вечерним разбором пропускаем:
+    вечером и так придёт разбор."""
+    minute = now.hour * 60 + now.minute
+    evening = _minutes(settings["evening"])
+    passed = [
+        t for t in settings.get("checkins", [])
+        if 0 <= minute - _minutes(t) < CHECKIN_WINDOW.seconds // 60 and abs(_minutes(t) - evening) > 30
+    ]  # fmt: skip
+    return f"{now.date().isoformat()}T{max(passed)}" if passed else None
+
+
+def checkin_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [Btn("⚡ Быстро", callback_data="ci:quick"), Btn("📦 Пачкой", callback_data="ci:batch")],
+            [Btn("🌙 На вечер", callback_data="ci:later"), Btn("🔕 Сегодня хватит", callback_data="ci:off")],
+        ]
+    )
+
+
+async def _checkin_run(bot: Bot, uid: int, now: datetime) -> str:
+    today = now.date().isoformat()
+    if await notion.get_value(f"checkin_off:{uid}:{today}") is not None:
+        return "выключены на сегодня"
+    items = await notion.review_items(uid)
+    if not items:
+        return "разбирать нечего"
+    await bot.send_message(
+        uid,
+        f"☀️ Неразобранных заметок: {len(items)}. Сколько у тебя сейчас времени?\n"
+        "⚡ пара минут — пробежимся по актуальности\n📦 побольше — разберём пачкой\n🌙 нет — всё подождёт вечера",
+        reply_markup=checkin_markup(),
+    )
+    return f"чек-ин, заметок {len(items)}"
+
+
+async def checkins_off_today(uid: int) -> None:
+    today = local_now(await get_settings(uid)).date().isoformat()
+    await notion.set_value(f"checkin_off:{uid}:{today}", "1")
+
+
+JOBS = [Job("evening", _evening_due, _evening_run), Job("checkin", _checkin_due, _checkin_run)]
 
 
 async def tick(bot: Bot, user_ids: list[int], now: datetime | None = None, force: str | None = None) -> str:
@@ -214,7 +266,7 @@ async def tick(bot: Bot, user_ids: list[int], now: datetime | None = None, force
                 for job in JOBS:
                     if force:
                         if job.name == force:
-                            report.append(f"{uid} {job.name}: {await job.run(bot, uid)} (проверка)")
+                            report.append(f"{uid} {job.name}: {await job.run(bot, uid, current)} (проверка)")
                         continue
                     period = job.due(current, settings)
                     if not period:
@@ -224,7 +276,7 @@ async def tick(bot: Bot, user_ids: list[int], now: datetime | None = None, force
                         continue
                     # Отметку ставим до отправки: лучше в редком сбое не отправить, чем отправить дважды
                     await mark_done(key)
-                    report.append(f"{uid} {job.name}: {await job.run(bot, uid)}")
+                    report.append(f"{uid} {job.name}: {await job.run(bot, uid, current)}")
                 if not force:
                     for item in await _reminders(bot, uid, now or datetime.now(timezone.utc), settings):
                         report.append(f"{uid} напоминание: {item}")
