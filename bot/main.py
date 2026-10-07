@@ -23,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, documents, notion, pdf, schedule, scheduler, team, weekly, whenparse
+from . import ai, documents, notion, pdf, schedule, scheduler, styles, team, weekly, whenparse
 from . import config as c
 from .markdown import chunks as _chunks, tg_html, to_blocks
 
@@ -84,6 +84,7 @@ MENU = (
     "/schedule — расписание и календарь в PDF\n"
     "/report — недельный отчёт: настроение и дела\n"
     "/settings — часовой пояс, время разбора и дневных чек-инов\n"
+    "/style — как бот с тобой разговаривает: стиль или свой персонаж\n"
     "{owner_commands}"
     "/start — это меню\n\n"
     "Или жми кнопку 👇"
@@ -202,8 +203,16 @@ async def _members_view() -> tuple[str, InlineKeyboardMarkup | None]:
     if people:
         lines.append("👥 Участники:")
         for m in people:
-            lines.append(f"• {m['name']}" + (f" ({m['username']})" if m["username"] else ""))
-            rows.append([Btn(f"🗑 Убрать {m['name']}", callback_data=f"mr:{m['tg']}")])
+            style = (await scheduler.get_settings(m["tg"])).get("style") or "standard"
+            persona = await styles.persona(m["tg"]) if style == styles.CUSTOM else None
+            lines.append(
+                f"• {m['name']}" + (f" ({m['username']})" if m["username"] else "")
+                + (f" · 🎭 {styles.style_name(style, persona and persona['name'])}" if style != "standard" else "")
+            )
+            row = [Btn(f"🗑 Убрать {m['name']}", callback_data=f"mr:{m['tg']}")]
+            if style != "standard":
+                row.append(Btn("🎭 Сбросить стиль", callback_data=f"ms:{m['tg']}"))
+            rows.append(row)
     if pending:
         lines.append("\n🎟 Неиспользованные приглашения:")
         for inv in pending:
@@ -255,6 +264,13 @@ async def on_member_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         elif action == "mi":
             await notion.remove_person(arg)
             await q.answer("Код отозван")
+        elif action == "ms":
+            await scheduler.update_settings(int(arg), style="standard")
+            await q.answer("Стиль сброшен на обычный")
+            try:
+                await ctx.bot.send_message(int(arg), "🎭 Владелица вернула обычный стиль общения. Выбрать другой: /style")
+            except Exception:
+                log.info("could not notify member about style reset")
         else:
             await q.answer()
         text, kb = await _members_view()
@@ -451,7 +467,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await stranger(update, ctx)
         return
     text, kb = menu(uid)
-    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(await styles.wrap(uid, "greeting", text, html=True), reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -565,7 +581,7 @@ async def _save(
         )
     except Exception as e:
         log.exception("save failed")
-        await status.edit_text(f"❌ Не получилось сохранить: {e}"[:4000])
+        await status.edit_text(await styles.wrap(user.id, "error", f"❌ Не получилось сохранить: {e}"[:3800]))
         return
     pinned = await _pinned_project(user.id)
     if pinned:
@@ -579,7 +595,7 @@ async def _save(
     when_line = f"\n⏰ Напомню: {escape(await _when_label(user.id, idea.when))}" if idea.when else ""
     pin_line = f"\n📌 Сразу в «{escape(pinned['name'])}», без разбора (выключить: /settings)" if pinned else ""
     await status.edit_text(
-        f'✅ <b>{escape(idea.title)}</b>\n📄 <a href="{url}">Заметка — тут</a>{pin_line}{when_line}{note}',
+        await styles.wrap(user.id, "saved", f'✅ <b>{escape(idea.title)}</b>\n📄 <a href="{url}">Заметка — тут</a>{pin_line}{when_line}{note}', html=True),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
         reply_markup=_panel(page_id, pinned["name"] if pinned else None, when=idea.when),
@@ -656,6 +672,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(PROJECT_DESC_MARK):
         await _project_desc_reply(update.message, reply.text)
+        return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text in PERSONA_PROMPTS:
+        await _persona_step(update.message, reply.text)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == TEAM_PROMPT:
         if can_create_team(update.effective_user.id):
@@ -798,7 +817,7 @@ async def on_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
     items = await notion.review_items(uid)
     if not items:
-        return "🎉 Всё разобрано!", None
+        return await styles.wrap(uid, "all_done", "🎉 Всё разобрано!", html=True), None
     if k >= len(items):
         return f"Остальное пропущено. В разборе ещё: {len(items)}.", InlineKeyboardMarkup(
             [[Btn("↩️ Сначала", callback_data="r:0")]]
@@ -1435,7 +1454,7 @@ async def on_deadline_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
         item = await own_page(uid, page_id)
         if action == "ok":
             await notion.set_done(page_id)
-            await q.answer("Готово ✓")
+            await q.answer((await styles.line(uid, "praise")) or "Готово ✓")
             await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("✅ Готово", callback_data="noop")]]))
             return
         if action == "sn":
@@ -1656,7 +1675,7 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer()
         if not state["items"]:
             _batches.pop(key, None)
-            await q.edit_message_text("🎉 Всё разобрано!")
+            await q.edit_message_text(await styles.wrap(uid, "all_done", "🎉 Всё разобрано!"))
             return
         text, kb = _batch_view(state)
     except Exception as e:
@@ -2244,6 +2263,160 @@ async def areas_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Сферы деятельности:\n\n" + "\n".join(lines) + "\n\nОбновить описание: /addarea Название — новое описание", parse_mode=ParseMode.HTML)
 
 
+# ---------- 🎭 стиль бота ----------
+# Тон реплик у каждого свой: встроенные стили, «Эминемовна» (когда заполним профиль) или свой персонаж из Character.AI.
+# callback_data: sy:<стиль> (выбрать) | sy:new (перенести своего персонажа) | sy:redo (переписать реплики) | sy:ok
+
+PERSONA_STEPS = [
+    ("name", "🧩 Шаг 1 из 4. Как зовут персонажа? Напишите ответом на это сообщение."),
+    ("description", "🧩 Шаг 2 из 4. Характер и описание: скопируйте со страницы персонажа в Character.AI или опишите своими словами."),
+    ("greeting", "🧩 Шаг 3 из 4. Приветствие персонажа — его первая реплика."),
+    ("examples", "🧩 Шаг 4 из 4. 2–3 примера его реплик, каждая с новой строки."),
+]
+PERSONA_PROMPTS = {prompt: i for i, (_, prompt) in enumerate(PERSONA_STEPS)}
+PERSONA_LIMIT = 3  # новых наборов реплик своего персонажа в день у участника (у владелицы без лимита)
+_persona_drafts: dict[int, dict] = {}
+
+
+async def _style_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    st = await scheduler.get_settings(uid)
+    current = st.get("style") or "standard"
+    mine = await styles.persona(uid)
+    sample = await styles.line(uid, "saved")
+    text = (
+        "🎭 Как мне с тобой разговаривать?\nСтиль меняет только мои реплики: заметки и кнопки остаются как есть.\n\n"
+        f"Сейчас: {styles.style_name(current, mine and mine['name'])}" + (f"\nНапример: «{sample}»" if sample else "")
+    )
+    if is_owner(uid) and not styles.eminemovna_profile():
+        text += f"\n\n{styles.EMINEMOVNA_NAME} появится здесь, когда заполним профиль в styles/eminemovna.md."
+    buttons = [Btn(("✓ " if key == current else "") + v["name"], callback_data=f"sy:{key}") for key, v in styles.BUILTIN.items()]
+    if styles.eminemovna_profile():
+        mark = "✓ " if current == styles.EMINEMOVNA else ""
+        buttons.append(Btn(mark + styles.EMINEMOVNA_NAME, callback_data=f"sy:{styles.EMINEMOVNA}"))
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    if mine:
+        rows.append([Btn(("✓ " if current == styles.CUSTOM else "") + f"🧩 {mine['name']}", callback_data=f"sy:{styles.CUSTOM}")])
+    rows.append([Btn("🧩 Другой персонаж" if mine else "🧩 Свой персонаж из Character.AI", callback_data="sy:new")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def style_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = await _style_view(update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def _persona_allowed(message: Message) -> bool:
+    """Не больше PERSONA_LIMIT наборов реплик в день: каждый — запрос к ИИ на токене владелицы."""
+    uid = message.chat_id
+    if is_owner(uid):
+        return True
+    key = f"persona_gen:{uid}:{datetime.now(timezone.utc):%Y-%m-%d}"
+    used = int(await notion.get_value(key) or 0)
+    if used >= PERSONA_LIMIT:
+        await message.reply_text(f"⛔ Персонажа можно менять {PERSONA_LIMIT} раза в день, продолжим завтра.")
+        return False
+    await notion.set_value(key, str(used + 1))
+    return True
+
+
+async def _persona_sample(message: Message, p: dict) -> None:
+    pack = p.get("pack") or {}
+    lines = [styles._pick(pack, k) for k in ("greeting", "saved", "all_done")]
+    text = f"🧩 Вот как я буду с тобой говорить в роли «{p['name']}»:\n\n" + "\n".join(f"— {x}" for x in lines if x)
+    await message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [Btn("✅ Оставить", callback_data="sy:ok"), Btn("🔄 Переделать", callback_data="sy:redo")],
+            [Btn("↩️ Обычный стиль", callback_data="sy:standard")],
+        ]),  # fmt: skip
+    )
+
+
+async def _build_persona(message: Message, p: dict) -> None:
+    uid = message.chat_id
+    if not await _persona_allowed(message) or not await ai_allowed(message):
+        return
+    status = await message.reply_text(f"🧩 Пишу реплики персонажа «{p['name']}»…")
+    try:
+        p["pack"] = await styles.generate_pack(styles.persona_card(p))
+    except PermissionError as e:
+        await status.edit_text(f"🙅 {e}")
+        return
+    except Exception as e:
+        log.exception("persona failed")
+        await status.edit_text(f"❌ Не получилось: {e}"[:4000])
+        return
+    await styles.save_persona(uid, p)
+    await scheduler.update_settings(uid, style=styles.CUSTOM)
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await _persona_sample(message, p)
+
+
+async def _persona_step(message: Message, prompt: str) -> None:
+    uid = message.chat_id
+    step = PERSONA_PROMPTS[prompt]
+    draft = _persona_drafts.get(uid)
+    if draft is None or step != len(draft):
+        await message.reply_text("Что-то сбилось. Начнём заново: /style → «🧩 Свой персонаж».")
+        _persona_drafts.pop(uid, None)
+        return
+    draft[PERSONA_STEPS[step][0]] = message.text.strip()[:3000]
+    if step + 1 < len(PERSONA_STEPS):
+        await message.reply_text(PERSONA_STEPS[step + 1][1], reply_markup=ForceReply())
+        return
+    _persona_drafts.pop(uid, None)
+    await _build_persona(message, draft)
+
+
+async def on_style_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    choice = q.data.split(":", 1)[1]
+    try:
+        if choice == "ok":
+            await q.answer("Оставили ✓")
+            await q.edit_message_reply_markup(None)
+            return
+        if choice == "new":
+            await q.answer()
+            _persona_drafts[uid] = {}
+            await q.message.reply_text(
+                "🧩 Перенесём персонажа к нам: я спрошу 4 вещи по очереди. Скопируйте их со страницы персонажа "
+                "в Character.AI. Персонаж меняет только тон моих ответов.",
+            )
+            await q.message.reply_text(PERSONA_STEPS[0][1], reply_markup=ForceReply())
+            return
+        if choice == "redo":
+            p = await styles.persona(uid)
+            await q.answer()
+            if not p:
+                await q.message.reply_text("Персонажа нет. Создать: /style → «🧩 Свой персонаж».")
+                return
+            await q.edit_message_reply_markup(None)
+            await _build_persona(q.message, p)
+            return
+        if choice in styles.BUILTIN or (choice == styles.EMINEMOVNA and styles.eminemovna_profile()):
+            await scheduler.update_settings(uid, style=choice)
+        elif choice == styles.CUSTOM and await styles.persona(uid):
+            await scheduler.update_settings(uid, style=choice)
+        else:
+            await q.answer("Этот стиль недоступен")
+            return
+        await q.answer("Сохранено ✓")
+        text, kb = await _style_view(uid)
+    except Exception as e:
+        log.exception("style button failed")
+        await _fail(q, e)
+        return
+    await q.edit_message_text(text, reply_markup=kb)
+
+
 # ---------- 🎨 ИИ-иконки проектов ----------
 # При создании проекта ИИ придумывает образ, генератор картинок рисует иконку в стиле из design/icon_style.md,
 # бот сразу ставит её на страницу проекта в Notion и показывает: оставить, другой вариант или без иконки.
@@ -2636,6 +2809,7 @@ COMMANDS = [
     ("feed", "Лента заметок проекта"),
     ("ask", "Спросить ИИ по заметкам"),
     ("settings", "Часовой пояс и время разбора"),
+    ("style", "Стиль общения бота"),
     ("schedule", "Расписание и PDF"),
     ("report", "Недельный отчёт"),
     ("types", "Типы записей"),
@@ -2796,6 +2970,8 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("feed", feed_cmd, filters=member))
     app.add_handler(CallbackQueryHandler(on_team_button, pattern=r"^(tm|fd|fv|fs):"))
     app.add_handler(CallbackQueryHandler(on_icon_button, pattern=r"^ic:"))
+    app.add_handler(CommandHandler("style", style_cmd, filters=member))
+    app.add_handler(CallbackQueryHandler(on_style_button, pattern=r"^sy:"))
     app.add_handler(CommandHandler("settings", settings_cmd, filters=member))
     app.add_handler(CommandHandler("types", types_cmd, filters=member))
     app.add_handler(CommandHandler("addtype", addtype, filters=member))
@@ -2813,7 +2989,7 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_settings_button, pattern=r"^st:"))
     app.add_handler(CommandHandler("invite", invite_cmd, filters=owner))
     app.add_handler(CommandHandler("members", members_cmd, filters=owner))
-    app.add_handler(CallbackQueryHandler(on_member_button, pattern=r"^m[rkil]"))
+    app.add_handler(CallbackQueryHandler(on_member_button, pattern=r"^m[rkils]"))
     app.add_handler(CallbackQueryHandler(on_scope_button, pattern=r"^q:"))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|x|pj|p|d|v):"))
     app.add_handler(CallbackQueryHandler(on_expand_button, pattern=r"^x[sc]:"))

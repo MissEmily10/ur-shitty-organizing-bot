@@ -19,7 +19,7 @@ from telegram import Bot
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup
 
-from . import notion, team, weekly
+from . import notion, styles, team, weekly
 from .whenparse import human
 
 log = logging.getLogger("scheduler")
@@ -147,7 +147,8 @@ async def _evening_run(bot: Bot, uid: int, now: datetime) -> str:
     if late:
         lines.append(f"🔥 Просрочено: {len(late)}")
         buttons.append(Btn("🔥 Показать", callback_data="ov"))
-    await bot.send_message(uid, "\n".join(lines), reply_markup=InlineKeyboardMarkup([buttons]))
+    text = await styles.wrap(uid, "evening", "\n".join(lines))
+    await bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup([buttons]))
     return f"пуш: разбор {len(items)}, просрочено {len(late)}"
 
 
@@ -195,7 +196,7 @@ async def _reminders(bot: Bot, uid: int, now: datetime, settings: dict) -> list[
             await mark_done(key)
             await bot.send_message(
                 uid,
-                f'{label}: <a href="{item["url"]}">{escape(item["title"])}</a> — {escape(human(item["when"], local))}',
+                await styles.wrap(uid, "reminder", f'{label}: <a href="{item["url"]}">{escape(item["title"])}</a> — {escape(human(item["when"], local))}', html=True),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
                 reply_markup=reminder_markup(item["id"]),
@@ -244,8 +245,9 @@ async def _checkin_run(bot: Bot, uid: int, now: datetime) -> str:
         return "разбирать нечего"
     await bot.send_message(
         uid,
-        f"☀️ Неразобранных заметок: {len(items)}. Сколько у тебя сейчас времени?\n"
-        "⚡ пара минут — пробежимся по актуальности\n📦 побольше — разберём пачкой\n🌙 нет — всё подождёт вечера",
+        await styles.wrap(uid, "checkin",
+            f"☀️ Неразобранных заметок: {len(items)}. Сколько у тебя сейчас времени?\n"
+            "⚡ пара минут — пробежимся по актуальности\n📦 побольше — разберём пачкой\n🌙 нет — всё подождёт вечера"),
         reply_markup=checkin_markup(),
     )
     return f"чек-ин, заметок {len(items)}"
@@ -315,7 +317,7 @@ async def _mood_run(bot: Bot, uid: int, now: datetime) -> str:
     day = now.date().isoformat()
     if (await notion.moods(uid)).get(day, (None, ""))[0]:
         return "уже отмечено"
-    await bot.send_message(uid, "😊 Как настроение сегодня?", reply_markup=mood_markup(day))
+    await bot.send_message(uid, await styles.wrap(uid, "mood", "😊 Как настроение сегодня?"), reply_markup=mood_markup(day))
     return "спросили настроение"
 
 

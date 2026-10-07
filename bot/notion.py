@@ -733,7 +733,10 @@ async def get_value(key: str) -> str | None:
 
 async def set_value(key: str, value: str) -> None:
     row = await _service_row(key)
-    props = {"Значение": {"rich_text": [{"text": {"content": value[:2000]}}]}}
+    # Длинные значения (наборы реплик, персонажи) — кусками по 2000 символов; при чтении страницы Notion
+    # отдаёт не больше 25 кусков, поэтому всего до 50 000 символов
+    parts = [value[i : i + 2000] for i in range(0, min(len(value), 50_000), 2000)]
+    props = {"Значение": {"rich_text": [{"text": {"content": p}} for p in parts]}}
     if row:
         await _call("PATCH", f"/pages/{row['id']}", {"properties": props})
     else:
