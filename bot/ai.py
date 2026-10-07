@@ -522,9 +522,10 @@ async def icon_prompt(name: str, about: str | None, attempt: int = 0) -> str:
     return prompt.strip().strip('"') or f"icon for {name}, {icon_style()}"
 
 
-async def draw(prompt: str, size: int = 512) -> bytes:
-    """Картинка по описанию (text-to-image на Hugging Face) → PNG."""
-    image = await _client().text_to_image(prompt, model=c.IMAGE_MODEL, width=size, height=size)
+async def draw(prompt: str, size: int | tuple[int, int] = 512) -> bytes:
+    """Картинка по описанию (text-to-image на Hugging Face) → PNG. size — сторона квадрата или (ширина, высота)."""
+    width, height = size if isinstance(size, tuple) else (size, size)
+    image = await _client().text_to_image(prompt, model=c.IMAGE_MODEL, width=width, height=height)
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     return buf.getvalue()

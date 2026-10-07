@@ -9,7 +9,7 @@ from html import escape
 
 from telegram import InlineKeyboardButton as Btn
 from aiohttp import web
-from telegram import BotCommandScopeChat, ForceReply, InlineKeyboardMarkup, Message, Update
+from telegram import BotCommandScopeChat, ForceReply, InlineKeyboardMarkup, InputMediaPhoto, Message, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -23,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, documents, notion, pdf, schedule, scheduler, styles, team, weekly, whenparse
+from . import ai, banners, documents, notion, pdf, schedule, scheduler, styles, team, weekly, whenparse
 from . import config as c
 from .markdown import chunks as _chunks, tg_html, to_blocks
 
@@ -92,10 +92,19 @@ MENU = (
 OWNER_COMMANDS = (
     "/invite — пригласить участника\n/members — участники и приглашения\n"
     "/teamproject — командный проект: заметки вместе с участниками\n"
+    "/banners — картинки разделов меню\n"
 )
 
 
-def menu(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+MENU_SHORT = (
+    "Я складываю твои мысли в Notion.\n"
+    "✍️ Пиши, присылай фото, голосовые и документы — всё станет заметкой.\n\n"
+    "Выбери раздел 👇"
+)
+
+
+def menu(uid: int, short: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    """short — подпись к картинке-панели (у подписи лимит 1024 символа), полный список команд — кнопкой."""
     rows = [
         [Btn("🗂 Разобрать входящие", callback_data="m:razbor")],
         [Btn("📁 Проекты", callback_data="m:projects"), Btn("➕ Добавить проект", callback_data="m:add")],
@@ -104,7 +113,119 @@ def menu(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     ]
     if is_owner(uid):
         rows.append([Btn("👥 Участники", callback_data="m:members"), Btn("🎟 Пригласить", callback_data="m:invite")])
+    if short:
+        rows.append([Btn("📜 Все команды", callback_data="m:help")])
+        return MENU_SHORT, InlineKeyboardMarkup(rows)
     return MENU.format(owner_commands=OWNER_COMMANDS if is_owner(uid) else ""), InlineKeyboardMarkup(rows)
+
+# ---------- 🖼 панель с картинками ----------
+# Меню — одно «живое» сообщение: картинка-баннер раздела, подпись и кнопки. Разделы открываются в нём же,
+# «↩️ В меню» возвращает главное. Картинки — banners.py; выключается в /settings.
+
+CAPTION_LIMIT = 1000  # у подписи к картинке лимит 1024 символа
+
+
+def _fits_caption(text: str) -> bool:
+    return len(re.sub(r"<[^>]+>", "", text)) <= CAPTION_LIMIT
+
+
+async def _edit(q, text: str, reply_markup=None, **kwargs):
+    """Правит сообщение с кнопкой. У панели-картинки правится подпись; не влезший в подпись текст уходит новым
+    сообщением, а у картинки убираются кнопки."""
+    if not (q.message and q.message.photo):
+        return await q.edit_message_text(text, reply_markup=reply_markup, **kwargs)
+    kwargs.pop("disable_web_page_preview", None)
+    if _fits_caption(text):
+        return await q.edit_message_caption(caption=text, reply_markup=reply_markup, **kwargs)
+    await q.edit_message_reply_markup(None)
+    return await q.message.reply_text(text, reply_markup=reply_markup, disable_web_page_preview=True, **kwargs)
+
+
+async def _banners_on(uid: int) -> bool:
+    return bool((await scheduler.get_settings(uid)).get("banners"))
+
+
+def _with_home(kb: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup:
+    rows = [list(r) for r in kb.inline_keyboard] if kb else []
+    return InlineKeyboardMarkup(rows + [[Btn("↩️ В меню", callback_data="m:home")]])
+
+
+async def _show(q, uid: int, section: str, text: str, kb: InlineKeyboardMarkup | None, parse_mode=None, home: bool = True) -> None:
+    """Открывает раздел в панели: меняет картинку и подпись. Без картинок или с длинным текстом — обычным сообщением."""
+    if not (await _banners_on(uid) and _fits_caption(text)):
+        await q.message.reply_text(text, reply_markup=kb, parse_mode=parse_mode, disable_web_page_preview=True)
+        return
+    kb = _with_home(kb) if home else kb
+    image = await banners.get(section)
+    if q.message.photo:
+        msg = await q.edit_message_media(InputMediaPhoto(image, caption=text, parse_mode=parse_mode), reply_markup=kb)
+    else:
+        msg = await q.message.reply_photo(image, caption=text, parse_mode=parse_mode, reply_markup=kb)
+    banners.remember(section, msg)
+
+
+async def send_menu(message: Message, uid: int) -> None:
+    if await _banners_on(uid):
+        text, kb = menu(uid, short=True)
+        msg = await message.reply_photo(
+            await banners.get("menu"), caption=await styles.wrap(uid, "greeting", text, html=True), reply_markup=kb, parse_mode=ParseMode.HTML
+        )
+        banners.remember("menu", msg)
+        return
+    text, kb = menu(uid)
+    await message.reply_text(await styles.wrap(uid, "greeting", text, html=True), reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def banners_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = [[Btn(f"🎨 {name}", callback_data=f"bn:{key}")] for key, name in banners.SECTIONS.items()]
+    await update.message.reply_text(
+        "🖼 Баннеры разделов. Сейчас стоят временные картинки; когда пришлёте дизайн из Figma, они заменятся им.\n"
+        "Можно нарисовать баннер ИИ в стиле иконок — выберите раздел:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def on_banner_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_owner(q.from_user.id):
+        await q.answer()
+        return
+    _, section, *rest = q.data.split(":")
+    action = rest[0] if rest else "new"
+    try:
+        if section not in banners.SECTIONS:
+            raise ValueError("Нет такого раздела")
+        if action == "ok":
+            await banners.save(section, q.message.photo[-1].file_id)
+            await q.answer("Баннер сохранён ✓")
+            await q.edit_message_reply_markup(None)
+            return
+        if action == "reset":
+            await banners.save(section, None)
+            await q.answer("Вернула временную картинку")
+            await q.edit_message_reply_markup(None)
+            return
+        await q.answer()
+        status = await q.message.reply_text(f"🎨 Рисую баннер «{banners.SECTIONS[section]}»…")
+        try:
+            image = await banners.draw(section)
+        except Exception as e:
+            log.exception("banner failed")
+            await status.edit_text(f"🎨 Не получилось нарисовать: {e}"[:4000])
+            return
+        await status.delete()
+        await q.message.reply_photo(
+            image,
+            caption=f"🖼 Баннер «{banners.SECTIONS[section]}»",
+            reply_markup=InlineKeyboardMarkup([
+                [Btn("✅ Поставить", callback_data=f"bn:{section}:ok"), Btn("🔄 Другой", callback_data=f"bn:{section}:new")],
+                [Btn("↩️ Временная картинка", callback_data=f"bn:{section}:reset")],
+            ]),  # fmt: skip
+        )
+    except Exception as e:
+        log.exception("banner button failed")
+        await _fail(q, e)
+
 # Ответ на это сообщение бота — названия проектов, а не заметка
 ADD_PROMPT = "Напишите названия проектов ответом на это сообщение: через запятую или каждый с новой строки."
 
@@ -241,9 +362,9 @@ async def on_member_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             person = next((m for m in await notion.members() if str(m["tg"]) == arg), None)
             await q.answer()
             if not person:
-                await q.edit_message_text("Этого участника уже нет.")
+                await _edit(q, "Этого участника уже нет.")
                 return
-            await q.edit_message_text(
+            await _edit(q, 
                 f"Убрать {person['name']} из бота?\nДоступ закроется, его заметки останутся в Notion.",
                 reply_markup=InlineKeyboardMarkup(
                     [[Btn("Да, убрать", callback_data=f"mk:{arg}"), Btn("Отмена", callback_data="ml")]]
@@ -278,7 +399,7 @@ async def on_member_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         log.exception("member button failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb)
+    await _edit(q, text, reply_markup=kb)
 
 
 # ---------- ⚙️ настройки ----------
@@ -319,13 +440,15 @@ async def _settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"☀️ Дневные чек-ины: {checkins}\n"
         f"😊 Вопрос о настроении: {'вместе с вечерним разбором' if st.get('mood', True) else 'выключен'}\n"
         f"📌 Новые заметки: {'сразу в «' + pinned['name'] + '», без разбора' if pinned else 'во входящие, разбор вечером'}\n"
-        f"👥 Новости командных проектов: {'присылать' if st.get('team_notify', True) else 'не присылать'}"
+        f"👥 Новости командных проектов: {'присылать' if st.get('team_notify', True) else 'не присылать'}\n"
+        f"🖼 Меню с картинками: {'да' if st.get('banners') else 'нет, только текст'}"
     )
     return text, InlineKeyboardMarkup(
         [
             [Btn("🌍 Часовой пояс", callback_data="st:tz"), Btn("🌙 Время разбора", callback_data="st:ev")],
             [Btn("☀️ Чек-ины", callback_data="st:ci"), Btn("😊 Настроение: вкл/выкл", callback_data="st:mood")],
             [Btn("📌 Куда писать", callback_data="st:ap"), Btn("👥 Новости команды: вкл/выкл", callback_data="st:tn")],
+            [Btn("🖼 Картинки в меню: вкл/выкл", callback_data="st:bn")],
         ]
     )
 
@@ -348,7 +471,7 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
             rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
             rows.append([Btn("✍️ Другой", callback_data="st:tzx"), Btn("↩️ Назад", callback_data="st:back")])
             await q.answer()
-            await q.edit_message_text("🌍 Выберите часовой пояс:", reply_markup=InlineKeyboardMarkup(rows))
+            await _edit(q, "🌍 Выберите часовой пояс:", reply_markup=InlineKeyboardMarkup(rows))
             return
         if parts[1] == "tz":
             await scheduler.update_settings(uid, tz=TIMEZONES[int(parts[2])][1])
@@ -362,7 +485,7 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
             rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
             rows.append([Btn("✍️ Своё время", callback_data="st:evx"), Btn("↩️ Назад", callback_data="st:back")])
             await q.answer()
-            await q.edit_message_text("🌙 Во сколько присылать вечерний разбор?", reply_markup=InlineKeyboardMarkup(rows))
+            await _edit(q, "🌙 Во сколько присылать вечерний разбор?", reply_markup=InlineKeyboardMarkup(rows))
             return
         elif parts[1] == "ev":
             await scheduler.update_settings(uid, evening=f"{parts[2][:2]}:{parts[2][2:]}")
@@ -378,7 +501,7 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
                 [Btn("🔕 Выключить", callback_data="st:ci:off"), Btn("↩️ Назад", callback_data="st:back")],
             ]
             await q.answer()
-            await q.edit_message_text(
+            await _edit(q, 
                 "☀️ Когда днём спрашивать о неразобранном? Пишу только если оно есть.", reply_markup=InlineKeyboardMarkup(rows)
             )
             return
@@ -391,7 +514,7 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
             rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
             rows.append([Btn("📥 Во входящие", callback_data="st:ap:off"), Btn("↩️ Назад", callback_data="st:back")])
             await q.answer()
-            await q.edit_message_text(
+            await _edit(q, 
                 "📌 Куда класть новые заметки? Если выбрать проект, они сразу попадают в него и не ждут вечернего разбора.",
                 reply_markup=InlineKeyboardMarkup(rows),
             )
@@ -405,6 +528,10 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
                     await q.answer("Список проектов изменился, попробуйте ещё раз")
                     return
                 await scheduler.update_settings(uid, active_project=projects[int(parts[2])]["id"])
+            await q.answer("Сохранено ✓")
+        elif parts[1] == "bn":
+            st = await scheduler.get_settings(uid)
+            await scheduler.update_settings(uid, banners=not st.get("banners"))
             await q.answer("Сохранено ✓")
         elif parts[1] == "tn":
             st = await scheduler.get_settings(uid)
@@ -425,7 +552,7 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
         log.exception("settings failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb)
+    await _edit(q, text, reply_markup=kb)
 
 
 async def _settings_reply(message: Message, prompt: str) -> None:
@@ -466,8 +593,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             await stranger(update, ctx)
         return
-    text, kb = menu(uid)
-    await update.message.reply_text(await styles.wrap(uid, "greeting", text, html=True), reply_markup=kb, parse_mode=ParseMode.HTML)
+    await send_menu(update.message, uid)
 
 
 async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,10 +606,10 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if action == "razbor":
             text, kb = await _review_view(uid, 0)
-            await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await _show(q, uid, "razbor", text, kb, ParseMode.HTML, home=False)
         elif action == "projects":
             text, kb = await _projects_view(uid)
-            await q.message.reply_text(text, reply_markup=kb)
+            await _show(q, uid, "projects", text, kb)
         elif action == "add":
             await _ask_project_names(q.message)
         elif action == "members" and is_owner(uid):
@@ -493,13 +619,19 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await _ask_invite_label(q.message)
         elif action == "ask":
             text, kb = await _ask_scope_view(uid)
-            await q.message.reply_text(text, reply_markup=kb)
+            await _show(q, uid, "ask", text, kb)
         elif action == "settings":
             text, kb = await _settings_view(uid)
-            await q.message.reply_text(text, reply_markup=kb)
+            await _show(q, uid, "settings", text, kb)
         elif action == "schedule":
             text, kb = await _schedule_view(uid)
-            await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await _show(q, uid, "schedule", text, kb, ParseMode.HTML)
+        elif action == "home":
+            text, kb = menu(uid, short=True)
+            await _show(q, uid, "menu", await styles.wrap(uid, "greeting", text, html=True), kb, ParseMode.HTML, home=False)
+        elif action == "help":
+            text, _kb = menu(uid)
+            await q.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.exception("menu failed")
         await q.message.reply_text(f"❌ Ошибка: {e}"[:4000])
@@ -1361,13 +1493,13 @@ async def _after_when(q, page_id: str, where: str, uid: int) -> None:
     """Вернуть экран, откуда пришли: карточку разбора или сообщение о сохранённой заметке."""
     if where != "-":
         text, kb = await _review_view(uid, int(where))
-        await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         return
     item = await notion.page_info(page_id)
     lines = [ln for ln in (q.message.text_html or "").split("\n") if not ln.startswith("⏰")]
     if item["when"]:
         lines.insert(min(2, len(lines)), f"⏰ Напомню: {escape(await _when_label(uid, item['when']))}")
-    await q.edit_message_text(
+    await _edit(q, 
         "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True,
         reply_markup=_panel(page_id, item["project"], item["when"]),
     )
@@ -1606,7 +1738,7 @@ async def on_quick_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("quick button failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1622,7 +1754,7 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if action == "bx":
             _batches.pop(key, None)
             await q.answer()
-            await q.edit_message_text("📦 Закрыто.")
+            await _edit(q, "📦 Закрыто.")
             return
         if state is None or action == "br":
             # Бот перезапускался или просили обновить — собираем список заново
@@ -1643,11 +1775,11 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)] + [[Btn("↩️ Назад", callback_data="bb")]]
             await q.answer()
             title = "В какой проект отправить отмеченные?" if action == "bp" else "Какой тип у отмеченных? После этого они разобраны."
-            await q.edit_message_text(title, reply_markup=InlineKeyboardMarkup(rows))
+            await _edit(q, title, reply_markup=InlineKeyboardMarkup(rows))
             return
         elif action == "bd":
             await q.answer()
-            await q.edit_message_text(
+            await _edit(q, 
                 f"Удалить отмеченные ({len(state['picked'])})? Их можно будет восстановить из корзины Notion.",
                 reply_markup=InlineKeyboardMarkup([[Btn("Да, удалить", callback_data="bdd"), Btn("↩️ Назад", callback_data="bb")]]),
             )
@@ -1675,14 +1807,14 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer()
         if not state["items"]:
             _batches.pop(key, None)
-            await q.edit_message_text(await styles.wrap(uid, "all_done", "🎉 Всё разобрано!"))
+            await _edit(q, await styles.wrap(uid, "all_done", "🎉 Всё разобрано!"))
             return
         text, kb = _batch_view(state)
     except Exception as e:
         log.exception("batch button failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb)
+    await _edit(q, text, reply_markup=kb)
 
 
 # ---------- 🗓 расписание ----------
@@ -1804,7 +1936,7 @@ async def on_schedule_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
                 return
             await q.answer("Применяю…")
             done = await schedule.apply(uid, stored[0])
-            await q.edit_message_text("✅ Расписание обновлено:\n\n" + (stored[1] if done else "ничего не поменялось"))
+            await _edit(q, "✅ Расписание обновлено:\n\n" + (stored[1] if done else "ничего не поменялось"))
             return
         action = parts[1]
         if action == "week":
@@ -1836,7 +1968,7 @@ async def on_schedule_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
             await scheduler.update_settings(uid, schedule_review=parts[2])
             await q.answer(f"Пересмотр: {REVIEW_OPTIONS[parts[2]]} ✓")
             text, kb = await _schedule_view(uid)
-            await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.exception("schedule button failed")
         await _fail(q, e)
@@ -1863,7 +1995,7 @@ async def on_mood_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     emoji = dict((n, e) for e, n in scheduler.MOOD_BUTTONS)[int(score)]
     await q.answer(f"Записала {emoji}")
-    await q.edit_message_text(f"😊 Настроение {day[8:10]}.{day[5:7]}: {emoji} {score} из 5")
+    await _edit(q, f"😊 Настроение {day[8:10]}.{day[5:7]}: {emoji} {score} из 5")
     await q.message.reply_text(
         f"{MOOD_COMMENT_MARK}{day[8:10]}.{day[5:7]}? Ответьте на это сообщение — или просто ничего не пишите.",
         reply_markup=ForceReply(input_field_placeholder="как прошёл день"),
@@ -1954,7 +2086,7 @@ async def on_type_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer("Список изменился")
         elif action == "ta":
             await q.answer()
-            await q.edit_message_text(
+            await _edit(q, 
                 f"Удалить тип «{names[int(arg)]}»?\nУ заметок с этим типом поле «Тип» станет пустым, и они вернутся в разбор.",
                 reply_markup=InlineKeyboardMarkup([[Btn("Да, удалить", callback_data=f"tk:{arg}"), Btn("Отмена", callback_data="tl")]]),
             )
@@ -1969,7 +2101,7 @@ async def on_type_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("type button failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb)
+    await _edit(q, text, reply_markup=kb)
 
 
 # ---------- 📁 проекты и сферы ----------
@@ -2123,7 +2255,7 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
         if parts[0] in ("pl", "plc"):
             await q.answer()
             text, kb = await _projects_view(uid, closed=parts[0] == "plc")
-            await q.edit_message_text(text, reply_markup=kb)
+            await _edit(q, text, reply_markup=kb)
             return
         if parts[0] == "ps":
             project = await notion.get_project(parts[1])
@@ -2166,7 +2298,7 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
                 await notion.update_project(project["id"], kind=notion.KIND_TEAM)
                 await q.answer("Теперь проект командный")
                 text, kb = await _team_members_view(await notion.get_project(project["id"]))
-                await q.edit_message_text(text, reply_markup=kb)
+                await _edit(q, text, reply_markup=kb)
                 return
             elif action == "desc":
                 await q.answer()
@@ -2193,7 +2325,7 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
                 if not (is_owner(uid) or (project["creator"] == uid and project["kind"] == notion.KIND_PERSONAL)):
                     raise PermissionError("Удалить проект может только владелица.")
                 await q.answer()
-                await q.edit_message_text(
+                await _edit(q, 
                     f"Удалить проект «{project['name']}»? Заметки останутся, но без проекта.\n"
                     "Если проект просто закончился — лучше «✅ Закрыть».",
                     reply_markup=InlineKeyboardMarkup([[Btn("Да, удалить", callback_data=f"pr:{project['id']}:delok"), Btn("Отмена", callback_data=f"pr:{project['id']}")]]),
@@ -2205,7 +2337,7 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
                 await notion.delete_project(project["id"])
                 await q.answer("Проект удалён")
                 text, kb = await _projects_view(uid)
-                await q.edit_message_text(text, reply_markup=kb)
+                await _edit(q, text, reply_markup=kb)
                 return
             else:
                 await q.answer()
@@ -2215,7 +2347,7 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
         log.exception("project button failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 async def _project_desc_reply(message: Message, prompt: str) -> None:
@@ -2414,7 +2546,7 @@ async def on_style_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("style button failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb)
+    await _edit(q, text, reply_markup=kb)
 
 
 # ---------- 🎨 ИИ-иконки проектов ----------
@@ -2718,7 +2850,7 @@ async def on_team_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("team button failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb)
+    await _edit(q, text, reply_markup=kb)
 
 
 async def razbor(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2745,7 +2877,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 await notion.set_type(page_id, names[idx])
                 await q.answer(f"{names[idx]} ✓")
                 item = await notion.page_info(page_id)
-                await q.edit_message_text(
+                await _edit(q, 
                     f'<a href="{item["url"]}">{escape(item["title"])}</a> → {escape(names[idx])} ✓\n\n'
                     "Раскрыть заметку под этот тип? ИИ задаст несколько вопросов по одному и соберёт подробное описание.",
                     parse_mode=ParseMode.HTML,
@@ -2796,7 +2928,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("button failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 # ---------- запуск ----------
@@ -2820,6 +2952,7 @@ OWNER_EXTRA = [
     ("invite", "Пригласить участника"),
     ("members", "Участники и приглашения"),
     ("teamproject", "Командный проект"),
+    ("banners", "Картинки разделов"),
 ]
 
 
@@ -2971,6 +3104,8 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_team_button, pattern=r"^(tm|fd|fv|fs):"))
     app.add_handler(CallbackQueryHandler(on_icon_button, pattern=r"^ic:"))
     app.add_handler(CommandHandler("style", style_cmd, filters=member))
+    app.add_handler(CommandHandler("banners", banners_cmd, filters=owner))
+    app.add_handler(CallbackQueryHandler(on_banner_button, pattern=r"^bn:"))
     app.add_handler(CallbackQueryHandler(on_style_button, pattern=r"^sy:"))
     app.add_handler(CommandHandler("settings", settings_cmd, filters=member))
     app.add_handler(CommandHandler("types", types_cmd, filters=member))

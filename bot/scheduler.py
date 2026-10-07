@@ -19,7 +19,8 @@ from telegram import Bot
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup
 
-from . import notion, styles, team, weekly
+from . import banners, notion, styles, team, weekly
+from . import config as c
 from .whenparse import human
 
 log = logging.getLogger("scheduler")
@@ -29,6 +30,7 @@ DEFAULT_SETTINGS = {
     "evening": "20:00",
     "checkins": ["12:00", "14:00", "16:00", "18:00"],
     "mood": True,
+    "banners": c.BANNERS,
 }
 SETTINGS_TTL = 3600  # секунд держим настройки в памяти, чтобы не спрашивать Notion на каждом тике
 
@@ -108,6 +110,15 @@ async def mark_done(key: str) -> None:
 # ---------- задачи ----------
 
 
+async def push(bot: Bot, uid: int, section: str, text: str, markup=None, parse_mode=None) -> None:
+    """Сообщение по расписанию: с картинкой раздела, если у человека меню с картинками, иначе текстом."""
+    if (await get_settings(uid)).get("banners") and len(text) <= 1000:
+        msg = await bot.send_photo(uid, await banners.get(section), caption=text, reply_markup=markup, parse_mode=parse_mode)
+        banners.remember(section, msg)
+        return
+    await bot.send_message(uid, text, reply_markup=markup, parse_mode=parse_mode)
+
+
 @dataclass
 class Job:
     name: str
@@ -148,7 +159,7 @@ async def _evening_run(bot: Bot, uid: int, now: datetime) -> str:
         lines.append(f"🔥 Просрочено: {len(late)}")
         buttons.append(Btn("🔥 Показать", callback_data="ov"))
     text = await styles.wrap(uid, "evening", "\n".join(lines))
-    await bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup([buttons]))
+    await push(bot, uid, "evening", text, InlineKeyboardMarkup([buttons]))
     return f"пуш: разбор {len(items)}, просрочено {len(late)}"
 
 
@@ -243,12 +254,14 @@ async def _checkin_run(bot: Bot, uid: int, now: datetime) -> str:
     items = await notion.review_items(uid)
     if not items:
         return "разбирать нечего"
-    await bot.send_message(
+    await push(
+        bot,
         uid,
+        "checkin",
         await styles.wrap(uid, "checkin",
             f"☀️ Неразобранных заметок: {len(items)}. Сколько у тебя сейчас времени?\n"
             "⚡ пара минут — пробежимся по актуальности\n📦 побольше — разберём пачкой\n🌙 нет — всё подождёт вечера"),
-        reply_markup=checkin_markup(),
+        checkin_markup(),
     )
     return f"чек-ин, заметок {len(items)}"
 

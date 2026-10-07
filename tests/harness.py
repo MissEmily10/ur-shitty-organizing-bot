@@ -96,8 +96,12 @@ async def _no_spheres():
     return []
 
 
-# Иконки проектов рисуются по сети: в тестах выключены, кроме test_icons
+# Иконки проектов рисуются по сети: в тестах выключены, кроме test_icons. Меню с картинками — тоже
+# (проверяется в test_banners), чтобы остальные тесты видели обычные текстовые сообщения
 main.c.AUTO_ICONS = False
+from bot import scheduler as _scheduler  # noqa: E402
+
+_scheduler.DEFAULT_SETTINGS["banners"] = False
 
 REAL = {"_load_projects": _notion._load_projects, "spheres": _notion.spheres}
 _notion._load_projects, _notion.spheres = _no_projects, _no_spheres
@@ -113,9 +117,13 @@ async def make_app():
     return APP
 
 
-def callback(data: str, message_text: str = "карточка", user: dict | None = None) -> Update:
+def callback(data: str, message_text: str = "карточка", user: dict | None = None, photo: bool = False) -> Update:
+    """photo=True — кнопка под сообщением-картинкой (панель меню с баннером)."""
     user = user or OWNER
     msg = _message(message_text, chat={"id": user["id"], "type": "private"})
+    if photo:
+        msg.pop("text")
+        msg.update(caption=message_text, photo=[{"file_id": "PHOTO", "file_unique_id": "u", "width": 1280, "height": 640}])
     return Update.de_json(
         {"update_id": next(_ids), "callback_query": {"id": str(next(_ids)), "from": user, "chat_instance": "c", "data": data, "message": msg}},
         APP.bot,
