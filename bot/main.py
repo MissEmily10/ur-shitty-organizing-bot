@@ -308,8 +308,8 @@ TOUR = [
     "Пиши, присылай фото блокнота, голосовые и документы — каждое сообщение станет заметкой. "
     "ИИ сам придумает название и коротко перескажет суть, а полный текст спрячет внутрь.",
     "🗂 <b>Разбор</b>\n\n"
-    "Вечером я присылаю неразобранные заметки. Для каждой выбираешь, что это — 💡 идея, 📋 задача, ⏰ напоминание, "
-    "🎨 референс… — и в какой 📁 проект. Днём могу спросить, есть ли минутка разобрать (это чек-ины).",
+    "Вечером я присылаю неразобранные заметки. Для каждой сначала выбираешь, к какому 📁 проекту она относится, "
+    "потом — что это: 💡 идея, 📋 задача, ⏰ напоминание, 🎨 референс… Днём могу спросить, есть ли минутка разобрать (это чек-ины).",
     "✨ <b>Раскрыть</b>\n\n"
     "После выбора типа я задам несколько вопросов по одному и соберу подробное описание: для задачи — шаги, "
     "для референса — что взять и как повторить, для идеи — как развить.",
@@ -323,6 +323,7 @@ TOUR = [
 
 HINT_TIMES = 3  # сколько раз бот сам поясняет шаг
 HINTS = {
+    "review_project": "Сначала проект: к чему относится запись. Не относится ни к чему — «📭 Ни к какому». Следующим шагом выберешь, что это за запись.",
     "review": "Выбери, что это за запись: после этого она разобрана. ✨ — тип, который предлагает ИИ. «📁 В проект» и «⏰ Срок» — по желанию. «⏭ Позже» — вернуться потом.",
     "expand": "«✨ Раскрыть»: ИИ задаст несколько вопросов по одному и допишет в заметку подробное описание под её тип.",
     "interview": "Отвечай обычным сообщением. «⏭ Пропустить» — без ответа, «✅ Хватит» — собрать описание из того, что уже есть.",
@@ -1180,12 +1181,17 @@ async def on_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- вечерний разбор ----------
 # В разборе все заметки без типа. Тип выбран — заметка разобрана и больше в разбор не попадает.
-# Проект можно поставить раньше (кнопкой под заметкой или здесь), он сам по себе из разбора не убирает.
-# callback_data: r:<номер>  |  t:<page_id>:<тип>:<номер>  |  pj:<page_id>:<номер> (раскрыть проекты)
-#                p:<page_id>:<проект>:<номер>  |  d:<page_id>:<номер>  |  v:<page_id>
+# Два шага: сначала — к какому проекту относится (если проекта ещё нет), потом — что это за запись (тип).
+# Проект можно поставить раньше (кнопкой под заметкой), он сам по себе из разбора не убирает.
+# callback_data: r:<номер>  |  t:<page_id>:<тип>:<номер>  |  pj:<page_id>:<номер> (сменить проект)
+#                p:<page_id>:<проект>:<номер>  |  pn:<page_id>:<номер> (ни к какому проекту → к типу)
+#                d:<page_id>:<номер>  |  v:<page_id>
 
 
-async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
+async def _review_view(
+    uid: int, k: int, show_projects: bool = False, types_step: bool = False
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """types_step — проект уже пропустили кнопкой «📭 Ни к какому», сразу к типу."""
     items = await notion.review_items(uid)
     if not items:
         return await styles.wrap(uid, "all_done", "🎉 Всё разобрано!", html=True), None
@@ -1202,8 +1208,19 @@ async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[s
         f"<b>Заметка {k + 1} из {len(items)}</b> · {where}{when}\n\n"
         f'<a href="{item["url"]}">{escape(item["title"])}</a>\n\n{escape(body)}\n\n'
     )
+    projects = await notion.projects(uid)
+    two_steps = bool(projects)
+    if two_steps and not show_projects and not types_step and not item["project"]:
+        # Шаг 1: проект
+        text += "<b>Шаг 1 из 2.</b> К какому проекту относится запись?" + await _hint(uid, "review_project")
+        buttons = [Btn(f"📁 {p}", callback_data=f"p:{item['id']}:{i}:{k}") for i, p in enumerate(projects)]
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([Btn("📭 Ни к какому", callback_data=f"pn:{item['id']}:{k}")])
+        rows.append([Btn("🤖 Спросить ИИ", callback_data=f"a:{item['id']}"), Btn("👁 Показать", callback_data=f"v:{item['id']}")])
+        rows.append(_review_nav(item["id"], k))
+        rows.append([Btn("❔ Что делать", callback_data="hp:review_project"), Btn("↩️ В меню", callback_data="m:home")])
+        return text, InlineKeyboardMarkup(rows)
     if show_projects:
-        projects = await notion.projects(uid)
         text += "В какой проект?"
         buttons = [
             Btn(f"📁 {p} ✓" if p == item["project"] else f"📁 {p}", callback_data=f"p:{item['id']}:{i}:{k}")
@@ -1214,7 +1231,8 @@ async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[s
         return text, InlineKeyboardMarkup(rows)
 
     types = await notion.types()
-    text += "Что это за запись?" + (f" ✨ ИИ думает: {escape(item['ai_type'])}" if item.get("ai_type") in types else "")
+    text += ("<b>Шаг 2 из 2.</b> " if two_steps else "") + "Что это за запись?"
+    text += f" ✨ ИИ думает: {escape(item['ai_type'])}" if item.get("ai_type") in types else ""
     text += await _hint(uid, "review")
     buttons = [
         Btn(f"✨ {t}" if t == item.get("ai_type") else t, callback_data=f"t:{item['id']}:{i}:{k}") for i, t in enumerate(types)
@@ -1230,13 +1248,17 @@ async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[s
         ]
     )
     rows.append([Btn("🤖 Спросить ИИ", callback_data=f"a:{item['id']}"), Btn("👁 Показать", callback_data=f"v:{item['id']}")])
-    nav = [Btn("🗑 Удалить", callback_data=f"d:{item['id']}:{k}")]
+    rows.append(_review_nav(item["id"], k))
+    rows.append([Btn("❔ Что делать", callback_data="hp:review"), Btn("↩️ В меню", callback_data="m:home")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _review_nav(page_id: str, k: int) -> list:
+    nav = [Btn("🗑 Удалить", callback_data=f"d:{page_id}:{k}")]
     if k > 0:
         nav.append(Btn("◀️", callback_data=f"r:{k - 1}"))
     nav.append(Btn("⏭ Позже", callback_data=f"r:{k + 1}"))
-    rows.append(nav)
-    rows.append([Btn("❔ Что делать", callback_data="hp:review"), Btn("↩️ В меню", callback_data="m:home")])
-    return text, InlineKeyboardMarkup(rows)
+    return nav
 
 
 async def show_note(message: Message, page_id: str) -> None:
@@ -3241,7 +3263,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer()
         return
     action, *args = q.data.split(":")
-    show_projects = False
+    show_projects = types_step = False
     try:
         if action != "r":
             await own_page(q.from_user.id, args[0])
@@ -3284,6 +3306,10 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             page_id, k = args[0], int(args[1])
             show_projects = True
             await q.answer()
+        elif action == "pn":
+            page_id, k = args[0], int(args[1])
+            types_step = True
+            await q.answer("Без проекта — теперь тип")
         elif action == "p":
             page_id, idx, k = args[0], int(args[1]), int(args[2])
             projects = await notion.projects(q.from_user.id)
@@ -3303,7 +3329,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             k = int(args[0])
             await q.answer()
-        text, kb = await _review_view(q.from_user.id, k, show_projects)
+        text, kb = await _review_view(q.from_user.id, k, show_projects, types_step)
     except Exception as e:
         log.exception("button failed")
         await _fail(q, e)
@@ -3515,7 +3541,7 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("members", members_cmd, filters=owner))
     app.add_handler(CallbackQueryHandler(on_member_button, pattern=r"^m[rkils]"))
     app.add_handler(CallbackQueryHandler(on_scope_button, pattern=r"^q:"))
-    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|x|pj|p|d|v):"))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|x|pj|pn|p|d|v):"))
     app.add_handler(CallbackQueryHandler(on_expand_button, pattern=r"^x[sc]:"))
     app.add_handler(CallbackQueryHandler(on_interview_button, pattern=r"^xi:"))
     app.add_handler(CallbackQueryHandler(lambda u, _: u.callback_query.answer(), pattern=r"^noop$"))
