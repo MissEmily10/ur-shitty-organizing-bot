@@ -243,11 +243,11 @@ def _section(uid: int, name: str) -> tuple[str, list[list[tuple[str, str]]]]:
             "📥 <b>Заметки</b>\nПиши что угодно — всё станет заметкой: текст, фото, голосовые, документы.\n\n"
             "🗂 <b>Разобрать</b> — решить про каждую заметку, что это и куда её\n"
             "📌 <b>Куда писать</b> — новые заметки сразу в проект, без разбора\n"
-            "🔥 <b>Просроченное</b> — заметки, у которых прошёл срок\n"
+            "🔥 <b>Горящие дедлайны</b> — просроченное, сегодня и завтра: что уже закрыто?\n"
             "🏷 <b>Типы</b> — виды записей: идея, задача, референс…\n"
             "☀️ <b>Чек-ины</b> — когда днём спрашивать о неразобранном",
             [[("🗂 Разобрать", "m:razbor"), ("📌 Куда писать", "st:ap")],
-             [("🔥 Просроченное", "ov"), ("🏷 Типы", "m:types")], [("☀️ Чек-ины", "st:ci")]],
+             [("🔥 Горящие дедлайны", "hd:show"), ("🏷 Типы", "m:types")], [("☀️ Чек-ины", "st:ci")]],
         )  # fmt: skip
     if name == "projects":
         rows = [[("📁 Все проекты", "pl"), ("➕ Новый", "m:add")], [("📰 Лента", "m:feed"), ("🗂 Сферы", "m:areas")]]
@@ -623,14 +623,15 @@ async def _settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"😊 Вопрос о настроении: {'вместе с вечерним разбором' if st.get('mood', True) else 'выключен'}\n"
         f"📌 Новые заметки: {'сразу в «' + pinned['name'] + '», без разбора' if pinned else 'во входящие, разбор вечером'}\n"
         f"👥 Новости командных проектов: {'присылать' if st.get('team_notify', True) else 'не присылать'}\n"
-        f"🖼 Меню с картинками: {'да' if st.get('banners') else 'нет, только текст'}"
+        f"🖼 Меню с картинками: {'да' if st.get('banners') else 'нет, только текст'}\n"
+        f"🔥 Горящие дедлайны: {'каждое утро в ' + st['deadlines'] if st.get('deadlines') else 'выключены'}"
     )
     return text, InlineKeyboardMarkup(
         [
             [Btn("🌍 Часовой пояс", callback_data="st:tz"), Btn("🌙 Время разбора", callback_data="st:ev")],
             [Btn("☀️ Чек-ины", callback_data="st:ci"), Btn("😊 Настроение: вкл/выкл", callback_data="st:mood")],
             [Btn("📌 Куда писать", callback_data="st:ap"), Btn("👥 Новости команды: вкл/выкл", callback_data="st:tn")],
-            [Btn("🖼 Картинки в меню: вкл/выкл", callback_data="st:bn")],
+            [Btn("🖼 Картинки в меню: вкл/выкл", callback_data="st:bn"), Btn("🔥 Горящие дедлайны", callback_data="st:dd")],
         ]
     )
 
@@ -710,6 +711,18 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
                     await q.answer("Список проектов изменился, попробуйте ещё раз")
                     return
                 await scheduler.update_settings(uid, active_project=projects[int(parts[2])]["id"])
+            await q.answer("Сохранено ✓")
+        elif parts[1] == "dd" and len(parts) == 2:
+            rows = [
+                [Btn(t, callback_data=f"st:dd:{t.replace(':', '')}") for t in ("08:00", "09:00", "10:00", "12:00")],
+                [Btn("🔕 Выключить", callback_data="st:dd:off"), Btn("↩️ Назад", callback_data="st:back")],
+            ]
+            await q.answer()
+            await _edit(q, "🔥 Во сколько утром присылать горящие дедлайны (просроченное, сегодня и завтра) с вопросом, что уже закрыто?",
+                        reply_markup=InlineKeyboardMarkup(rows))  # fmt: skip
+            return
+        elif parts[1] == "dd":
+            await scheduler.update_settings(uid, deadlines="" if parts[2] == "off" else f"{parts[2][:2]}:{parts[2][2:]}")
             await q.answer("Сохранено ✓")
         elif parts[1] == "bn":
             st = await scheduler.get_settings(uid)
@@ -1698,7 +1711,8 @@ async def on_expand_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
 # ---------- ⏰ сроки и напоминания ----------
 # callback_data: w:<page>:<номер|-> (меню срока)  |  wv:<page>:<номер|->:<t|d1|w1> (быстрый срок)
 #                wc:<page>:<номер|-> (своя дата)  |  wx:<page>:<номер|-> (без срока)
-#                dl:ok:<page> (готово)  |  dl:sn:<page> (перенести)  |  dl:p1h / dl:p1d / dl:p7d:<page>  |  ov (просроченные)
+#                dl:ok:<page> (готово / закрыта)  |  dl:sn:<page> (перенести)  |  dl:p1h / dl:p1d / dl:p7d:<page>
+#                dl:x:<page> (неактуально — убрать срок)  |  ov (просроченные)  |  hd:… (🔥 горящие дедлайны, см. ниже)
 # «номер» — позиция в разборе, куда вернуться; «-» — сообщение после сохранения заметки.
 
 WHEN_PROMPT_MARK = "⏰ Срок для "
@@ -1819,6 +1833,11 @@ async def on_deadline_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
             await q.answer((await styles.line(uid, "praise")) or "Готово ✓")
             await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("✅ Готово", callback_data="noop")]]))
             return
+        if action == "x":
+            await notion.set_when(page_id, None)
+            await q.answer("Срок убран, больше не напомню")
+            await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("🗑 Неактуально: срок убран", callback_data="noop")]]))
+            return
         if action == "sn":
             await q.answer()
             await q.edit_message_reply_markup(
@@ -1856,6 +1875,59 @@ async def send_overdue(bot, uid: int) -> None:
             disable_web_page_preview=True,
             reply_markup=scheduler.reminder_markup(item["id"]),
         )
+
+
+# ---------- 🔥 горящие дедлайны ----------
+# Сводка по утрам (scheduler.hot_view) и по кнопке «🔥 Горящие дедлайны» в разделе «📥 Заметки».
+# callback_data: hd:show | hd:ok:<page> (закрыта) | hd:sn:<page> (меню переноса) | hd:p1d / hd:p7d:<page> | hd:back
+
+
+async def on_hot_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    action, *rest = q.data.split(":")[1:]
+    try:
+        settings = await scheduler.get_settings(uid)
+        now = scheduler.local_now(settings)
+        if action == "show":
+            await q.answer()
+            text, kb = await scheduler.hot_view(uid, now)
+            await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        if action != "back":
+            page_id = rest[0]
+            item = await own_page(uid, page_id)
+            if action == "sn":
+                await q.answer()
+                short = item["title"] if len(item["title"]) <= 30 else item["title"][:29] + "…"
+                await q.edit_message_reply_markup(InlineKeyboardMarkup([
+                    [Btn(f"⏰ «{short}» — на когда?", callback_data="noop")],
+                    [Btn("Завтра", callback_data=f"hd:p1d:{page_id}"), Btn("Через неделю", callback_data=f"hd:p7d:{page_id}")],
+                    [Btn("✍️ Своя дата", callback_data=f"wc:{page_id}:-"), Btn("🗑 Неактуально", callback_data=f"hd:x:{page_id}")],
+                    [Btn("↩️ Назад", callback_data="hd:back")],
+                ]))  # fmt: skip
+                return
+            if action == "ok":
+                await notion.set_done(page_id)
+                await q.answer((await styles.line(uid, "praise")) or f"✅ «{item['title'][:40]}» закрыта")
+            elif action == "x":
+                await notion.set_when(page_id, None)
+                await q.answer("Срок убран")
+            else:
+                when = _quick_when(action, now, settings, item["when"])
+                await notion.set_when(page_id, when)
+                await q.answer(f"Перенесено: {await _when_label(uid, when)}")
+        else:
+            await q.answer()
+        text, kb = await scheduler.hot_view(uid, now)
+    except Exception as e:
+        log.exception("hot deadlines button failed")
+        await _fail(q, e)
+        return
+    await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 # ---------- ☀️ дневные чек-ины ----------
@@ -3429,6 +3501,7 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_type_button, pattern=r"^t[akl]"))
     app.add_handler(CallbackQueryHandler(on_when_button, pattern=r"^w[vcx]?:"))
     app.add_handler(CallbackQueryHandler(on_deadline_button, pattern=r"^(dl:|ov$)"))
+    app.add_handler(CallbackQueryHandler(on_hot_button, pattern=r"^hd:"))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))
     app.add_handler(CommandHandler("schedule", schedule_cmd, filters=member))
     app.add_handler(CommandHandler("report", report_cmd, filters=member))

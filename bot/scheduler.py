@@ -31,6 +31,7 @@ DEFAULT_SETTINGS = {
     "checkins": ["12:00", "14:00", "16:00", "18:00"],
     "mood": True,
     "banners": c.BANNERS,
+    "deadlines": "10:00",  # утренняя сводка горящих дедлайнов; "" — выключена
 }
 SETTINGS_TTL = 3600  # секунд держим настройки в памяти, чтобы не спрашивать Notion на каждом тике
 
@@ -171,23 +172,44 @@ def reminder_markup(page_id: str) -> InlineKeyboardMarkup:
         [[Btn("✅ Готово", callback_data=f"dl:ok:{page_id}"), Btn("⏰ Перенести", callback_data=f"dl:sn:{page_id}")]]
     )
 
+def closed_markup(page_id: str) -> InlineKeyboardMarkup:
+    """Срок прошёл: задача закрыта или нет."""
+    return InlineKeyboardMarkup([
+        [Btn("✅ Да, закрыта", callback_data=f"dl:ok:{page_id}"), Btn("⏳ Ещё нет", callback_data=f"dl:sn:{page_id}")],
+        [Btn("🗑 Уже неактуально", callback_data=f"dl:x:{page_id}")],
+    ])  # fmt: skip
+
+
+def is_task(item: dict) -> bool:
+    """Про что спрашивать «закрыто?»: всё со сроком, кроме напоминаний и встреч — их не «закрывают»."""
+    kind = (item.get("type") or item.get("ai_type") or "").lower()
+    return not re.search(r"напомин|событ|встреч", kind)
+
+
 REMINDER_WINDOW = timedelta(hours=3)  # напоминание, пропущенное дольше этого (бот лежал), уже не шлём
 
 
 def reminder_points(item: dict, now: datetime) -> list[tuple[str, datetime, str]]:
-    """Когда и что напомнить: (вид, момент, текст). У «Напоминания» — ровно в срок; у остального — за день и в день."""
+    """Когда и что напомнить: (вид, момент, текст). У «Напоминания» — ровно в срок; у остального — за день и в день,
+    а когда срок прошёл (через час после времени или наутро после дня) — вопрос «задача закрыта?» (вид after)."""
     iso = item["when"]
     kind = (item.get("type") or item.get("ai_type") or "").lower()
     if "T" in iso:
         at = datetime.fromisoformat(iso).astimezone(now.tzinfo)
         if "напомин" in kind:
             return [("now", at, "⏰ Напоминание")]
-        return [("day", at - timedelta(days=1), "📌 Завтра срок"), ("hour", at - timedelta(hours=1), "📌 Через час срок")]
-    day = datetime.fromisoformat(iso).date()
-    return [
-        ("day", datetime.combine(day - timedelta(days=1), time(10, 0), now.tzinfo), "📌 Завтра срок"),
-        ("morning", datetime.combine(day, time(9, 0), now.tzinfo), "📌 Сегодня срок"),
-    ]
+        points = [("day", at - timedelta(days=1), "📌 Завтра срок"), ("hour", at - timedelta(hours=1), "📌 Через час срок")]
+        after = at + timedelta(hours=1)
+    else:
+        day = datetime.fromisoformat(iso).date()
+        points = [
+            ("day", datetime.combine(day - timedelta(days=1), time(10, 0), now.tzinfo), "📌 Завтра срок"),
+            ("morning", datetime.combine(day, time(9, 0), now.tzinfo), "📌 Сегодня срок"),
+        ]
+        after = datetime.combine(day + timedelta(days=1), time(9, 30), now.tzinfo)
+    if is_task(item):
+        points.append(("after", after, "🔥 Срок прошёл"))
+    return points
 
 
 async def _reminders(bot: Bot, uid: int, now: datetime, settings: dict) -> list[str]:
@@ -200,20 +222,77 @@ async def _reminders(bot: Bot, uid: int, now: datetime, settings: dict) -> list[
         for kind, at, label in reminder_points(item, local):
             if not (at <= local < at + REMINDER_WINDOW):
                 continue
+            if kind == "after" and "T" not in item["when"] and settings.get("deadlines"):
+                continue  # про задачи без времени и так спросит утренняя сводка горящих дедлайнов
             # В ключе есть сам срок: если срок перенесли, напоминания по новому сроку придут заново
             key = f"rem:{item['id']}:{kind}:{item['when']}"
             if await is_done(key):
                 continue
             await mark_done(key)
+            text = f'{label}: <a href="{item["url"]}">{escape(item["title"])}</a> — {escape(human(item["when"], local))}'
+            if kind == "after":
+                text += "\nЗадача закрыта?"
             await bot.send_message(
                 uid,
-                await styles.wrap(uid, "reminder", f'{label}: <a href="{item["url"]}">{escape(item["title"])}</a> — {escape(human(item["when"], local))}', html=True),
+                await styles.wrap(uid, "reminder", text, html=True),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
-                reply_markup=reminder_markup(item["id"]),
+                reply_markup=closed_markup(item["id"]) if kind == "after" else reminder_markup(item["id"]),
             )
             sent.append(f"{kind} {item['title'][:20]}")
     return sent
+
+
+# ---------- 🔥 горящие дедлайны ----------
+# Утром — сводка: что просрочено, что сегодня и завтра. У каждой задачи вопрос «закрыта?»: ✅ — отметить, ⏰ — перенести.
+# callback_data (обрабатывает main): hd:show | hd:ok:<page> | hd:sn:<page> | hd:p1d:<page> / hd:p7d:<page> | hd:back
+
+HOT_LIMIT = 8  # задач в сводке (по две кнопки на каждую)
+
+
+async def hot_items(uid: int, now: datetime) -> list[dict]:
+    """Невыполненные задачи со сроком до конца завтрашнего дня, включая просроченные, ближайшие первыми."""
+    end = datetime.combine(now.date() + timedelta(days=2), time(0, 0), now.tzinfo)
+    items = await notion.dated_items(uid, before=(now.date() + timedelta(days=2)).isoformat())
+    return [i for i in items if is_task(i) and _deadline(i["when"], now) <= end]
+
+
+async def hot_view(uid: int, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]:
+    items = await hot_items(uid, now)
+    if not items:
+        return "🎉 Горящих дедлайнов нет: всё просроченное закрыто, на сегодня и завтра сроков нет.", None
+    lines, rows = [], []
+    for n, item in enumerate(items[:HOT_LIMIT], 1):
+        late = _deadline(item["when"], now) < now
+        mark = "🔥" if late else "⏳"
+        lines.append(f'{n}. {mark} <a href="{item["url"]}">{escape(item["title"])}</a> — '
+                     f'{"было " if late else ""}{escape(human(item["when"], now))}')  # fmt: skip
+        short = item["title"] if len(item["title"]) <= 24 else item["title"][:23] + "…"
+        rows.append([Btn(f"✅ {n}. {short}", callback_data=f"hd:ok:{item['id']}"), Btn("⏰", callback_data=f"hd:sn:{item['id']}")])
+    more = f"\n…и ещё {len(items) - HOT_LIMIT}" if len(items) > HOT_LIMIT else ""
+    text = (
+        "🔥 <b>Горящие дедлайны</b>\n\n" + "\n".join(lines) + more
+        + "\n\nКакие из них уже закрыты? Нажми ✅ у закрытых, ⏰ — перенести срок."
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _hot_due(now: datetime, settings: dict) -> str | None:
+    at = settings.get("deadlines")
+    if not at:
+        return None
+    hh, mm = map(int, at.split(":"))
+    return now.date().isoformat() if now.time() >= time(hh, mm) else None
+
+
+async def _hot_run(bot: Bot, uid: int, now: datetime) -> str:
+    items = await hot_items(uid, now)
+    if not items:
+        return "горящих нет"
+    text, markup = await hot_view(uid, now)
+    await bot.send_message(uid, await styles.wrap(uid, "reminder", text, html=True), parse_mode="HTML",
+                           disable_web_page_preview=True, reply_markup=markup)  # fmt: skip
+    return f"горящие: {len(items)}"
 
 
 # ---------- ☀️ дневные чек-ины ----------
@@ -357,6 +436,7 @@ JOBS = [
     Job("schedule_review", _review_due, _review_run),
     Job("weekly_report", _report_due, _report_run),
     Job("team_summary", _report_due, _team_run),
+    Job("deadlines", _hot_due, _hot_run),
 ]
 
 
