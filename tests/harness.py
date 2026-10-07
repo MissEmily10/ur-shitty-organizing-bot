@@ -34,6 +34,12 @@ def _message_for(data: dict) -> dict:
 async def _fake_post(self, endpoint, data=None, *args, **kwargs):
     data = {k: (json.loads(v) if isinstance(v, str) and v[:1] in "[{" else v) for k, v in (data or {}).items()}
     sent.append((endpoint, data))
+    # Telegram не принимает кнопки, у которых callback_data длиннее 64 байт
+    markup = data.get("reply_markup")
+    for row in getattr(markup, "inline_keyboard", None) or []:
+        for b in row:
+            if b.callback_data and len(b.callback_data.encode()) > 64:
+                raise AssertionError(f"callback_data длиннее 64 байт: {b.callback_data}")
     if endpoint == "getMe":
         return BOT_USER
     if endpoint in ("sendMessage", "editMessageText"):

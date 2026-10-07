@@ -1,4 +1,5 @@
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -1178,8 +1179,32 @@ async def project_note_count(project_id: str) -> int:
     return len(data["results"])
 
 
+SEED_SPHERES = ["📚 Образование", "📷 Фотография", "💼 Работа", "🏠 Бытовое"]
+
+
+async def seed_spheres() -> str:
+    """Один раз добавляет сферы владелицы. Если потом какую-то удалить, она не вернётся."""
+    if await get_value("seed:spheres:1"):
+        return "уже"
+    existing = {_bare(a["name"]) for a in await spheres()}
+    added = [name for name in SEED_SPHERES if _bare(name) not in existing]
+    for name in added:
+        await add_sphere(name)
+    await set_value("seed:spheres:1", ", ".join(added) or "-")
+    return ", ".join(added) or "все уже были"
+
+
+def _bare(name: str) -> str:
+    """Название без эмодзи и регистра: «📷 Фотография» = «фотография»."""
+    return re.sub(r"[^\w\s-]", "", name).strip().lower()
+
+
 async def spheres() -> list[dict]:
-    data = await _call("POST", f"/databases/{await spheres_db_id()}/query", {"page_size": 100})
+    """Сферы в порядке создания: по этому порядку номера в кнопках."""
+    data = await _call(
+        "POST", f"/databases/{await spheres_db_id()}/query",
+        {"page_size": 100, "sorts": [{"timestamp": "created_time", "direction": "ascending"}]},
+    )  # fmt: skip
     return [
         {"id": p["id"].replace("-", ""), "name": _plain(p["properties"]["Название"]["title"]) or "Без названия", "description": _text_prop(p, "Описание")}
         for p in data["results"]

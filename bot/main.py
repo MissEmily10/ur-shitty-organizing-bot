@@ -323,7 +323,7 @@ TOUR = [
 
 HINT_TIMES = 3  # сколько раз бот сам поясняет шаг
 HINTS = {
-    "review_project": "Сначала проект: к чему относится запись. Не относится ни к чему — «📭 Ни к какому». Следующим шагом выберешь, что это за запись.",
+    "review_project": "Сначала — к какой сфере и проекту относится запись. Ни к чему не относится — «📭 Ни к какому». Следующим шагом выберешь, что это за запись.",
     "review": "Выбери, что это за запись: после этого она разобрана. ✨ — тип, который предлагает ИИ. «📁 В проект» и «⏰ Срок» — по желанию. «⏭ Позже» — вернуться потом.",
     "expand": "«✨ Раскрыть»: ИИ задаст несколько вопросов по одному и допишет в заметку подробное описание под её тип.",
     "interview": "Отвечай обычным сообщением. «⏭ Пропустить» — без ответа, «✅ Хватит» — собрать описание из того, что уже есть.",
@@ -967,7 +967,8 @@ async def _save(
 
 
 # ---------- кнопка «В проект» под заметкой ----------
-# callback_data: n:<page_id> (показать проекты)  |  np:<page_id>:<проект>  |  nx:<page_id> (свернуть)
+# callback_data: n:<page_id> (сферы или сразу проекты)  |  ns:<page_id>:<сфера> (проекты сферы)
+#                np:<page_id>:<проект>  |  nx:<page_id> (свернуть)
 
 
 def _panel(page_id: str, project: str | None = None, when: str | None = None) -> InlineKeyboardMarkup:
@@ -993,14 +994,20 @@ async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     action, page_id, *rest = q.data.split(":")
     try:
         await own_page(q.from_user.id, page_id)
-        if action == "n":
-            projects = await notion.projects(q.from_user.id)
-            if not projects:
+        if action in ("n", "ns"):
+            groups = await _project_groups(q.from_user.id)
+            if not groups:
                 await q.answer("Проектов пока нет: /addproject", show_alert=True)
                 return
-            buttons = [Btn(f"📁 {p}", callback_data=f"np:{page_id}:{i}") for i, p in enumerate(projects)]
+            if action == "n" and len(groups) > 1:
+                buttons = [Btn(f"{name} ({len(ps)})", callback_data=f"ns:{page_id}:{g}") for g, (name, ps) in enumerate(groups)]
+                back = []
+            else:
+                g = min(int(rest[0]), len(groups) - 1) if action == "ns" else 0
+                buttons = [Btn(f"📁 {p}", callback_data=f"np:{page_id}:{i}") for i, p in groups[g][1]]
+                back = [Btn("↩️ Сферы", callback_data=f"n:{page_id}")] if len(groups) > 1 else []
             rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-            rows.append([Btn("✖️ Свернуть", callback_data=f"nx:{page_id}")])
+            rows.append(back + [Btn("✖️ Свернуть", callback_data=f"nx:{page_id}")])
             await q.answer()
             await q.edit_message_reply_markup(InlineKeyboardMarkup(rows))
         elif action == "np":
@@ -1179,19 +1186,38 @@ async def on_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await _save(update, "Голос", text=text)
 
 
+# ---------- проекты по сферам (для кнопок «в проект») ----------
+
+NO_SPHERE = "📁 Без сферы"
+
+
+async def _project_groups(uid: int) -> list[tuple[str, list[tuple[int, str]]]]:
+    """Открытые проекты человека по сферам: [(сфера, [(номер в notion.projects(uid), название)])].
+    Сферы по алфавиту, проекты без сферы — последней группой. Сферы без проектов не показываются."""
+    projects = await notion.project_list(uid)
+    areas = {a["id"]: a["name"] for a in await notion.spheres()}
+    groups: dict[str, list[tuple[int, str]]] = {}
+    for i, p in enumerate(projects):
+        groups.setdefault(areas.get(p["sphere_id"] or "") or NO_SPHERE, []).append((i, p["name"]))
+    order = sorted((g for g in groups if g != NO_SPHERE), key=str.lower) + ([NO_SPHERE] if NO_SPHERE in groups else [])
+    return [(g, groups[g]) for g in order]
+
+
 # ---------- вечерний разбор ----------
 # В разборе все заметки без типа. Тип выбран — заметка разобрана и больше в разбор не попадает.
 # Два шага: сначала — к какому проекту относится (если проекта ещё нет), потом — что это за запись (тип).
 # Проект можно поставить раньше (кнопкой под заметкой), он сам по себе из разбора не убирает.
 # callback_data: r:<номер>  |  t:<page_id>:<тип>:<номер>  |  pj:<page_id>:<номер> (сменить проект)
 #                p:<page_id>:<проект>:<номер>  |  pn:<page_id>:<номер> (ни к какому проекту → к типу)
+#                ra:<page_id>:<сфера>:<номер> (проекты одной сферы; сфера — номер группы из _project_groups)
 #                d:<page_id>:<номер>  |  v:<page_id>
 
 
 async def _review_view(
-    uid: int, k: int, show_projects: bool = False, types_step: bool = False
+    uid: int, k: int, show_projects: bool = False, types_step: bool = False, group: int | None = None
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    """types_step — проект уже пропустили кнопкой «📭 Ни к какому», сразу к типу."""
+    """types_step — проект уже пропустили кнопкой «📭 Ни к какому», сразу к типу.
+    group — на шаге 1 выбрана сфера: показываем её проекты."""
     items = await notion.review_items(uid)
     if not items:
         return await styles.wrap(uid, "all_done", "🎉 Всё разобрано!", html=True), None
@@ -1211,11 +1237,25 @@ async def _review_view(
     projects = await notion.projects(uid)
     two_steps = bool(projects)
     if two_steps and not show_projects and not types_step and not item["project"]:
-        # Шаг 1: проект
-        text += "<b>Шаг 1 из 2.</b> К какому проекту относится запись?" + await _hint(uid, "review_project")
-        buttons = [Btn(f"📁 {p}", callback_data=f"p:{item['id']}:{i}:{k}") for i, p in enumerate(projects)]
-        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-        rows.append([Btn("📭 Ни к какому", callback_data=f"pn:{item['id']}:{k}")])
+        # Шаг 1: проект; если проекты разложены по сферам — сначала сфера, потом проект в ней
+        groups = await _project_groups(uid)
+        if group is None and len(groups) == 1:
+            group = 0
+        if group is None:
+            text += "<b>Шаг 1 из 2.</b> К какой сфере относится запись?" + await _hint(uid, "review_project")
+            buttons = [Btn(f"{name} ({len(ps)})", callback_data=f"ra:{item['id']}:{g}:{k}") for g, (name, ps) in enumerate(groups)]
+            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+            rows.append([Btn("📭 Ни к какому проекту", callback_data=f"pn:{item['id']}:{k}")])
+        else:
+            name, members = groups[min(group, len(groups) - 1)]
+            where_step = f"{escape(name)} → какой проект?" if len(groups) > 1 else "К какому проекту относится запись?"
+            text += f"<b>Шаг 1 из 2.</b> {where_step}" + await _hint(uid, "review_project")
+            buttons = [Btn(f"📁 {p}", callback_data=f"p:{item['id']}:{i}:{k}") for i, p in members]
+            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+            tail = [Btn("📭 Ни к какому", callback_data=f"pn:{item['id']}:{k}")]
+            if len(groups) > 1:
+                tail.insert(0, Btn("↩️ Другая сфера", callback_data=f"r:{k}"))
+            rows.append(tail)
         rows.append([Btn("🤖 Спросить ИИ", callback_data=f"a:{item['id']}"), Btn("👁 Показать", callback_data=f"v:{item['id']}")])
         rows.append(_review_nav(item["id"], k))
         rows.append([Btn("❔ Что делать", callback_data="hp:review_project"), Btn("↩️ В меню", callback_data="m:home")])
@@ -2435,7 +2475,7 @@ async def on_type_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- 📁 проекты и сферы ----------
 # callback_data: pl (список) | plc (закрытые) | pr:<id> (карточка) | pr:<id>:<действие> (close, open, desc, kind, sph, del, delok)
-#                ps:<проект>:<сфера|new|none> (выбор сферы)
+#                ps:<проект>:<номер сферы|new|none>[:n] (выбор сферы; n — только что созданный проект: потом иконка)
 
 PROJECT_DESC_MARK = "✏️ Описание проекта «"
 AREA_PROMPT = (
@@ -2547,7 +2587,21 @@ async def _add_projects_reply(message: Message, raw: str) -> None:
     await message.reply_text(text)
     for name in added:
         if project := await notion.get_project(name):
-            await auto_icon(message, project)
+            await _ask_sphere(message, project)
+
+
+async def _ask_sphere(message: Message, project: dict) -> None:
+    """Новый проект: «К какой сфере?» кнопками; иконка — после ответа. Сфер нет — сразу иконка."""
+    areas = await notion.spheres()
+    if not areas:
+        await auto_icon(message, project)
+        return
+    buttons = [Btn(a["name"], callback_data=f"ps:{project['id']}:{i}:n") for i, a in enumerate(areas)]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([Btn("Без сферы", callback_data=f"ps:{project['id']}:none:n")])
+    await message.reply_text(
+        f"🗂 К какой сфере относится «{project['name']}»? Новая сфера: /addarea", reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 
 async def _add_projects_text(raw: str, uid: int) -> tuple[str, list[str]]:
@@ -2594,9 +2648,19 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
                 await q.answer()
                 await q.message.reply_text(AREA_PROMPT, reply_markup=ForceReply(input_field_placeholder="📷 Фотограф — …"))
                 return
-            await notion.update_project(project["id"], sphere_id="" if parts[2] == "none" else parts[2])
+            areas = await notion.spheres()
+            if parts[2] != "none" and int(parts[2]) >= len(areas):
+                await q.answer("Список сфер изменился, попробуйте ещё раз")
+                return
+            area = None if parts[2] == "none" else areas[int(parts[2])]
+            await notion.update_project(project["id"], sphere_id=area["id"] if area else "")
             await q.answer("Сохранено ✓")
             project = await notion.get_project(project["id"])
+            if parts[3:] == ["n"]:
+                # Только что созданный проект: сфера выбрана — теперь иконка (ИИ учтёт сферу)
+                await _edit(q, f"📁 «{project['name']}» → {area['name'] if area else 'без сферы'} ✓", reply_markup=None)
+                await auto_icon(q.message, project)
+                return
         else:
             project = await notion.get_project(parts[1])
             if not project or not notion.can_see(project, uid):
@@ -2638,7 +2702,7 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
                 return
             elif action == "sph":
                 areas = await notion.spheres()
-                rows = [[Btn(a["name"], callback_data=f"ps:{project['id']}:{a['id']}")] for a in areas]
+                rows = [[Btn(a["name"], callback_data=f"ps:{project['id']}:{i}")] for i, a in enumerate(areas)]
                 rows.append([Btn("➕ Новая сфера", callback_data=f"ps:{project['id']}:new"), Btn("Без сферы", callback_data=f"ps:{project['id']}:none")])
                 await q.answer()
                 await q.edit_message_reply_markup(InlineKeyboardMarkup(rows))
@@ -3118,7 +3182,7 @@ async def _create_team(message: Message, raw: str) -> None:
     project = await notion.create_project(name, notion.KIND_TEAM, uid, [])
     text, kb = await _team_members_view(project)
     await message.reply_text(f"✅ Командный проект «{name}» создан.\n\n" + text, reply_markup=kb)
-    await auto_icon(message, project)
+    await _ask_sphere(message, project)
 
 
 async def teamproject_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3264,6 +3328,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     action, *args = q.data.split(":")
     show_projects = types_step = False
+    group = None
     try:
         if action != "r":
             await own_page(q.from_user.id, args[0])
@@ -3310,6 +3375,9 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             page_id, k = args[0], int(args[1])
             types_step = True
             await q.answer("Без проекта — теперь тип")
+        elif action == "ra":
+            page_id, group, k = args[0], int(args[1]), int(args[2])
+            await q.answer()
         elif action == "p":
             page_id, idx, k = args[0], int(args[1]), int(args[2])
             projects = await notion.projects(q.from_user.id)
@@ -3329,7 +3397,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             k = int(args[0])
             await q.answer()
-        text, kb = await _review_view(q.from_user.id, k, show_projects, types_step)
+        text, kb = await _review_view(q.from_user.id, k, show_projects, types_step, group)
     except Exception as e:
         log.exception("button failed")
         await _fail(q, e)
@@ -3371,6 +3439,7 @@ async def set_commands(app: Application) -> None:
         await app.bot.set_my_commands(COMMANDS + OWNER_EXTRA, scope=BotCommandScopeChat(c.OWNER_ID))
     try:
         log.info("projects: %s", await notion.ensure_projects())
+        log.info("spheres: %s", await notion.seed_spheres())
     except Exception:
         log.exception("could not prepare projects")
     try:
@@ -3541,11 +3610,11 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("members", members_cmd, filters=owner))
     app.add_handler(CallbackQueryHandler(on_member_button, pattern=r"^m[rkils]"))
     app.add_handler(CallbackQueryHandler(on_scope_button, pattern=r"^q:"))
-    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|x|pj|pn|p|d|v):"))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(r|t|x|pj|pn|ra|p|d|v):"))
     app.add_handler(CallbackQueryHandler(on_expand_button, pattern=r"^x[sc]:"))
     app.add_handler(CallbackQueryHandler(on_interview_button, pattern=r"^xi:"))
     app.add_handler(CallbackQueryHandler(lambda u, _: u.callback_query.answer(), pattern=r"^noop$"))
-    app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^n[px]?:"))
+    app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^n[pxs]?:"))
     app.add_handler(CallbackQueryHandler(on_ai_button, pattern=r"^aq?:"))
     app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^(pr:|ps:|pl$|plc$)"))
     app.add_handler(CommandHandler("addarea", addarea, filters=member))

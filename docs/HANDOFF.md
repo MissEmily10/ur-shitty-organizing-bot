@@ -59,6 +59,9 @@ Telegram-бот «организатор мыслей»: заметки (тек�
 - 🔥 Горящие дедлайны (этап 15): в `scheduler.py` раздел «🔥 горящие дедлайны» (`hot_items`, `hot_view`, задача `deadlines`,
   настройка `deadlines` = время или ""), вопрос «закрыта?» — вид `after` в `reminder_points` (`closed_markup`, `is_task`);
   в `main.py` раздел «🔥 горящие дедлайны» (`hd:`), `dl:x` — убрать срок. Тест — `tests/test_hot_deadlines.py`.
+- Сферы: `notion.seed_spheres` (один раз при запуске, флаг `seed:spheres:1`), `_project_groups` в `main.py` — проекты
+  по сферам для разбора (`ra:`) и «📁 В проект» (`ns:`), `_ask_sphere` при создании проекта (`ps:<проект>:<номер>:n` → иконка).
+  Сфера в кнопках — **номер**, не id: callback_data ≤ 64 байт (harness теперь падает на длинных кнопках).
 - `team.py` — 👥 сводки командных проектов (по кнопке и задача `team_summary` в понедельник).
 - `report.py` + `weekly.py` — недельный отчёт (Pillow). `documents.py` — PDF/Word/Excel/CSV/TXT.
 - Оформление картинок и PDF — `design/tokens.json` + шрифт PT Sans в `design/fonts/` (временное, под её дизайн).

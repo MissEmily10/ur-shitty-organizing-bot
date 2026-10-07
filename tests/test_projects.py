@@ -156,7 +156,7 @@ async def bot_flows():
     # сфера: новая через /addarea и привязка
     await app.process_update(h.text("/addarea 🎨 Дизайнер — айдентика и веб"))
     assert areas[-1] == {"id": "a2", "name": "🎨 Дизайнер", "description": "айдентика и веб"}, areas
-    await app.process_update(h.callback("ps:s2:a2"))
+    await app.process_update(h.callback("ps:s2:1"))  # сфера по номеру: 1 — вторая, «🎨 Дизайнер»
     assert next(r for r in rows if r["id"] == "s2")["sphere_id"] == "a2"
     # контекст для ИИ
     ctx = await main.project_context("Сайт")
@@ -172,7 +172,7 @@ async def bot_flows():
     assert next(r for r in rows if r["id"] == "x1")["status"] == notion.STATUS_CLOSED, "своё личное — можно"
     await app.process_update(h.text("/addproject Аня-проект", user=anya))
     assert rows[-1]["name"] == "Аня-проект" and rows[-1]["kind"] == notion.KIND_PERSONAL and rows[-1]["creator"] == 77
-    assert "личные" in h.texts(chat=77)[-1]
+    assert "личные" in h.texts(chat=77)[-2] and "К какой сфере" in h.texts(chat=77)[-1]
     # владелица делает проект общим/личным и удаляет
     await app.process_update(h.callback("pr:s2:kind"))
     assert next(r for r in rows if r["id"] == "s2")["kind"] == notion.KIND_PERSONAL
