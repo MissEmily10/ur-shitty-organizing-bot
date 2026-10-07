@@ -91,6 +91,7 @@ _db_id: str | None = None
 _members_db_id: str | None = None
 _service_db_id: str | None = None
 _schedule_db_id: str | None = None
+_extra_dbs: dict[str, str] = {}
 _db_lock = asyncio.Lock()
 
 
@@ -825,3 +826,146 @@ async def dated_events(user_id: int, start: str, end: str) -> list[dict]:
     )
     items = [_item(p) for p in data["results"]]
     return [i for i in items if "событ" in ((i.get("type") or i.get("ai_type") or "").lower())]
+
+
+# ---------- 😊 настроение и недельные отчёты ----------
+
+MOOD_TITLE = "Настроение"
+MOOD_SCHEMA = {"День": {"title": {}}, "Оценка": {"number": {}}, "Комментарий": {"rich_text": {}}, "Автор ID": {"number": {}}}
+REPORTS_TITLE = "Недельные отчёты"
+REPORTS_SCHEMA = {"Неделя": {"title": {}}, "Среднее настроение": {"number": {}}, "Автор ID": {"number": {}}}
+
+
+async def _db_next_to_ideas(title: str, schema: dict) -> str:
+    """Найти таблицу по названию или создать её рядом с «Входящими идеями»; пропавшие колонки вернуть."""
+    if title in _extra_dbs:
+        return _extra_dbs[title]
+    found = next((d for d in await _search("database", title) if _plain(d["title"]) == title), None)
+    if found:
+        missing = {n: spec for n, spec in schema.items() if n not in found["properties"] and "title" not in spec}
+        if missing:
+            await _call("PATCH", f"/databases/{found['id']}", {"properties": missing})
+        _extra_dbs[title] = found["id"]
+    else:
+        ideas = await _call("GET", f"/databases/{await db_id()}")
+        parent = ideas["parent"].get("page_id") or await _first_shared_page()
+        db = await _call(
+            "POST",
+            "/databases",
+            {"parent": {"type": "page_id", "page_id": parent}, "title": [{"type": "text", "text": {"content": title}}], "properties": schema},
+        )
+        _extra_dbs[title] = db["id"]
+    return _extra_dbs[title]
+
+
+async def _mood_row(user_id: int, day: str) -> dict | None:
+    data = await _call(
+        "POST",
+        f"/databases/{await _db_next_to_ideas(MOOD_TITLE, MOOD_SCHEMA)}/query",
+        {"filter": {"and": [{"property": "День", "title": {"equals": day}}, {"property": "Автор ID", "number": {"equals": user_id}}]}, "page_size": 1},
+    )
+    return data["results"][0] if data["results"] else None
+
+
+async def set_mood(user_id: int, day: str, score: int | None = None, comment: str | None = None) -> None:
+    """Одна строка на человека и день: повторный ответ обновляет оценку или комментарий."""
+    props = {}
+    if score is not None:
+        props["Оценка"] = {"number": score}
+    if comment is not None:
+        props["Комментарий"] = {"rich_text": [{"text": {"content": comment[:1500]}}]}
+    row = await _mood_row(user_id, day)
+    if row:
+        await _call("PATCH", f"/pages/{row['id']}", {"properties": props})
+    else:
+        props.update({"День": {"title": [{"text": {"content": day}}]}, "Автор ID": {"number": user_id}})
+        await _call("POST", "/pages", {"parent": {"database_id": await _db_next_to_ideas(MOOD_TITLE, MOOD_SCHEMA)}, "properties": props})
+
+
+async def moods(user_id: int) -> dict[str, tuple[int | None, str]]:
+    """{«ГГГГ-ММ-ДД»: (оценка, комментарий)} за последние ~100 записей."""
+    data = await _call(
+        "POST",
+        f"/databases/{await _db_next_to_ideas(MOOD_TITLE, MOOD_SCHEMA)}/query",
+        {"filter": {"property": "Автор ID", "number": {"equals": user_id}}, "sorts": [{"timestamp": "created_time", "direction": "descending"}], "page_size": 100},
+    )
+    result = {}
+    for p in data["results"]:
+        day = _plain(p["properties"]["День"]["title"])
+        result[day] = ((p["properties"].get("Оценка") or {}).get("number"), _text_prop(p, "Комментарий"))
+    return result
+
+
+async def notes_created(user_id: int, start: str, end: str) -> list[dict]:
+    """Заметки человека, созданные между start и end (ISO), с моментом создания — для недельного отчёта."""
+    notes, cursor = [], None
+    while True:
+        body = {
+            "filter": {
+                "and": [
+                    {"timestamp": "created_time", "created_time": {"on_or_after": start}},
+                    {"timestamp": "created_time", "created_time": {"before": end}},
+                    _by_author(user_id),
+                ]
+            },
+            "page_size": 100,
+        }
+        if cursor:
+            body["start_cursor"] = cursor
+        data = await _call("POST", f"/databases/{await db_id()}/query", body)
+        notes += [{**_item(p), "created_at": p["created_time"]} for p in data["results"]]
+        if not data.get("has_more"):
+            return notes
+        cursor = data["next_cursor"]
+
+
+def _table(rows: list[list[str]]) -> dict:
+    """Настоящая таблица Notion: первая строка — заголовок."""
+    width = len(rows[0])
+    return {
+        "object": "block",
+        "type": "table",
+        "table": {
+            "table_width": width,
+            "has_column_header": True,
+            "has_row_header": False,
+            "children": [
+                {"object": "block", "type": "table_row", "table_row": {"cells": [[{"type": "text", "text": {"content": cell[:1900]}}] for cell in row]}}
+                for row in rows
+            ],
+        },
+    }
+
+
+async def create_report(user_id: int, title: str, average: float | None, rows: list[list[str]], conclusion: list[dict], image_id: str | None) -> str:
+    """Страница недельного отчёта: картинка, таблица по дням и вывод."""
+    children = ([image_block(image_id)] if image_id else []) + [_table(rows)] + conclusion
+    props = {"Неделя": {"title": [{"text": {"content": title}}]}, "Автор ID": {"number": user_id}}
+    if average is not None:
+        props["Среднее настроение"] = {"number": round(average, 1)}
+    page = await _call(
+        "POST",
+        "/pages",
+        {"parent": {"database_id": await _db_next_to_ideas(REPORTS_TITLE, REPORTS_SCHEMA)}, "properties": props, "children": children[:100]},
+    )
+    return page["url"]
+
+
+async def done_between(user_id: int, start: str, end: str) -> list[dict]:
+    """Выполненные заметки со сроком в этом промежутке — для колонки «Выполнено» в отчёте."""
+    data = await _call(
+        "POST",
+        f"/databases/{await db_id()}/query",
+        {
+            "filter": {
+                "and": [
+                    {"property": c.P_WHEN, "date": {"on_or_after": start}},
+                    {"property": c.P_WHEN, "date": {"before": end}},
+                    {"property": c.P_DONE, "checkbox": {"equals": True}},
+                    _by_author(user_id),
+                ]
+            },
+            "page_size": 100,
+        },
+    )
+    return [_item(p) for p in data["results"]]

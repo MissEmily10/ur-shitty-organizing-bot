@@ -41,7 +41,7 @@ async def _fake_post(self, endpoint, data=None, *args, **kwargs):
         if "message_id" in data:
             msg["message_id"] = data["message_id"]
         return msg
-    if endpoint == "sendDocument":
+    if endpoint in ("sendDocument", "sendPhoto"):
         return _message_for({**data, "text": ""})
     if endpoint == "editMessageReplyMarkup":
         return _message("", message_id=data.get("message_id", next(_ids)))
@@ -69,7 +69,23 @@ async def _types():
     return list(TYPES)
 
 
+moods: dict[tuple[int, str], list] = {}
+
+
+async def _set_mood(uid, day, score=None, comment=None):
+    row = moods.setdefault((uid, day), [None, ""])
+    if score is not None:
+        row[0] = score
+    if comment is not None:
+        row[1] = comment
+
+
+async def _moods(uid):
+    return {day: tuple(v) for (u, day), v in moods.items() if u == uid}
+
+
 _notion.get_value, _notion.set_value, _notion.types = _get_value, _set_value, _types
+_notion.set_mood, _notion.moods = _set_mood, _moods
 
 
 APP = None

@@ -23,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, documents, notion, pdf, schedule, scheduler, whenparse
+from . import ai, documents, notion, pdf, schedule, scheduler, weekly, whenparse
 from . import config as c
 from .markdown import tg_html, to_blocks
 
@@ -80,6 +80,7 @@ MENU = (
     "/types, /addtype — типы записей\n"
     "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
     "/schedule — расписание и календарь в PDF\n"
+    "/report — недельный отчёт: настроение и дела\n"
     "/settings — часовой пояс, время разбора и дневных чек-инов\n"
     "{owner_commands}"
     "/start — это меню\n\n"
@@ -295,12 +296,13 @@ async def _settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
         "⚙️ Настройки\n\n"
         f"🌍 Часовой пояс: {_tz_label(st['tz'])}, у вас сейчас {now}\n"
         f"🌙 Вечерний разбор: {st['evening']}\n"
-        f"☀️ Дневные чек-ины: {checkins}"
+        f"☀️ Дневные чек-ины: {checkins}\n"
+        f"😊 Вопрос о настроении: {'вместе с вечерним разбором' if st.get('mood', True) else 'выключен'}"
     )
     return text, InlineKeyboardMarkup(
         [
             [Btn("🌍 Часовой пояс", callback_data="st:tz"), Btn("🌙 Время разбора", callback_data="st:ev")],
-            [Btn("☀️ Чек-ины", callback_data="st:ci")],
+            [Btn("☀️ Чек-ины", callback_data="st:ci"), Btn("😊 Настроение: вкл/выкл", callback_data="st:mood")],
         ]
     )
 
@@ -359,6 +361,10 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
             return
         elif parts[1] == "ci":
             await scheduler.update_settings(uid, checkins=CHECKIN_PRESETS[parts[2]])
+            await q.answer("Сохранено ✓")
+        elif parts[1] == "mood":
+            st = await scheduler.get_settings(uid)
+            await scheduler.update_settings(uid, mood=not st.get("mood", True))
             await q.answer("Сохранено ✓")
         elif parts[1] == "cix":
             await q.answer()
@@ -605,6 +611,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
         await update.message.reply_text(await _add_projects_text(update.message.text))
+        return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(MOOD_COMMENT_MARK):
+        await _mood_comment(update.message, reply.text)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text in (ROUTINE_PROMPT, CHANGE_PROMPT):
         await _schedule_reply(update.message, routine=reply.text == ROUTINE_PROMPT)
@@ -1775,6 +1784,69 @@ async def on_schedule_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
         await _fail(q, e)
 
 
+# ---------- 😊 настроение и 📊 отчёт ----------
+# callback_data: md:<день>:<1-5> (оценка)  |  rp:cur / rp:prev (отчёт за эту / прошлую неделю)
+
+MOOD_COMMENT_MARK = "💬 Пара слов о дне "
+
+
+async def on_mood_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    _, day, score = q.data.split(":")
+    try:
+        await notion.set_mood(uid, day, score=int(score))
+    except Exception as e:
+        log.exception("mood failed")
+        await _fail(q, e)
+        return
+    emoji = dict((n, e) for e, n in scheduler.MOOD_BUTTONS)[int(score)]
+    await q.answer(f"Записала {emoji}")
+    await q.edit_message_text(f"😊 Настроение {day[8:10]}.{day[5:7]}: {emoji} {score} из 5")
+    await q.message.reply_text(
+        f"{MOOD_COMMENT_MARK}{day[8:10]}.{day[5:7]}? Ответьте на это сообщение — или просто ничего не пишите.",
+        reply_markup=ForceReply(input_field_placeholder="как прошёл день"),
+    )
+
+
+async def _mood_comment(message: Message, prompt: str) -> None:
+    m = re.search(r"(\d{2})\.(\d{2})", prompt)
+    today = scheduler.local_now(await scheduler.get_settings(message.chat_id)).date()
+    day = today.replace(month=int(m.group(2)), day=int(m.group(1))) if m else today
+    if day > today:  # запись прошлогодняя — например, ответили 1 января на 31 декабря
+        day = day.replace(year=day.year - 1)
+    await notion.set_mood(message.chat_id, day.isoformat(), comment=message.text)
+    await message.reply_text("💬 Записала ✓")
+
+
+async def report_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📊 Отчёт за какую неделю? Сам он приходит по понедельникам в 10:00 за прошедшую.",
+        reply_markup=InlineKeyboardMarkup([[Btn("Эта неделя", callback_data="rp:cur"), Btn("Прошлая", callback_data="rp:prev")]]),
+    )
+
+
+async def on_report_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    await q.answer("Собираю отчёт…")
+    if not await ai_allowed(q.message):
+        return
+    now = scheduler.local_now(await scheduler.get_settings(uid))
+    monday = now.date() - timedelta(days=now.weekday()) - timedelta(days=7 if q.data == "rp:prev" else 0)
+    try:
+        await weekly.send_report(ctx.bot, uid, monday, now.tzinfo)
+    except Exception as e:
+        log.exception("report failed")
+        await q.message.reply_text(f"❌ Не получилось собрать отчёт: {e}"[:4000])
+
+
 # ---------- 🏷 типы (общие, как проекты: добавлять могут все, удалять — только владелица) ----------
 # callback_data: ta:<номер> (спросить про удаление)  |  tk:<номер> (удалить)  |  tl (список)
 
@@ -2005,6 +2077,7 @@ COMMANDS = [
     ("ask", "Спросить ИИ по заметкам"),
     ("settings", "Часовой пояс и время разбора"),
     ("schedule", "Расписание и PDF"),
+    ("report", "Недельный отчёт"),
     ("types", "Типы записей"),
     ("addtype", "Добавить тип"),
 ]
@@ -2161,6 +2234,9 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_deadline_button, pattern=r"^(dl:|ov$)"))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))
     app.add_handler(CommandHandler("schedule", schedule_cmd, filters=member))
+    app.add_handler(CommandHandler("report", report_cmd, filters=member))
+    app.add_handler(CallbackQueryHandler(on_mood_button, pattern=r"^md:"))
+    app.add_handler(CallbackQueryHandler(on_report_button, pattern=r"^rp:"))
     app.add_handler(CallbackQueryHandler(on_schedule_button, pattern=r"^(sc:|sca$|scx$)"))
     app.add_handler(CallbackQueryHandler(on_quick_button, pattern=r"^k[qan]"))
     app.add_handler(CallbackQueryHandler(on_batch_button, pattern=r"^b(t|a|p|pp|y|yy|d|dd|r|x|b)(:|$)"))

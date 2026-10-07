@@ -33,7 +33,8 @@ async def dated_items(uid, before, after=None):
 
 class FakeBot:
     async def send_message(self, uid, text, **kw):
-        pushes.append(uid)
+        if text.startswith("🌙"):  # здесь проверяем только вечерний разбор; вопрос о настроении — в test_mood
+            pushes.append(uid)
 
 
 def utc(hh, mm=0, day=6):

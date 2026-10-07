@@ -455,3 +455,26 @@ async def parse_schedule(text: str, base: str, now: datetime, routine: bool) -> 
                 m = re.fullmatch(r"\s*(\d{1,2})(?::(\d{2}))?\s*", value)
                 item[key] = f"{int(m.group(1)):02d}:{m.group(2) or '00'}" if m and int(m.group(1)) < 24 else ""
     return clean
+
+
+# ---------- 📊 вывод к недельному отчёту ----------
+
+WEEK_PROMPT = """Ниже недельная таблица пользователя: настроение (1–5), комментарий о дне, сколько было заметок, сколько разобрано, сколько выполнено.
+{table}
+Среднее настроение неделей раньше: {previous}.
+
+Напиши короткий вывод на 2–4 предложения, тепло и по делу, на «ты»: лучший и худший день, как изменилось настроение по сравнению
+с прошлой неделей, и одна заметная закономерность, если она правда видна в данных (например, «в дни без заметок настроение ниже»).
+Не выдумывай того, чего нет в таблице, не давай непрошеных советов. Без заголовков и списков."""
+
+
+async def week_conclusion(rows: list[list[str]], previous: float | None) -> str:
+    table = "\n".join(" | ".join(r) for r in rows)
+    prev = f"{previous:.1f}" if previous else "нет данных"
+    response = await _client().chat_completion(
+        model=c.VISION_MODEL,
+        messages=[{"role": "user", "content": WEEK_PROMPT.format(table=table, previous=prev)}],
+        max_tokens=400,
+        temperature=0.5,
+    )
+    return (response.choices[0].message.content or "").strip()

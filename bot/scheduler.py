@@ -19,12 +19,17 @@ from telegram import Bot
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup
 
-from . import notion
+from . import notion, weekly
 from .whenparse import human
 
 log = logging.getLogger("scheduler")
 
-DEFAULT_SETTINGS = {"tz": "Europe/Moscow", "evening": "20:00", "checkins": ["12:00", "14:00", "16:00", "18:00"]}
+DEFAULT_SETTINGS = {
+    "tz": "Europe/Moscow",
+    "evening": "20:00",
+    "checkins": ["12:00", "14:00", "16:00", "18:00"],
+    "mood": True,
+}
 SETTINGS_TTL = 3600  # секунд держим настройки в памяти, чтобы не спрашивать Notion на каждом тике
 
 _settings_cache: dict[int, tuple[float, dict]] = {}
@@ -291,10 +296,46 @@ async def _review_run(bot: Bot, uid: int, now: datetime) -> str:
     return "предложен пересмотр"
 
 
+# ---------- 😊 настроение и 📊 недельный отчёт ----------
+
+MOOD_BUTTONS = [("😞", 1), ("😕", 2), ("😐", 3), ("🙂", 4), ("🤩", 5)]
+REPORT_AT = time(10, 0)  # отчёт за прошлую неделю — в понедельник утром, когда воскресенье уже отмечено
+
+
+def mood_markup(day: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[Btn(e, callback_data=f"md:{day}:{n}") for e, n in MOOD_BUTTONS]])
+
+
+def _mood_due(now: datetime, settings: dict) -> str | None:
+    """Вместе с вечерним разбором, раз в день, если не выключено в настройках."""
+    return _evening_due(now, settings) if settings.get("mood", True) else None
+
+
+async def _mood_run(bot: Bot, uid: int, now: datetime) -> str:
+    day = now.date().isoformat()
+    if (await notion.moods(uid)).get(day, (None, ""))[0]:
+        return "уже отмечено"
+    await bot.send_message(uid, "😊 Как настроение сегодня?", reply_markup=mood_markup(day))
+    return "спросили настроение"
+
+
+def _report_due(now: datetime, settings: dict) -> str | None:
+    if now.weekday() != 0 or now.time() < REPORT_AT:
+        return None
+    return f"{now.isocalendar().year}-W{now.isocalendar().week}"
+
+
+async def _report_run(bot: Bot, uid: int, now: datetime) -> str:
+    monday = now.date() - timedelta(days=7)
+    return await weekly.send_report(bot, uid, monday, now.tzinfo, automatic=True)
+
+
 JOBS = [
     Job("evening", _evening_due, _evening_run),
+    Job("mood", _mood_due, _mood_run),
     Job("checkin", _checkin_due, _checkin_run),
     Job("schedule_review", _review_due, _review_run),
+    Job("weekly_report", _report_due, _report_run),
 ]
 
 

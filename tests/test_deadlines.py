@@ -161,7 +161,8 @@ async def run():
     pages["d" * 32]["when"] = "2026-10-05"
     await scheduler.tick(bot, [42], now=utc(8, 17, 0))
     # просрочены «Сдать макет» (5-го) и не отмеченное «Позвонить» (7-го в 18:00)
-    assert "🔥 Просрочено: 2" in h.texts(chat=42)[-1], h.texts(chat=42)[-1]
+    evening = [t for t in h.texts(chat=42) if "Просрочено" in t][-1]  # следом приходит вопрос о настроении
+    assert "🔥 Просрочено: 2" in evening, evening
     await app.process_update(h.callback("ov"))
     shown = h.texts(chat=42)[-2:]
     assert all(t.startswith("🔥") for t in shown) and any("Сдать макет" in t for t in shown), shown
