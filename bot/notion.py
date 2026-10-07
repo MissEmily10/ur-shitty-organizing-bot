@@ -44,7 +44,6 @@ async def _call(method: str, path: str, json: dict | None = None) -> dict:
 SCHEMA = {
     c.P_TITLE: {"title": {}},
     c.P_STATUS: {"select": {"options": [{"name": c.STATUS_NEW, "color": "red"}, {"name": c.STATUS_DONE, "color": "green"}]}},
-    c.P_PROJECT: {"select": {"options": [{"name": "Пример проекта", "color": "blue"}]}},
     c.P_SOURCE: {
         "select": {
             "options": [{"name": "Текст", "color": "gray"}, {"name": "Фото", "color": "orange"}, {"name": "Голос", "color": "purple"}]
@@ -238,7 +237,8 @@ def _item(p: dict) -> dict:
         "id": p["id"].replace("-", ""),
         "title": _title(p),
         "url": p["url"],
-        "project": _select(p, c.P_PROJECT),
+        "project_id": _project_id(p),
+        "project": _project_names.get(_project_id(p) or ""),
         "type": _select(p, c.P_TYPE),
         "author_id": int((p["properties"].get(c.P_AUTHOR_ID) or {}).get("number") or 0),
         "when": ((p["properties"].get(c.P_WHEN) or {}).get("date") or {}).get("start"),
@@ -248,11 +248,12 @@ def _item(p: dict) -> dict:
 
 
 async def page_info(page_id: str) -> dict:
+    await _load_projects()
     return _item(await _call("GET", f"/pages/{page_id}"))
 
 
 async def page_project(page_id: str) -> str | None:
-    return _select(await _call("GET", f"/pages/{page_id}"), c.P_PROJECT)
+    return (await page_info(page_id))["project"]
 
 
 def _by_author(user_id: int) -> dict:
@@ -266,6 +267,7 @@ def _by_author(user_id: int) -> dict:
 async def review_items(user_id: int) -> list[dict]:
     """Для вечернего разбора: заметки человека, которым ещё не выбран тип (проект может уже стоять). Старые первыми.
     Заметки со статусом «Разобрано» из времён до типов тоже считаются разобранными."""
+    await _load_projects()
     data = await _call(
         "POST",
         f"/databases/{await db_id()}/query",
@@ -352,22 +354,30 @@ async def _delete_option(prop: str, name: str) -> None:
     await _set_options(prop, keep)
 
 
-async def _project_options() -> list[dict]:
-    return await _options(c.P_PROJECT)
+async def projects(user_id: int | None = None) -> list[str]:
+    """Названия открытых проектов, которые видит человек (None — все открытые). По ним строятся кнопки «📁»."""
+    return [p["name"] for p in await project_list(user_id)]
 
 
-async def projects() -> list[str]:
-    """Проекты = варианты поля «Проект». Добавили вариант в Notion или через /addproject — появилась кнопка в боте."""
-    return [o["name"] for o in await _project_options()]
-
-
-async def add_projects(names: list[str]) -> list[str]:
-    """Добавляет новые проекты, возвращает те, которых ещё не было."""
-    return await _add_options(c.P_PROJECT, names)
+async def add_projects(names: list[str], user_id: int | None = None) -> list[str]:
+    """Создаёт проекты, которых ещё нет (без учёта регистра). Проекты владелицы — общие, участников — личные."""
+    existing = {p["name"].lower() for p in await project_list(None, include_closed=True)}
+    added = []
+    for name in names:
+        if name.lower() in existing:
+            continue
+        existing.add(name.lower())
+        kind = KIND_SHARED if not user_id or user_id == c.OWNER_ID else KIND_PERSONAL
+        await create_project(name, kind, user_id or c.OWNER_ID)
+        added.append(name)
+    return added
 
 
 async def delete_project(name: str) -> None:
-    await _delete_option(c.P_PROJECT, name)
+    project = await get_project(name)
+    if project:
+        await trash(project["id"])
+        _forget_projects()
 
 
 async def preview(page_id: str, limit: int = 600) -> str:
@@ -384,7 +394,10 @@ async def preview(page_id: str, limit: int = 600) -> str:
 
 async def file_to_project(page_id: str, project: str) -> None:
     """Только проект: из разбора заметка уходит, когда ей выбран тип."""
-    await _call("PATCH", f"/pages/{page_id}", {"properties": {c.P_PROJECT: {"select": {"name": project}}}})
+    found = await get_project(project)
+    if not found:
+        raise RuntimeError(f"Проект «{project}» не найден")
+    await _call("PATCH", f"/pages/{page_id}", {"properties": {c.P_PROJECT: {"relation": [{"id": found["id"]}]}}})
 
 
 async def types() -> list[str]:
@@ -413,6 +426,7 @@ async def set_done(page_id: str, done: bool = True) -> None:
 
 async def dated_items(user_id: int, before: str, after: str | None = None) -> list[dict]:
     """Невыполненные заметки человека со сроком до before (и после after, если указано), ближайшие первыми."""
+    await _load_projects()
     conditions = [
         {"property": c.P_WHEN, "date": {"on_or_before": before}},
         {"property": c.P_DONE, "checkbox": {"equals": False}},
@@ -457,12 +471,16 @@ async def download(url: str) -> bytes:
 
 
 async def project_titles(project: str, exclude: str, user_id: int, limit: int = 15) -> list[str]:
-    """Названия других своих заметок проекта: контекст для ИИ, пока у проекта нет своей страницы с описанием."""
+    """Названия других заметок проекта — контекст для ИИ. В командном проекте — всех участников, иначе свои."""
+    found = await get_project(project)
+    if not found:
+        return []
+    scope = {"property": c.P_PROJECT, "relation": {"contains": found["id"]}}
     data = await _call(
         "POST",
         f"/databases/{await db_id()}/query",
         {
-            "filter": {"and": [{"property": c.P_PROJECT, "select": {"equals": project}}, _by_author(user_id)]},
+            "filter": scope if found["kind"] == KIND_TEAM else {"and": [scope, _by_author(user_id)]},
             "sorts": [{"timestamp": "created_time", "direction": "descending"}],
             "page_size": limit + 1,
         },
@@ -477,13 +495,20 @@ async def add_expansion(page_id: str, type_name: str, blocks: list[dict]) -> Non
 
 
 async def notes_in_scope(user_id: int, project: str | None = None, days: int | None = None, limit: int = 150) -> list[dict]:
-    """Свои заметки проекта или за последние N дней, новые первыми (не больше limit)."""
+    """Заметки проекта или за последние N дней, новые первыми (не больше limit). Свои — а в командном проекте
+    заметки всех его участников."""
+    await _load_projects()
+    team = False
     if project:
-        scope = {"property": c.P_PROJECT, "select": {"equals": project}}
+        found = await get_project(project)
+        if not found:
+            return []
+        scope = {"property": c.P_PROJECT, "relation": {"contains": found["id"]}}
+        team = found["kind"] == KIND_TEAM
     else:
         since = (datetime.now(timezone.utc) - timedelta(days=days or 7)).isoformat()
         scope = {"timestamp": "created_time", "created_time": {"on_or_after": since}}
-    flt = {"and": [scope, _by_author(user_id)]}
+    flt = scope if team else {"and": [scope, _by_author(user_id)]}
     notes, cursor = [], None
     while len(notes) < limit:
         body = {"filter": flt, "sorts": [{"timestamp": "created_time", "direction": "descending"}], "page_size": 100}
@@ -969,3 +994,208 @@ async def done_between(user_id: int, start: str, end: str) -> list[dict]:
         },
     )
     return [_item(p) for p in data["results"]]
+
+
+# ---------- 📁 проекты-страницы и сферы ----------
+
+PROJECTS_TITLE = "Проекты"
+SPHERES_TITLE = "Сферы"
+STATUS_ACTIVE, STATUS_CLOSED = "🟢 Активный", "✅ Закрыт"
+KIND_SHARED, KIND_PERSONAL, KIND_TEAM = "🌐 Общий", "👤 Личный", "👥 Командный"
+OLD_PROJECT = "Проект (старое)"
+SPHERES_SCHEMA = {"Название": {"title": {}}, "Описание": {"rich_text": {}}}
+
+_project_names: dict[str, str] = {}  # id без дефисов → название
+_projects_cache: tuple[float, list[dict]] | None = None
+PROJECTS_TTL = 60  # секунд
+
+
+def _project_id(p: dict) -> str | None:
+    rel = (p["properties"].get(c.P_PROJECT) or {}).get("relation") or []
+    return rel[0]["id"].replace("-", "") if rel else None
+
+
+def _forget_projects() -> None:
+    global _projects_cache
+    _projects_cache = None
+
+
+def _project(p: dict) -> dict:
+    props = p["properties"]
+    sphere = (props.get("Сфера") or {}).get("relation") or []
+    members = _text_prop(p, "Участники ID")
+    return {
+        "id": p["id"].replace("-", ""),
+        "name": _plain((props.get("Название") or {}).get("title") or []) or "Без названия",
+        "status": ((props.get("Статус") or {}).get("select") or {}).get("name") or STATUS_ACTIVE,
+        "kind": ((props.get("Вид") or {}).get("select") or {}).get("name") or KIND_SHARED,
+        "sphere_id": sphere[0]["id"].replace("-", "") if sphere else None,
+        "members": [int(x) for x in members.replace(" ", "").split(",") if x.isdigit()],
+        "creator": int((props.get("Создатель ID") or {}).get("number") or 0),
+        "description": _text_prop(p, "Описание"),
+        "url": p.get("url", ""),
+    }
+
+
+async def spheres_db_id() -> str:
+    return await _db_next_to_ideas(SPHERES_TITLE, SPHERES_SCHEMA)
+
+
+async def projects_db_id() -> str:
+    schema = {
+        "Название": {"title": {}},
+        "Статус": {"select": {"options": [{"name": STATUS_ACTIVE, "color": "green"}, {"name": STATUS_CLOSED, "color": "gray"}]}},
+        "Вид": {"select": {"options": [{"name": KIND_SHARED, "color": "blue"}, {"name": KIND_PERSONAL, "color": "yellow"}, {"name": KIND_TEAM, "color": "purple"}]}},
+        "Сфера": {"relation": {"database_id": await spheres_db_id(), "single_property": {}}},
+        "Участники ID": {"rich_text": {}},
+        "Создатель ID": {"number": {}},
+        "Описание": {"rich_text": {}},
+    }
+    return await _db_next_to_ideas(PROJECTS_TITLE, schema)
+
+
+async def _load_projects(force: bool = False) -> list[dict]:
+    global _projects_cache
+    loop = asyncio.get_running_loop()
+    if not force and _projects_cache and loop.time() - _projects_cache[0] < PROJECTS_TTL:
+        return _projects_cache[1]
+    rows, cursor = [], None
+    while True:
+        body = {"page_size": 100, "sorts": [{"timestamp": "created_time", "direction": "ascending"}]}
+        if cursor:
+            body["start_cursor"] = cursor
+        data = await _call("POST", f"/databases/{await projects_db_id()}/query", body)
+        rows += [_project(p) for p in data["results"]]
+        if not data.get("has_more"):
+            break
+        cursor = data["next_cursor"]
+    _project_names.clear()
+    _project_names.update({p["id"]: p["name"] for p in rows})
+    _projects_cache = (loop.time(), rows)
+    return rows
+
+
+def can_see(project: dict, user_id: int | None) -> bool:
+    """Владелица видит всё; общий — все; личный — автор; командный — его участники и автор."""
+    if user_id is None or user_id == c.OWNER_ID or project["kind"] == KIND_SHARED:
+        return True
+    return user_id == project["creator"] or user_id in project["members"]
+
+
+async def project_list(user_id: int | None = None, include_closed: bool = False) -> list[dict]:
+    return [
+        p for p in await _load_projects()
+        if can_see(p, user_id) and (include_closed or p["status"] != STATUS_CLOSED)
+    ]  # fmt: skip
+
+
+async def get_project(name_or_id: str) -> dict | None:
+    key = name_or_id.replace("-", "")
+    rows = await _load_projects()
+    return next((p for p in rows if p["id"] == key), None) or next((p for p in rows if p["name"].lower() == name_or_id.lower()), None)
+
+
+async def create_project(name: str, kind: str, creator: int, members: list[int] | None = None) -> dict:
+    props = {
+        "Название": {"title": [{"text": {"content": name[:200]}}]},
+        "Статус": {"select": {"name": STATUS_ACTIVE}},
+        "Вид": {"select": {"name": kind}},
+        "Создатель ID": {"number": creator},
+        "Участники ID": {"rich_text": [{"text": {"content": ",".join(map(str, members or []))}}]},
+    }
+    page = await _call("POST", "/pages", {"parent": {"database_id": await projects_db_id()}, "properties": props})
+    _forget_projects()
+    return _project(page)
+
+
+async def update_project(project_id: str, *, status: str | None = None, kind: str | None = None, description: str | None = None,
+                         sphere_id: str | None = None, members: list[int] | None = None, name: str | None = None) -> None:  # fmt: skip
+    props = {}
+    if status:
+        props["Статус"] = {"select": {"name": status}}
+    if kind:
+        props["Вид"] = {"select": {"name": kind}}
+    if description is not None:
+        props["Описание"] = {"rich_text": [{"text": {"content": description[:2000]}}]}
+    if sphere_id is not None:
+        props["Сфера"] = {"relation": [{"id": sphere_id}] if sphere_id else []}
+    if members is not None:
+        props["Участники ID"] = {"rich_text": [{"text": {"content": ",".join(map(str, members))}}]}
+    if name:
+        props["Название"] = {"title": [{"text": {"content": name[:200]}}]}
+    await _call("PATCH", f"/pages/{project_id}", {"properties": props})
+    _forget_projects()
+
+
+async def project_note_count(project_id: str) -> int:
+    data = await _call(
+        "POST", f"/databases/{await db_id()}/query",
+        {"filter": {"property": c.P_PROJECT, "relation": {"contains": project_id}}, "page_size": 100},
+    )  # fmt: skip
+    return len(data["results"])
+
+
+async def spheres() -> list[dict]:
+    data = await _call("POST", f"/databases/{await spheres_db_id()}/query", {"page_size": 100})
+    return [
+        {"id": p["id"].replace("-", ""), "name": _plain(p["properties"]["Название"]["title"]) or "Без названия", "description": _text_prop(p, "Описание")}
+        for p in data["results"]
+    ]  # fmt: skip
+
+
+async def add_sphere(name: str, description: str = "") -> dict:
+    page = await _call(
+        "POST", "/pages",
+        {"parent": {"database_id": await spheres_db_id()}, "properties": {
+            "Название": {"title": [{"text": {"content": name[:200]}}]},
+            "Описание": {"rich_text": [{"text": {"content": description[:2000]}}] if description else []},
+        }},
+    )  # fmt: skip
+    return {"id": page["id"].replace("-", ""), "name": name, "description": description}
+
+
+async def update_sphere(sphere_id: str, description: str) -> None:
+    await _call("PATCH", f"/pages/{sphere_id}", {"properties": {"Описание": {"rich_text": [{"text": {"content": description[:2000]}}]}}})
+
+
+async def ensure_projects() -> str:
+    """Проекты-страницы. Один раз переносит старые проекты-метки: создаёт страницы, переименовывает старую
+    колонку в «Проект (старое)», добавляет связь «Проект» и привязывает к ней заметки. Повторный вызов
+    только проверяет, что связь на месте."""
+    ideas = await _call("GET", f"/databases/{await db_id()}")
+    props = ideas["properties"]
+    projects_id = await projects_db_id()
+    current = props.get(c.P_PROJECT)
+    if current and current.get("type") == "relation":
+        return "ok"
+    report = []
+    if current and current.get("type") == "select":
+        names = [o["name"] for o in current["select"].get("options", [])]
+        existing = {p["name"].lower() for p in await _load_projects(force=True)}
+        for name in names:
+            if name.lower() not in existing:
+                await create_project(name, KIND_SHARED, c.OWNER_ID)
+        await _call("PATCH", f"/databases/{ideas['id']}", {"properties": {c.P_PROJECT: {"name": OLD_PROJECT}}})
+        report.append(f"перенесено проектов: {len(names)}")
+    await _call(
+        "PATCH", f"/databases/{ideas['id']}",
+        {"properties": {c.P_PROJECT: {"relation": {"database_id": projects_id, "single_property": {}}}}},
+    )  # fmt: skip
+    if current and current.get("type") == "select":
+        by_name = {p["name"].lower(): p["id"] for p in await _load_projects(force=True)}
+        moved, cursor = 0, None
+        while True:
+            body = {"filter": {"property": OLD_PROJECT, "select": {"is_not_empty": True}}, "page_size": 100}
+            if cursor:
+                body["start_cursor"] = cursor
+            data = await _call("POST", f"/databases/{ideas['id']}/query", body)
+            for p in data["results"]:
+                old = _select(p, OLD_PROJECT)
+                if old and old.lower() in by_name:
+                    await _call("PATCH", f"/pages/{p['id']}", {"properties": {c.P_PROJECT: {"relation": [{"id": by_name[old.lower()]}]}}})
+                    moved += 1
+            if not data.get("has_more"):
+                break
+            cursor = data["next_cursor"]
+        report.append(f"привязано заметок: {moved}")
+    return "; ".join(report) or "связь добавлена"

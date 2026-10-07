@@ -41,7 +41,7 @@ async def set_type(pid, name):
     notes[pid]["type"] = name
 
 
-async def projects():
+async def projects(*a):
     return ["Сайт", "Фоны"]
 
 

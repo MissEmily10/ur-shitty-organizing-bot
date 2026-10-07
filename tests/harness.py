@@ -87,6 +87,18 @@ async def _moods(uid):
 _notion.get_value, _notion.set_value, _notion.types = _get_value, _set_value, _types
 _notion.set_mood, _notion.moods = _set_mood, _moods
 
+# Проекты и сферы по умолчанию пустые: тесты, которым они нужны, подменяют _load_projects и spheres сами
+async def _no_projects(force=False):
+    return []
+
+
+async def _no_spheres():
+    return []
+
+
+REAL = {"_load_projects": _notion._load_projects, "spheres": _notion.spheres}
+_notion._load_projects, _notion.spheres = _no_projects, _no_spheres
+
 
 APP = None
 

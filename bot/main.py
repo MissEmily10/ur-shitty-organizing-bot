@@ -75,9 +75,10 @@ MENU = (
     "✍️ Просто пиши, присылай фото блокнота, голосовые или документы: всё, что не начинается с «/», становится заметкой.\n\n"
     "<b>Команды</b>\n"
     "/razbor — разобрать свои входящие\n"
-    "/projects — список проектов\n"
+    "/projects — проекты: карточки, описание, закрыть\n"
     "/addproject — добавить проект (бот спросит название)\n"
     "/types, /addtype — типы записей\n"
+    "/areas, /addarea — сферы деятельности (фотограф, дизайнер…)\n"
     "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
     "/schedule — расписание и календарь в PDF\n"
     "/report — недельный отчёт: настроение и дела\n"
@@ -444,7 +445,7 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         elif action == "invite" and is_owner(uid):
             await _ask_invite_label(q.message)
         elif action == "ask":
-            text, kb = await _ask_scope_view()
+            text, kb = await _ask_scope_view(uid)
             await q.message.reply_text(text, reply_markup=kb)
         elif action == "settings":
             text, kb = await _settings_view(uid)
@@ -572,7 +573,7 @@ async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await own_page(q.from_user.id, page_id)
         if action == "n":
-            projects = await notion.projects()
+            projects = await notion.projects(q.from_user.id)
             if not projects:
                 await q.answer("Проектов пока нет: /addproject", show_alert=True)
                 return
@@ -582,7 +583,7 @@ async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer()
             await q.edit_message_reply_markup(InlineKeyboardMarkup(rows))
         elif action == "np":
-            projects = await notion.projects()
+            projects = await notion.projects(q.from_user.id)
             idx = int(rest[0])
             if idx >= len(projects):
                 await q.answer("Список проектов изменился, попробуйте ещё раз")
@@ -610,7 +611,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _settings_reply(update.message, reply.text)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
-        await update.message.reply_text(await _add_projects_text(update.message.text))
+        await update.message.reply_text(await _add_projects_text(update.message.text, update.effective_user.id))
+        return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(PROJECT_DESC_MARK):
+        await _project_desc_reply(update.message, reply.text)
+        return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == AREA_PROMPT:
+        await update.message.reply_text(await _area_reply(update.message, update.message.text))
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(MOOD_COMMENT_MARK):
         await _mood_comment(update.message, reply.text)
@@ -761,7 +768,7 @@ async def _review_view(uid: int, k: int, show_projects: bool = False) -> tuple[s
         f'<a href="{item["url"]}">{escape(item["title"])}</a>\n\n{escape(body)}\n\n'
     )
     if show_projects:
-        projects = await notion.projects()
+        projects = await notion.projects(uid)
         text += "В какой проект?"
         buttons = [
             Btn(f"📁 {p} ✓" if p == item["project"] else f"📁 {p}", callback_data=f"p:{item['id']}:{i}:{k}")
@@ -902,7 +909,9 @@ async def _ask_ai(message: Message, page_id: str, question: str, history: str = 
                 images.append(await notion.download(url))
             except Exception:
                 log.exception("image download failed")
-        context = "\n\n".join(p for p in (f"# {item['title']}", note["summary"], note["details"]) if p)
+        project = await project_context(item["project"])
+        header = f"# {item['title']}" + (f"\nПроект: {project}" if project else "")
+        context = "\n\n".join(p for p in (header, note["summary"], note["details"]) if p)
         answer = await ai.ask(context, question, images, history)
         await notion.add_answer(page_id, label, to_blocks(answer))
     except Exception as e:
@@ -966,8 +975,8 @@ def _scope_from(text: str) -> tuple[str, str | int] | None:
     return None
 
 
-async def _ask_scope_view() -> tuple[str, InlineKeyboardMarkup]:
-    projects = await notion.projects()
+async def _ask_scope_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    projects = await notion.projects(uid)
     buttons = [Btn(f"📁 {p}", callback_data=f"q:p:{i}") for i, p in enumerate(projects)]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     rows.append([Btn("🗂 Всё за неделю", callback_data="q:d:7"), Btn("🗂 Всё за месяц", callback_data="q:d:30")])
@@ -975,7 +984,7 @@ async def _ask_scope_view() -> tuple[str, InlineKeyboardMarkup]:
 
 
 async def ask_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    text, kb = await _ask_scope_view()
+    text, kb = await _ask_scope_view(update.effective_user.id)
     await update.message.reply_text(text, reply_markup=kb)
 
 
@@ -986,7 +995,7 @@ async def on_scope_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     _, kind, value = q.data.split(":")
     if kind == "p":
-        projects = await notion.projects()
+        projects = await notion.projects(q.from_user.id)
         if int(value) >= len(projects):
             await q.message.reply_text("Список проектов изменился, откройте /ask ещё раз.")
             return
@@ -1105,6 +1114,7 @@ async def start_interview(message: Message, page_id: str) -> None:
             except Exception:
                 log.exception("image download failed")
         titles = await notion.project_titles(item["project"], page_id, message.chat_id) if item["project"] else []
+        project_text = await project_context(item["project"])
     except Exception as e:
         log.exception("interview start failed")
         await status.edit_text(f"❌ Не получилось прочитать заметку: {e}"[:4000])
@@ -1116,6 +1126,7 @@ async def start_interview(message: Message, page_id: str) -> None:
         "note": "\n\n".join(p for p in (f"# {item['title']}", note["summary"], note["details"]) if p),
         "images": images,
         "titles": titles,
+        "project": project_text,
         "qa": [],
         "question": None,
         "draft": "",
@@ -1138,7 +1149,7 @@ async def _next_step(message: Message, status: Message | None = None) -> None:
         await status.edit_text("✨ Думаю над вопросом…")
     try:
         question = await ai.next_question(
-            state["type"], state["note"], state["item"]["project"], state["titles"], state["images"], state["qa"]
+            state["type"], state["note"], state["project"], state["titles"], state["images"], state["qa"]
         )
     except Exception as e:
         log.exception("next question failed")
@@ -1179,7 +1190,7 @@ async def _compose(message: Message, status: Message | None = None) -> None:
         await status.edit_text("✨ Собираю описание…")
     try:
         description = await ai.compose(
-            state["type"], state["note"], state["item"]["project"], state["titles"], state["images"], state["qa"], state["draft"]
+            state["type"], state["note"], state["project"], state["titles"], state["images"], state["qa"], state["draft"]
         )
     except Exception as e:
         log.exception("compose failed")
@@ -1579,7 +1590,7 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             state["picked"] = set() if state["picked"] == all_ids else all_ids
             await q.answer()
         elif action in ("bp", "by"):
-            names = await (notion.projects() if action == "bp" else notion.types())
+            names = await (notion.projects(uid) if action == "bp" else notion.types())
             code = "bpp" if action == "bp" else "byy"
             buttons = [Btn(f"📁 {n}" if action == "bp" else n, callback_data=f"{code}:{i}") for i, n in enumerate(names)]
             rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)] + [[Btn("↩️ Назад", callback_data="bb")]]
@@ -1599,7 +1610,7 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             for page_id in picked:
                 await own_page(uid, page_id)
             if action == "bpp":
-                name = (await notion.projects())[int(arg)]
+                name = (await notion.projects(uid))[int(arg)]
                 for page_id in picked:
                     await notion.file_to_project(page_id, name)
                 await q.answer(f"→ {name}: {len(picked)}")
@@ -1914,20 +1925,89 @@ async def on_type_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await q.edit_message_text(text, reply_markup=kb)
 
 
-# ---------- проекты ----------
-# callback_data: pl  |  pa:<номер> (спросить про удаление)  |  pk:<номер> (удалить)
+# ---------- 📁 проекты и сферы ----------
+# callback_data: pl (список) | plc (закрытые) | pr:<id> (карточка) | pr:<id>:<действие> (close, open, desc, kind, sph, del, delok)
+#                ps:<проект>:<сфера|new|none> (выбор сферы)
+
+PROJECT_DESC_MARK = "✏️ Описание проекта «"
+AREA_PROMPT = (
+    "🗂 Напишите сферу деятельности и коротко о ней ответом на это сообщение, например:\n"
+    "«📷 Фотограф — портреты и репортажи, обрабатываю в Lightroom, люблю тёплый плёночный цвет»"
+)
 
 
-async def _projects_view(uid: int) -> tuple[str, InlineKeyboardMarkup | None]:
-    """Проекты общие: добавлять могут все, удалять — только владелица."""
-    names = await notion.projects()
-    hint = "Добавить: /addproject Название (можно несколько, каждый с новой строки)."
-    if not names:
-        return f"Проектов пока нет.\n\n{hint}", None
-    text = "Проекты:\n" + "\n".join(f"📁 {n}" for n in names) + f"\n\n{hint}"
-    if not is_owner(uid):
-        return text, None
-    return text, InlineKeyboardMarkup([[Btn(f"🗑 {n}", callback_data=f"pa:{i}")] for i, n in enumerate(names)])
+async def project_context(name: str | None) -> str | None:
+    """«Сайт студии — описание. Сфера: 📷 Фотограф — описание» — чтобы ИИ понимал, о чём проект и в какой он сфере."""
+    if not name:
+        return None
+    project = await notion.get_project(name)
+    if not project:
+        return name
+    text = project["name"] + (f" — {project['description']}" if project["description"] else "")
+    if project["sphere_id"]:
+        area = next((a for a in await notion.spheres() if a["id"] == project["sphere_id"]), None)
+        if area:
+            text += f". Сфера деятельности: {area['name']}" + (f" — {area['description']}" if area["description"] else "")
+    return text
+
+
+def _can_manage(uid: int, project: dict) -> bool:
+    return is_owner(uid) or project["creator"] == uid
+
+
+async def _projects_view(uid: int, closed: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    rows_all = await notion.project_list(uid, include_closed=True)
+    shown = [p for p in rows_all if (p["status"] == notion.STATUS_CLOSED) == closed]
+    areas = {a["id"]: a["name"] for a in await notion.spheres()}
+    if not shown:
+        text = "Закрытых проектов нет." if closed else "Проектов пока нет. Добавить: /addproject"
+    else:
+        text = ("✅ Закрытые проекты:" if closed else "📁 Проекты") + " — нажмите, чтобы открыть карточку."
+    # Сгруппированы по сферам: сначала со сферой, потом без
+    shown.sort(key=lambda p: (areas.get(p["sphere_id"] or "", "яяя"), p["name"].lower()))
+    rows, current = [], None
+    for p in shown:
+        area = areas.get(p["sphere_id"] or "")
+        if area != current and area:
+            rows.append([Btn(f"— {area} —", callback_data="noop")])
+        current = area
+        mark = {notion.KIND_PERSONAL: "👤 ", notion.KIND_TEAM: "👥 "}.get(p["kind"], "")
+        rows.append([Btn(f"{mark}{p['name']}", callback_data=f"pr:{p['id']}")])
+    has_closed = any(p["status"] == notion.STATUS_CLOSED for p in rows_all)
+    nav = [Btn("📁 Открытые", callback_data="pl")] if closed else ([Btn("✅ Закрытые", callback_data="plc")] if has_closed else [])
+    nav.append(Btn("➕ Новый", callback_data="m:add"))
+    rows.append(nav)
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _project_card(uid: int, project: dict) -> tuple[str, InlineKeyboardMarkup]:
+    areas = {a["id"]: a for a in await notion.spheres()}
+    area = areas.get(project["sphere_id"] or "")
+    count = await notion.project_note_count(project["id"])
+    text = (
+        f"📁 <b>{escape(project['name'])}</b>\n"
+        f"{project['status']} · {project['kind']} · сфера: {escape(area['name']) if area else '—'}\n"
+        f"Заметок: {count}\n\n"
+        + (escape(project["description"]) if project["description"] else "<i>Описания пока нет. ИИ учитывает его при раскрытии заметок.</i>")
+    )
+    pid = project["id"]
+    rows = []
+    if _can_manage(uid, project):
+        closed = project["status"] == notion.STATUS_CLOSED
+        rows.append([
+            Btn("🟢 Открыть заново" if closed else "✅ Закрыть", callback_data=f"pr:{pid}:{'open' if closed else 'close'}"),
+            Btn("✏️ Описание", callback_data=f"pr:{pid}:desc"),
+        ])  # fmt: skip
+        row = [Btn("🗂 Сфера", callback_data=f"pr:{pid}:sph")]
+        if is_owner(uid) and project["kind"] != notion.KIND_TEAM:
+            to_shared = project["kind"] == notion.KIND_PERSONAL
+            row.append(Btn("🌐 Сделать общим" if to_shared else "👤 Сделать личным", callback_data=f"pr:{pid}:kind"))
+        rows.append(row)
+    rows.append([Btn("🔎 Спросить по проекту", callback_data=f"pr:{pid}:ask")])
+    if is_owner(uid) or (project["creator"] == uid and project["kind"] == notion.KIND_PERSONAL):
+        rows.append([Btn("🗑 Удалить проект", callback_data=f"pr:{pid}:del")])
+    rows.append([Btn("↩️ Все проекты", callback_data="pl")])
+    return text, InlineKeyboardMarkup(rows)
 
 
 async def projects_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1935,14 +2015,16 @@ async def projects_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, reply_markup=kb)
 
 
-async def _add_projects_text(raw: str) -> str:
-    # Проекты разделяются переносом строки или запятой (запятую Notion в названии всё равно не разрешает)
+async def _add_projects_text(raw: str, uid: int) -> str:
+    # Проекты разделяются переносом строки или запятой
     names = [n.strip()[:100] for n in re.split(r"[\n,]", raw) if n.strip()]
     if not names:
         return "Напишите название после команды, например:\n/addproject Сайт-портфолио"
-    added = await notion.add_projects(names)
+    added = await notion.add_projects(names, uid)
     skipped = [n for n in names if n not in added]
     text = ("✅ Добавлено: " + ", ".join(added)) if added else "Ничего нового не добавлено."
+    if added and not is_owner(uid):
+        text += "\n👤 Это ваши личные проекты: их видите только вы."
     if skipped:
         text += "\nУже были: " + ", ".join(skipped)
     return text + "\n\n/projects — список проектов"
@@ -1953,40 +2035,144 @@ async def addproject(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not raw.strip():
         await _ask_project_names(update.message)
         return
-    await update.message.reply_text(await _add_projects_text(raw))
+    await update.message.reply_text(await _add_projects_text(raw, update.effective_user.id))
 
 
 async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if q.from_user.id != c.OWNER_ID:
+    uid = q.from_user.id
+    if not is_member(uid):
         await q.answer()
         return
-    action, _, arg = q.data.partition(":")
+    parts = q.data.split(":")
     try:
-        names = await notion.projects()
-        if action in ("pa", "pk") and int(arg) >= len(names):
-            await q.answer("Список изменился")
-        elif action == "pa":
-            name = names[int(arg)]
+        if parts[0] in ("pl", "plc"):
             await q.answer()
-            await q.edit_message_text(
-                f"Удалить проект «{name}»?\nУ идей, отправленных в него, поле «Проект» станет пустым.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[Btn("Да, удалить", callback_data=f"pk:{arg}"), Btn("Отмена", callback_data="pl")]]
-                ),
-            )
+            text, kb = await _projects_view(uid, closed=parts[0] == "plc")
+            await q.edit_message_text(text, reply_markup=kb)
             return
-        elif action == "pk":
-            await notion.delete_project(names[int(arg)])
-            await q.answer(f"Удалено: {names[int(arg)]}")
+        if parts[0] == "ps":
+            project = await notion.get_project(parts[1])
+            if not project or not _can_manage(uid, project):
+                raise PermissionError("Этот проект менять нельзя.")
+            if parts[2] == "new":
+                await q.answer()
+                await q.message.reply_text(AREA_PROMPT, reply_markup=ForceReply(input_field_placeholder="📷 Фотограф — …"))
+                return
+            await notion.update_project(project["id"], sphere_id="" if parts[2] == "none" else parts[2])
+            await q.answer("Сохранено ✓")
+            project = await notion.get_project(project["id"])
         else:
-            await q.answer()
-        text, kb = await _projects_view(q.from_user.id)
+            project = await notion.get_project(parts[1])
+            if not project or not notion.can_see(project, uid):
+                raise PermissionError("Этот проект недоступен.")
+            action = parts[2] if len(parts) > 2 else "show"
+            manage = _can_manage(uid, project)
+            if action in ("close", "open", "desc", "sph") and not manage:
+                raise PermissionError("Менять проект может только его автор или владелица.")
+            if action == "close":
+                await notion.update_project(project["id"], status=notion.STATUS_CLOSED)
+                await q.answer("Проект закрыт: он пропал из кнопок, заметки остались")
+            elif action == "open":
+                await notion.update_project(project["id"], status=notion.STATUS_ACTIVE)
+                await q.answer("Проект снова открыт")
+            elif action == "kind" and is_owner(uid):
+                new = notion.KIND_SHARED if project["kind"] == notion.KIND_PERSONAL else notion.KIND_PERSONAL
+                await notion.update_project(project["id"], kind=new)
+                await q.answer(new)
+            elif action == "desc":
+                await q.answer()
+                await q.message.reply_text(
+                    f"{PROJECT_DESC_MARK}{project['name']}»: напишите ответом на это сообщение — о чём проект, цель, стиль, для кого.",
+                    reply_markup=ForceReply(input_field_placeholder="о чём проект"),
+                )
+                return
+            elif action == "sph":
+                areas = await notion.spheres()
+                rows = [[Btn(a["name"], callback_data=f"ps:{project['id']}:{a['id']}")] for a in areas]
+                rows.append([Btn("➕ Новая сфера", callback_data=f"ps:{project['id']}:new"), Btn("Без сферы", callback_data=f"ps:{project['id']}:none")])
+                await q.answer()
+                await q.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+                return
+            elif action == "ask":
+                await q.answer()
+                await q.message.reply_text(
+                    f"{NOTES_PROMPT_MARK}{_scope_label(('p', project['name']))}: напишите вопрос ответом на это сообщение.",
+                    reply_markup=ForceReply(input_field_placeholder="ваш вопрос"),
+                )
+                return
+            elif action == "del":
+                if not (is_owner(uid) or (project["creator"] == uid and project["kind"] == notion.KIND_PERSONAL)):
+                    raise PermissionError("Удалить проект может только владелица.")
+                await q.answer()
+                await q.edit_message_text(
+                    f"Удалить проект «{project['name']}»? Заметки останутся, но без проекта.\n"
+                    "Если проект просто закончился — лучше «✅ Закрыть».",
+                    reply_markup=InlineKeyboardMarkup([[Btn("Да, удалить", callback_data=f"pr:{project['id']}:delok"), Btn("Отмена", callback_data=f"pr:{project['id']}")]]),
+                )
+                return
+            elif action == "delok":
+                if not (is_owner(uid) or (project["creator"] == uid and project["kind"] == notion.KIND_PERSONAL)):
+                    raise PermissionError("Удалить проект может только владелица.")
+                await notion.delete_project(project["id"])
+                await q.answer("Проект удалён")
+                text, kb = await _projects_view(uid)
+                await q.edit_message_text(text, reply_markup=kb)
+                return
+            else:
+                await q.answer()
+            project = await notion.get_project(project["id"])
+        text, kb = await _project_card(uid, project)
     except Exception as e:
         log.exception("project button failed")
         await _fail(q, e)
         return
-    await q.edit_message_text(text, reply_markup=kb)
+    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def _project_desc_reply(message: Message, prompt: str) -> None:
+    name = prompt[len(PROJECT_DESC_MARK):].split("»")[0]
+    project = await notion.get_project(name)
+    if not project or not _can_manage(message.chat_id, project):
+        await message.reply_text("Этот проект менять нельзя.")
+        return
+    await notion.update_project(project["id"], description=message.text)
+    text, kb = await _project_card(message.chat_id, await notion.get_project(project["id"]))
+    await message.reply_text("Описание сохранено ✓\n\n" + text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def _area_reply(message: Message, raw: str) -> str:
+    # «Название — описание» (или через двоеточие); описание необязательно
+    m = re.match(r"\s*(.+?)(?:\s+[—–-]\s+|:\s+)(.+)", raw, re.S)
+    name, description = (m.group(1), m.group(2)) if m else (raw, "")
+    name, description = name.strip()[:100], description.strip()
+    if not name:
+        return "Напишите название сферы, например: /addarea 📷 Фотограф — портреты и репортажи"
+    existing = next((a for a in await notion.spheres() if a["name"].lower() == name.lower()), None)
+    if existing:
+        if description:
+            await notion.update_sphere(existing["id"], description)
+            return f"✏️ Описание сферы «{existing['name']}» обновлено."
+        return f"Сфера «{existing['name']}» уже есть."
+    await notion.add_sphere(name, description)
+    return f"✅ Сфера «{name}» добавлена. Привязать к ней проект: /projects → проект → «🗂 Сфера»."
+
+
+async def addarea(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = re.sub(r"^/addarea(@\w+)?", "", update.message.text, count=1)
+    if not raw.strip():
+        await update.message.reply_text(AREA_PROMPT, reply_markup=ForceReply(input_field_placeholder="📷 Фотограф — …"))
+        return
+    await update.message.reply_text(await _area_reply(update.message, raw))
+
+
+async def areas_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    items = await notion.spheres()
+    if not items:
+        await update.message.reply_text("Сфер пока нет. Добавить: /addarea 📷 Фотограф — чем занимаюсь")
+        return
+    lines = [f"🗂 <b>{escape(a['name'])}</b>" + (f" — {escape(a['description'])}" if a["description"] else "") for a in items]
+    await update.message.reply_text("Сферы деятельности:\n\n" + "\n".join(lines) + "\n\nОбновить описание: /addarea Название — новое описание", parse_mode=ParseMode.HTML)
 
 
 async def razbor(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2042,7 +2228,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer()
         elif action == "p":
             page_id, idx, k = args[0], int(args[1]), int(args[2])
-            projects = await notion.projects()
+            projects = await notion.projects(q.from_user.id)
             if idx >= len(projects):
                 await q.answer("Список проектов изменился, попробуйте ещё раз")
             else:
@@ -2079,6 +2265,7 @@ COMMANDS = [
     ("schedule", "Расписание и PDF"),
     ("report", "Недельный отчёт"),
     ("types", "Типы записей"),
+    ("areas", "Сферы деятельности"),
     ("addtype", "Добавить тип"),
 ]
 OWNER_EXTRA = [
@@ -2092,6 +2279,10 @@ async def set_commands(app: Application) -> None:
     await app.bot.set_my_commands(COMMANDS)
     if c.OWNER_ID:
         await app.bot.set_my_commands(COMMANDS + OWNER_EXTRA, scope=BotCommandScopeChat(c.OWNER_ID))
+    try:
+        log.info("projects: %s", await notion.ensure_projects())
+    except Exception:
+        log.exception("could not prepare projects")
     try:
         member.add_user_ids([m["tg"] for m in await notion.members()])
     except Exception:
@@ -2251,7 +2442,9 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(lambda u, _: u.callback_query.answer(), pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^n[px]?:"))
     app.add_handler(CallbackQueryHandler(on_ai_button, pattern=r"^aq?:"))
-    app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^p[akl]"))
+    app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^(pr:|ps:|pl$|plc$)"))
+    app.add_handler(CommandHandler("addarea", addarea, filters=member))
+    app.add_handler(CommandHandler("areas", areas_cmd, filters=member))
     app.add_handler(MessageHandler(member & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(member & (filters.PHOTO | filters.Document.IMAGE), on_photo))
     app.add_handler(MessageHandler(member & (filters.VOICE | filters.AUDIO), on_voice))
