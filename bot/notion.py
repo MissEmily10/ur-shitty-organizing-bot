@@ -554,6 +554,21 @@ async def notes_in_scope(user_id: int, project: str | None = None, days: int | N
     return notes[:limit]
 
 
+async def notes_without_project(user_id: int, limit: int = 80) -> list[dict]:
+    """Заметки человека, не разложенные по проектам, новые первыми (для «🧹 Навести порядок»)."""
+    await _load_projects()
+    data = await _call(
+        "POST",
+        f"/databases/{await db_id()}/query",
+        {
+            "filter": {"and": [{"property": c.P_PROJECT, "relation": {"is_empty": True}}, _by_author(user_id)]},
+            "sorts": [{"timestamp": "created_time", "direction": "descending"}],
+            "page_size": min(limit, 100),
+        },
+    )
+    return [_item(p) for p in data["results"]][:limit]
+
+
 async def created_today(user_id: int) -> int:
     """Сколько заметок человек сохранил за последние сутки: для дневного лимита участников."""
     since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()

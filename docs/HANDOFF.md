@@ -62,6 +62,9 @@ Telegram-бот «организатор мыслей»: заметки (тек�
 - Сферы: `notion.seed_spheres` (один раз при запуске, флаг `seed:spheres:1`), `_project_groups` в `main.py` — проекты
   по сферам для разбора (`ra:`) и «📁 В проект» (`ns:`), `_ask_sphere` при создании проекта (`ps:<проект>:<номер>:n` → иконка).
   Сфера в кнопках — **номер**, не id: callback_data ≤ 64 байт (harness теперь падает на длинных кнопках).
+- 🧹 Навести порядок (16): `ai.tidy_plan` (проверяет ответ модели), `notion.notes_without_project`, в `main.py` раздел
+  «🧹 навести порядок» (`td:`, план в памяти `_tidy`), разовая задача `tidy_offer` в планировщике (8–12, только владелица;
+  в harness убрана из JOBS — `h.TIDY_JOB`). Этап 17 (пересекающиеся цели) — только в ROADMAP, ждёт «делаем».
 - `team.py` — 👥 сводки командных проектов (по кнопке и задача `team_summary` в понедельник).
 - `report.py` + `weekly.py` — недельный отчёт (Pillow). `documents.py` — PDF/Word/Excel/CSV/TXT.
 - Оформление картинок и PDF — `design/tokens.json` + шрифт PT Sans в `design/fonts/` (временное, под её дизайн).

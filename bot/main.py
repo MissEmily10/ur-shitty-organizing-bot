@@ -78,6 +78,7 @@ MENU = (
     "/projects — проекты: карточки, описание, закрыть\n"
     "/addproject — добавить проект (бот спросит название)\n"
     "/feed — лента заметок проекта; в командном — от всех участников\n"
+    "/tidy — 🧹 разложить заметки без проекта по сферам и проектам\n"
     "/types, /addtype — типы записей\n"
     "/areas, /addarea — сферы деятельности (фотограф, дизайнер…)\n"
     "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
@@ -244,10 +245,12 @@ def _section(uid: int, name: str) -> tuple[str, list[list[tuple[str, str]]]]:
             "🗂 <b>Разобрать</b> — решить про каждую заметку, что это и куда её\n"
             "📌 <b>Куда писать</b> — новые заметки сразу в проект, без разбора\n"
             "🔥 <b>Горящие дедлайны</b> — просроченное, сегодня и завтра: что уже закрыто?\n"
+            "🧹 <b>Навести порядок</b> — ИИ предложит разложить заметки по сферам и проектам\n"
             "🏷 <b>Типы</b> — виды записей: идея, задача, референс…\n"
             "☀️ <b>Чек-ины</b> — когда днём спрашивать о неразобранном",
             [[("🗂 Разобрать", "m:razbor"), ("📌 Куда писать", "st:ap")],
-             [("🔥 Горящие дедлайны", "hd:show"), ("🏷 Типы", "m:types")], [("☀️ Чек-ины", "st:ci")]],
+             [("🔥 Горящие дедлайны", "hd:show"), ("🧹 Навести порядок", "td:plan")],
+             [("🏷 Типы", "m:types"), ("☀️ Чек-ины", "st:ci")]],
         )  # fmt: skip
     if name == "projects":
         rows = [[("📁 Все проекты", "pl"), ("➕ Новый", "m:add")], [("📰 Лента", "m:feed"), ("🗂 Сферы", "m:areas")]]
@@ -1939,6 +1942,182 @@ async def send_overdue(bot, uid: int) -> None:
         )
 
 
+# ---------- 🧹 навести порядок: разложить заметки по сферам и проектам ----------
+# ИИ предлагает план (заметкам без проекта — проект, при необходимости новые проекты, проектам без сферы — сферу),
+# человек подтверждает всё сразу или по группам. Ничего не удаляется: только ставятся проекты и сферы.
+# callback_data: td:plan | td:all | td:step | td:y | td:s | td:no
+
+TIDY_LIMIT = 80  # заметок за один раз
+_tidy: dict[int, dict] = {}
+
+
+def tidy_offer_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[Btn("🧹 Показать план", callback_data="td:plan"), Btn("Не сейчас", callback_data="td:no")]])
+
+
+async def _tidy_build(uid: int) -> dict | None:
+    notes = await notion.notes_without_project(uid, TIDY_LIMIT)
+    projects = await notion.project_list(uid)
+    areas = await notion.spheres()
+    area_name = {a["id"]: a["name"] for a in areas}
+    plan = await ai.tidy_plan(
+        [a["name"] for a in areas],
+        [(p["name"], area_name.get(p["sphere_id"] or "", "")) for p in projects],
+        [(n["title"], n.get("type") or n.get("ai_type") or "") for n in notes],
+    ) if notes or any(not p["sphere_id"] for p in projects) else {"notes": [], "new_projects": [], "spheres": []}  # fmt: skip
+    new = dict(plan["new_projects"])
+    sphere_of = {p["name"]: area_name.get(p["sphere_id"] or "", "") for p in projects} | new
+    groups: dict[str, list[dict]] = {}
+    for n, project in plan["notes"]:
+        groups.setdefault(project, []).append(notes[n - 1])
+    # сферы по алфавиту, проекты без сферы — в конце
+    ordered = sorted(groups, key=lambda name: (not sphere_of.get(name), (sphere_of.get(name) or "").lower(), name.lower()))
+    steps = [{"project": name, "sphere": sphere_of.get(name, ""), "new": name in new, "notes": groups[name]} for name in ordered]
+    manageable = {p["name"] for p in projects if _can_manage(uid, p)}
+    sphere_steps = [(p, a) for p, a in plan["spheres"] if p in manageable]
+    if sphere_steps:
+        steps.append({"spheres": sphere_steps})
+    if not steps:
+        return None
+    return {"steps": steps, "i": 0, "left": len(notes) - len(plan["notes"]), "applied": [0, 0, 0]}
+
+
+def _titles(notes: list[dict], limit: int = 3) -> str:
+    shown = ", ".join(f"«{escape(n['title'][:40])}»" for n in notes[:limit])
+    return shown + (f" и ещё {len(notes) - limit}" if len(notes) > limit else "")
+
+
+def _tidy_overview(plan: dict) -> str:
+    lines, current = [], None
+    for step in plan["steps"]:
+        if "spheres" in step:
+            lines.append("\n🗂 <b>Сферы проектам:</b> " + ", ".join(f"«{escape(p)}» → {escape(a)}" for p, a in step["spheres"]))
+            continue
+        if step["sphere"] != current:
+            current = step["sphere"]
+            lines.append(f"\n<b>{escape(current or '📁 Без сферы')}</b>")
+        mark = "🆕" if step["new"] else "📁"
+        lines.append(f"{mark} {escape(step['project'])} ← {len(step['notes'])}: {_titles(step['notes'])}")
+    left = f"\n\nНе нашла, куда положить: {plan['left']} — останутся во входящих." if plan["left"] else ""
+    return (
+        "🧹 <b>План: как разложить заметки</b>\nНичего не удаляю — только ставлю проекты и сферы. 🆕 — новый проект.\n"
+        + "\n".join(lines) + left
+    )[:3900]
+
+
+def _tidy_step_view(plan: dict) -> tuple[str, InlineKeyboardMarkup]:
+    i, steps = plan["i"], plan["steps"]
+    step = steps[i]
+    head = f"🧹 <b>Шаг {i + 1} из {len(steps)}</b>\n\n"
+    if "spheres" in step:
+        body = "🗂 Поставить сферы проектам?\n" + "\n".join(f"• «{escape(p)}» → {escape(a)}" for p, a in step["spheres"])
+    else:
+        where = f"{escape(step['sphere'] or '📁 Без сферы')} → {'🆕 новый проект ' if step['new'] else '📁 '}{escape(step['project'])}"
+        body = f"{where}\n\n" + "\n".join(f"• {escape(n['title'])}" for n in step["notes"][:20])
+        if len(step["notes"]) > 20:
+            body += f"\n…и ещё {len(step['notes']) - 20}"
+    kb = InlineKeyboardMarkup([
+        [Btn("✅ Да", callback_data="td:y"), Btn("⏭ Пропустить", callback_data="td:s")],
+        [Btn("✋ Хватит", callback_data="td:no")],
+    ])  # fmt: skip
+    return (head + body)[:3900], kb
+
+
+async def _tidy_apply(bot, uid: int, step: dict, applied: list[int]) -> None:
+    areas = {a["name"]: a["id"] for a in await notion.spheres()}
+    if "spheres" in step:
+        for name, area in step["spheres"]:
+            project = await notion.get_project(name)
+            if project and _can_manage(uid, project) and area in areas:
+                await notion.update_project(project["id"], sphere_id=areas[area])
+                applied[2] += 1
+        return
+    if step["new"]:
+        await notion.add_projects([step["project"]], uid)
+        project = await notion.get_project(step["project"])
+        if project and step["sphere"] in areas:
+            await notion.update_project(project["id"], sphere_id=areas[step["sphere"]])
+        applied[1] += 1
+    for note in step["notes"]:
+        await own_page(uid, note["id"])
+        await _file(bot, uid, note["id"], step["project"])
+        applied[0] += 1
+
+
+def _tidy_summary(applied: list[int]) -> str:
+    notes, new, areas = applied
+    if not any(applied):
+        return "Ничего не меняла. Захочешь — /tidy."
+    parts = [f"заметок разложено: {notes}"] + ([f"новых проектов: {new}"] if new else []) + ([f"сфер проставлено: {areas}"] if areas else [])
+    return "✅ Готово — " + ", ".join(parts) + ".\nВсё видно в /projects и в Notion."
+
+
+async def tidy_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🧹 Разложить заметки без проекта по сферам и проектам? Сначала покажу план — без твоего ✅ ничего не трону.",
+        reply_markup=tidy_offer_markup(),
+    )
+
+
+async def on_tidy_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    action = q.data.split(":")[1]
+    try:
+        if action == "no":
+            _tidy.pop(uid, None)
+            await q.answer()
+            await _edit(q, "Хорошо, в другой раз. Навести порядок: /tidy", reply_markup=None)
+            return
+        if action == "plan":
+            await q.answer()
+            if not await ai_allowed(q.message):
+                return
+            await _edit(q, "🧹 Смотрю заметки и проекты…", reply_markup=None)
+            plan = await _tidy_build(uid)
+            if not plan:
+                await _edit(q, "🎉 Всё уже разложено по проектам и сферам — менять нечего.", reply_markup=None)
+                return
+            _tidy[uid] = plan
+            kb = InlineKeyboardMarkup([
+                [Btn("✅ Разложить всё", callback_data="td:all"), Btn("👀 По шагам", callback_data="td:step")],
+                [Btn("✖️ Не сейчас", callback_data="td:no")],
+            ])  # fmt: skip
+            await _edit(q, _tidy_overview(plan), reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+        plan = _tidy.get(uid)
+        if not plan:
+            await q.answer("План устарел — покажу заново: /tidy", show_alert=True)
+            return
+        if action == "all":
+            await q.answer()
+            await _edit(q, "🧹 Раскладываю…", reply_markup=None)
+            for step in plan["steps"][plan["i"]:]:
+                await _tidy_apply(q.get_bot(), uid, step, plan["applied"])
+            _tidy.pop(uid, None)
+            await _edit(q, _tidy_summary(plan["applied"]), reply_markup=None)
+            return
+        if action in ("y", "s"):
+            if action == "y":
+                await _tidy_apply(q.get_bot(), uid, plan["steps"][plan["i"]], plan["applied"])
+            plan["i"] += 1
+            await q.answer("Готово ✓" if action == "y" else "Пропущено")
+            if plan["i"] >= len(plan["steps"]):
+                _tidy.pop(uid, None)
+                await _edit(q, _tidy_summary(plan["applied"]), reply_markup=None)
+                return
+        else:
+            await q.answer()
+        text, kb = _tidy_step_view(plan)
+        await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.exception("tidy failed")
+        await _fail(q, e)
+
+
 # ---------- 🔥 горящие дедлайны ----------
 # Сводка по утрам (scheduler.hot_view) и по кнопке «🔥 Горящие дедлайны» в разделе «📥 Заметки».
 # callback_data: hd:show | hd:ok:<page> (закрыта) | hd:sn:<page> (меню переноса) | hd:p1d / hd:p7d:<page> | hd:back
@@ -3414,6 +3593,7 @@ COMMANDS = [
     ("projects", "Список проектов"),
     ("addproject", "Добавить проект"),
     ("feed", "Лента заметок проекта"),
+    ("tidy", "Навести порядок: разложить заметки"),
     ("ask", "Спросить ИИ по заметкам"),
     ("settings", "Часовой пояс и время разбора"),
     ("style", "Стиль общения бота"),
@@ -3597,6 +3777,8 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_when_button, pattern=r"^w[vcx]?:"))
     app.add_handler(CallbackQueryHandler(on_deadline_button, pattern=r"^(dl:|ov$)"))
     app.add_handler(CallbackQueryHandler(on_hot_button, pattern=r"^hd:"))
+    app.add_handler(CommandHandler("tidy", tidy_cmd, filters=member))
+    app.add_handler(CallbackQueryHandler(on_tidy_button, pattern=r"^td:"))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))
     app.add_handler(CommandHandler("schedule", schedule_cmd, filters=member))
     app.add_handler(CommandHandler("report", report_cmd, filters=member))

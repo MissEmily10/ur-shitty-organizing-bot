@@ -429,6 +429,27 @@ async def _team_run(bot: Bot, uid: int, now: datetime) -> str:
     return await team.weekly(bot, uid, now, _report_due(now, {}) or now.date().isoformat(), is_done, mark_done)
 
 
+TIDY_FROM, TIDY_TILL = time(8, 0), time(12, 0)
+
+
+def _tidy_due(now: datetime, settings: dict) -> str | None:
+    """Первое утро после запуска (8:00–12:00): один раз предложить навести порядок."""
+    return "first" if TIDY_FROM <= now.time() < TIDY_TILL else None
+
+
+async def _tidy_run(bot: Bot, uid: int, now: datetime) -> str:
+    if uid != c.OWNER_ID:
+        return "только владелице"
+    await bot.send_message(
+        uid,
+        await styles.wrap(uid, "greeting",
+            "🧹 Доброе утро! Предлагаю аккуратно навести порядок: разложить заметки без проекта по сферам и проектам "
+            "(📚 Образование, 📷 Фотография, 💼 Работа, 🏠 Бытовое…). Сначала покажу план — без твоего ✅ ничего не трону."),
+        reply_markup=InlineKeyboardMarkup([[Btn("🧹 Показать план", callback_data="td:plan"), Btn("Не сейчас", callback_data="td:no")]]),
+    )
+    return "предложен порядок"
+
+
 JOBS = [
     Job("evening", _evening_due, _evening_run),
     Job("mood", _mood_due, _mood_run),
@@ -437,6 +458,7 @@ JOBS = [
     Job("weekly_report", _report_due, _report_run),
     Job("team_summary", _report_due, _team_run),
     Job("deadlines", _hot_due, _hot_run),
+    Job("tidy_offer", _tidy_due, _tidy_run),
 ]
 
 

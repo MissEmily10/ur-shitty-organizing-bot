@@ -590,3 +590,56 @@ HELP_PROMPT = """Ты справка Telegram-бота для заметок. О
 async def help_answer(question: str) -> str:
     guide = GUIDE_FILE.read_text(encoding="utf-8")
     return await _complete(HELP_PROMPT.format(guide=guide, question=question[:1000]), 1200) or "🤷 Не нашёл ответа. Загляните в /start."
+
+
+# ---------- 🧹 навести порядок ----------
+
+TIDY_PROMPT = """Ты помогаешь аккуратно разложить заметки по сферам и проектам. Ничего не выдумывай про содержание заметок.
+
+Сферы: {spheres}
+Проекты (проект — сфера): {projects}
+Заметки без проекта (номер. название [тип]):
+{notes}
+
+Задачи:
+1. Каждой заметке подбери подходящий проект из списка. Если подходящего нет, но несколько заметок явно про одно и то же,
+   можно предложить новый проект (не больше {max_new}, короткое название) в одной из сфер. Если заметка ни к чему не относится — не включай её.
+2. Проектам без сферы подбери сферу из списка, если она очевидна.
+Ответь только JSON:
+{{"notes": [{{"n": 1, "project": "название проекта"}}], "new_projects": [{{"name": "…", "sphere": "…"}}],
+  "spheres": [{{"project": "…", "sphere": "…"}}]}}"""
+
+
+async def tidy_plan(spheres: list[str], projects: list[tuple[str, str]], notes: list[tuple[str, str]], max_new: int = 5) -> dict:
+    """План раскладки: {"notes": [(номер заметки, проект)], "new_projects": [(название, сфера)], "spheres": [(проект, сфера)]}.
+    Всё, что ссылается на несуществующие сферы и проекты, отбрасывается."""
+    text = TIDY_PROMPT.format(
+        spheres=", ".join(spheres) or "нет",
+        projects="; ".join(f"{p} — {s or 'без сферы'}" for p, s in projects) or "нет",
+        notes="\n".join(f"{i}. {t}" + (f" [{k}]" if k else "") for i, (t, k) in enumerate(notes, 1)),
+        max_new=max_new,
+    )
+    raw = _json_object(await _complete(text, 3000))
+    sphere_set = {s.lower(): s for s in spheres}
+    new = []
+    for p in raw.get("new_projects") or []:
+        if isinstance(p, dict) and str(p.get("name", "")).strip() and str(p.get("sphere", "")).lower() in sphere_set:
+            new.append((str(p["name"]).strip()[:100], sphere_set[str(p["sphere"]).lower()]))
+    new = new[:max_new]
+    known = {p.lower(): p for p, _ in projects} | {n.lower(): n for n, _ in new}
+    plan_notes = []
+    for item in raw.get("notes") or []:
+        try:
+            n, project = int(item["n"]), str(item["project"]).strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 1 <= n <= len(notes) and project.lower() in known:
+            plan_notes.append((n, known[project.lower()]))
+    without = {p.lower() for p, s in projects if not s}
+    plan_spheres = [
+        (known[str(x["project"]).lower()], sphere_set[str(x["sphere"]).lower()])
+        for x in raw.get("spheres") or []
+        if isinstance(x, dict) and str(x.get("project", "")).lower() in without and str(x.get("sphere", "")).lower() in sphere_set
+    ]
+    used = {p for _, p in plan_notes}
+    return {"notes": plan_notes, "new_projects": [p for p in new if p[0] in used], "spheres": plan_spheres}

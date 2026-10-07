@@ -111,6 +111,9 @@ _scheduler.DEFAULT_SETTINGS["banners"] = False
 # Знакомство при первом /start и автоподсказки — тоже выключены (проверяются в test_navigation)
 _scheduler.DEFAULT_SETTINGS["toured"] = True
 main.HINT_TIMES = 0
+# Разовое утреннее «навести порядок» — тоже (проверяется в test_tidy)
+TIDY_JOB = next(j for j in _scheduler.JOBS if j.name == "tidy_offer")
+_scheduler.JOBS.remove(TIDY_JOB)
 
 REAL = {"_load_projects": _notion._load_projects, "spheres": _notion.spheres}
 _notion._load_projects, _notion.spheres = _no_projects, _no_spheres
