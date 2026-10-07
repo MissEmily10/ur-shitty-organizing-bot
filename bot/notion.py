@@ -178,6 +178,16 @@ async def upload_image(data: bytes, filename: str) -> str:
     return await upload_file(data, filename, "image/jpeg")
 
 
+async def set_icon(page_id: str, upload_id: str | None) -> None:
+    """Иконка страницы из загруженного файла; None — убрать иконку."""
+    icon = {"type": "file_upload", "file_upload": {"id": upload_id}} if upload_id else None
+    headers = {"Authorization": f"Bearer {c.NOTION_TOKEN}", "Notion-Version": FILES_VERSION}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.patch(f"{API}/pages/{page_id}", headers=headers, json={"icon": icon})
+    if r.is_error:
+        raise NotionError(r.status_code, r.text)
+
+
 def file_block(upload_id: str, kind: str = "file") -> dict:
     """kind: image — картинка, pdf — PDF с просмотром прямо в Notion, file — любой другой файл."""
     return {"object": "block", "type": kind, kind: {"type": "file_upload", "file_upload": {"id": upload_id}}}

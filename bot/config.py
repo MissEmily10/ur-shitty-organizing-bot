@@ -22,6 +22,9 @@ NOTION_DATABASE_ID = env("NOTION_DATABASE_ID")
 
 VISION_MODEL = env("VISION_MODEL", "google/gemma-4-26B-A4B-it")
 ASR_MODEL = env("ASR_MODEL", "openai/whisper-large-v3")
+# Картинки (иконки проектов). Позже сюда можно вписать свою LoRA-модель в её стиле
+IMAGE_MODEL = env("IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
+AUTO_ICONS = env("AUTO_ICONS", "1") == "1"  # «0» — не рисовать иконку сама при создании проекта
 
 # Render задаёт RENDER_EXTERNAL_URL сам. Без него бот работает в режиме polling (удобно локально).
 WEBHOOK_BASE = env("WEBHOOK_URL") or env("RENDER_EXTERNAL_URL")

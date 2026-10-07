@@ -652,7 +652,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _settings_reply(update.message, reply.text)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
-        await update.message.reply_text(await _add_projects_text(update.message.text, update.effective_user.id))
+        await _add_projects_reply(update.message, update.message.text)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(PROJECT_DESC_MARK):
         await _project_desc_reply(update.message, reply.text)
@@ -2039,9 +2039,12 @@ async def _project_card(uid: int, project: dict) -> tuple[str, InlineKeyboardMar
             row.append(Btn("🌐 Сделать общим" if to_shared else "👤 Сделать личным", callback_data=f"pr:{pid}:kind"))
         rows.append(row)
         if project["kind"] == notion.KIND_TEAM:
-            rows.append([Btn("👥 Участники", callback_data=f"tm:{pid}")])
-        elif can_create_team(uid):
-            rows.append([Btn("👥 Сделать командным", callback_data=f"pr:{pid}:team")])
+            rows.append([Btn("👥 Участники", callback_data=f"tm:{pid}"), Btn("🎨 Иконка", callback_data=f"ic:{pid}:new")])
+        else:
+            rows.append(
+                ([Btn("👥 Сделать командным", callback_data=f"pr:{pid}:team")] if can_create_team(uid) else [])
+                + [Btn("🎨 Иконка", callback_data=f"ic:{pid}:new")]
+            )
     if project["status"] != notion.STATUS_CLOSED:
         rows.append([Btn("📌 Пишу сюда ✓ — выключить" if pinned else "📌 Писать сюда", callback_data=f"pr:{pid}:pin")])
     rows.append([Btn("📰 Лента", callback_data=f"fd:{pid}"), Btn("🔎 Спросить по проекту", callback_data=f"pr:{pid}:ask")])
@@ -2058,11 +2061,20 @@ async def projects_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, reply_markup=kb)
 
 
-async def _add_projects_text(raw: str, uid: int) -> str:
+async def _add_projects_reply(message: Message, raw: str) -> None:
+    """Добавляет проекты, отвечает списком и рисует новым проектам иконки."""
+    text, added = await _add_projects_text(raw, message.chat_id)
+    await message.reply_text(text)
+    for name in added:
+        if project := await notion.get_project(name):
+            await auto_icon(message, project)
+
+
+async def _add_projects_text(raw: str, uid: int) -> tuple[str, list[str]]:
     # Проекты разделяются переносом строки или запятой
     names = [n.strip()[:100] for n in re.split(r"[\n,]", raw) if n.strip()]
     if not names:
-        return "Напишите название после команды, например:\n/addproject Сайт-портфолио"
+        return "Напишите название после команды, например:\n/addproject Сайт-портфолио", []
     added = await notion.add_projects(names, uid)
     skipped = [n for n in names if n not in added]
     text = ("✅ Добавлено: " + ", ".join(added)) if added else "Ничего нового не добавлено."
@@ -2070,7 +2082,7 @@ async def _add_projects_text(raw: str, uid: int) -> str:
         text += "\n👤 Это ваши личные проекты: их видите только вы."
     if skipped:
         text += "\nУже были: " + ", ".join(skipped)
-    return text + "\n\n/projects — список проектов"
+    return text + "\n\n/projects — список проектов", added
 
 
 async def addproject(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2078,7 +2090,7 @@ async def addproject(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not raw.strip():
         await _ask_project_names(update.message)
         return
-    await update.message.reply_text(await _add_projects_text(raw, update.effective_user.id))
+    await _add_projects_reply(update.message, raw)
 
 
 async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2232,6 +2244,82 @@ async def areas_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Сферы деятельности:\n\n" + "\n".join(lines) + "\n\nОбновить описание: /addarea Название — новое описание", parse_mode=ParseMode.HTML)
 
 
+# ---------- 🎨 ИИ-иконки проектов ----------
+# При создании проекта ИИ придумывает образ, генератор картинок рисует иконку в стиле из design/icon_style.md,
+# бот сразу ставит её на страницу проекта в Notion и показывает: оставить, другой вариант или без иконки.
+# callback_data: ic:<проект>:ok | ic:<проект>:new | ic:<проект>:no
+
+_icon_attempts: dict[str, int] = {}
+
+
+def _icon_markup(pid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [Btn("✅ Оставить", callback_data=f"ic:{pid}:ok"), Btn("🔄 Другой вариант", callback_data=f"ic:{pid}:new")],
+        [Btn("✖️ Без иконки", callback_data=f"ic:{pid}:no")],
+    ])  # fmt: skip
+
+
+async def make_icon(message: Message, project: dict) -> None:
+    if not await ai_allowed(message):
+        return
+    attempt = _icon_attempts.get(project["id"], 0)
+    _icon_attempts[project["id"]] = attempt + 1
+    status = await message.reply_text(f"🎨 Рисую иконку для «{project['name']}»…")
+    try:
+        prompt = await ai.icon_prompt(project["name"], await project_context(project["name"]), attempt)
+        image = await ai.draw(prompt)
+        upload = await notion.upload_file(image, "icon.png", "image/png")
+        await notion.set_icon(project["id"], upload)
+    except Exception as e:
+        log.exception("icon failed")
+        await status.edit_text(
+            f"🎨 Иконку нарисовать не получилось: {e}"[:3500]
+            + "\nПопробовать ещё раз: /projects → проект → «🎨 Иконка»."
+        )
+        return
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await message.reply_photo(
+        image, caption=f"🎨 Иконка «{project['name']}» уже стоит в Notion.", reply_markup=_icon_markup(project["id"])
+    )
+
+
+async def auto_icon(message: Message, project: dict) -> None:
+    """Иконка сама при создании проекта, если не выключено переменной AUTO_ICONS=0."""
+    if c.AUTO_ICONS:
+        await make_icon(message, project)
+
+
+async def on_icon_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    _, pid, action = q.data.split(":")
+    try:
+        project = await notion.get_project(pid)
+        if not project or not notion.can_see(project, uid) or not _can_manage(uid, project):
+            raise PermissionError("Иконку меняет автор проекта или владелица.")
+        if action == "ok":
+            await q.answer("Оставили ✓")
+            await q.edit_message_reply_markup(None)
+        elif action == "no":
+            await notion.set_icon(project["id"], None)
+            await q.answer("Иконка убрана")
+            await q.edit_message_caption(f"✖️ «{project['name']}» без иконки.", reply_markup=None)
+        else:
+            await q.answer()
+            if q.message.photo:
+                await q.edit_message_reply_markup(None)
+            await make_icon(q.message, project)
+    except Exception as e:
+        log.exception("icon button failed")
+        await _fail(q, e)
+
+
 # ---------- 👥 командные проекты ----------
 # Проект, в который несколько участников вместе вносят заметки. Создаёт владелица (или все, если TEAM_PROJECTS_BY_MEMBERS=1).
 # Участники видят заметки друг друга в ленте и сводке, удалять могут только свои.
@@ -2326,6 +2414,7 @@ async def _create_team(message: Message, raw: str) -> None:
     project = await notion.create_project(name, notion.KIND_TEAM, uid, [])
     text, kb = await _team_members_view(project)
     await message.reply_text(f"✅ Командный проект «{name}» создан.\n\n" + text, reply_markup=kb)
+    await auto_icon(message, project)
 
 
 async def teamproject_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2706,6 +2795,7 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("teamproject", teamproject_cmd, filters=member))
     app.add_handler(CommandHandler("feed", feed_cmd, filters=member))
     app.add_handler(CallbackQueryHandler(on_team_button, pattern=r"^(tm|fd|fv|fs):"))
+    app.add_handler(CallbackQueryHandler(on_icon_button, pattern=r"^ic:"))
     app.add_handler(CommandHandler("settings", settings_cmd, filters=member))
     app.add_handler(CommandHandler("types", types_cmd, filters=member))
     app.add_handler(CommandHandler("addtype", addtype, filters=member))

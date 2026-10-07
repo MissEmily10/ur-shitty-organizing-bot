@@ -96,6 +96,9 @@ async def _no_spheres():
     return []
 
 
+# Иконки проектов рисуются по сети: в тестах выключены, кроме test_icons
+main.c.AUTO_ICONS = False
+
 REAL = {"_load_projects": _notion._load_projects, "spheres": _notion.spheres}
 _notion._load_projects, _notion.spheres = _no_projects, _no_spheres
 

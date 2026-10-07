@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import io
 import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 
 from huggingface_hub import AsyncInferenceClient
 
@@ -489,3 +491,40 @@ async def week_conclusion(rows: list[list[str]], previous: float | None) -> str:
         temperature=0.5,
     )
     return (response.choices[0].message.content or "").strip()
+
+
+# ---------- 🎨 иконки проектов ----------
+
+STYLE_FILE = Path(__file__).resolve().parent.parent / "design" / "icon_style.md"
+
+ICON_PROMPT = """Write an English prompt for an image generator: an icon for the project «{name}».
+About the project: {about}
+The icon is one simple, clear visual metaphor of the project, centered, on a plain background, no text, no letters, no words.
+Style (follow it exactly): {style}
+{variant}Answer with the prompt only, one line, up to 70 words."""
+
+
+def icon_style() -> str:
+    """Описание стиля иконок из design/icon_style.md (строки после «---», без комментариев)."""
+    try:
+        text = STYLE_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return "flat minimal icon"
+    body = text.split("\n---\n", 1)[-1]
+    return " ".join(line.strip() for line in body.splitlines() if line.strip() and not line.startswith("#"))
+
+
+async def icon_prompt(name: str, about: str | None, attempt: int = 0) -> str:
+    variant = f"This is attempt {attempt + 1}: choose a different metaphor than the obvious one.\n" if attempt else ""
+    prompt = await _complete(
+        ICON_PROMPT.format(name=name, about=about or "—", style=icon_style(), variant=variant), 200
+    )
+    return prompt.strip().strip('"') or f"icon for {name}, {icon_style()}"
+
+
+async def draw(prompt: str, size: int = 512) -> bytes:
+    """Картинка по описанию (text-to-image на Hugging Face) → PNG."""
+    image = await _client().text_to_image(prompt, model=c.IMAGE_MODEL, width=size, height=size)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
