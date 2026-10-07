@@ -251,7 +251,51 @@ async def checkins_off_today(uid: int) -> None:
     await notion.set_value(f"checkin_off:{uid}:{today}", "1")
 
 
-JOBS = [Job("evening", _evening_due, _evening_run), Job("checkin", _checkin_due, _checkin_run)]
+# ---------- 🗓 пересмотр расписания ----------
+
+REVIEW_AT = time(11, 0)  # во сколько по местному времени предлагать пересмотр
+
+
+def _review_due(now: datetime, settings: dict) -> str | None:
+    """Неделя и две недели — в воскресенье, месяц — 1-го числа; всё в 11:00 местного времени."""
+    mode = settings.get("schedule_review", "week")
+    if mode == "off" or now.time() < REVIEW_AT:
+        return None
+    if mode == "month":
+        return now.strftime("%Y-%m") if now.day == 1 else None
+    if now.weekday() != 6:
+        return None
+    week = now.isocalendar().week
+    if mode == "2weeks" and week % 2:
+        return None
+    return f"{now.isocalendar().year}-W{week}"
+
+
+async def _review_run(bot: Bot, uid: int, now: datetime) -> str:
+    slots = await notion.schedule_slots(uid)
+    if not any(s["kind"] == notion.KIND_REGULAR for s in slots):
+        return "базового расписания нет"
+    monthly = (await get_settings(uid)).get("schedule_review") == "month"
+    period = "месяц" if monthly else "неделю"
+    await bot.send_message(
+        uid,
+        f"🗓 Пора пересмотреть расписание на {period}. Всё как обычно или есть изменения?",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [Btn("✅ Всё как есть", callback_data="sc:keep"), Btn("✏️ Изменить", callback_data="sc:edit")],
+                # в воскресенье — следующая неделя; 1-го числа — уже наступивший месяц
+                [Btn("📄 PDF на " + period, callback_data="sc:pdfm:0" if monthly else "sc:pdfw:1")],
+            ]
+        ),
+    )
+    return "предложен пересмотр"
+
+
+JOBS = [
+    Job("evening", _evening_due, _evening_run),
+    Job("checkin", _checkin_due, _checkin_run),
+    Job("schedule_review", _review_due, _review_run),
+]
 
 
 async def tick(bot: Bot, user_ids: list[int], now: datetime | None = None, force: str | None = None) -> str:

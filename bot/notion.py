@@ -90,6 +90,7 @@ MEMBERS_SCHEMA = {
 _db_id: str | None = None
 _members_db_id: str | None = None
 _service_db_id: str | None = None
+_schedule_db_id: str | None = None
 _db_lock = asyncio.Lock()
 
 
@@ -715,3 +716,112 @@ async def forget_old_marks(days: int = 14) -> int:
             await trash(row["id"])
         removed += len(data["results"])
     return removed
+
+
+# ---------- 🗓 расписание ----------
+
+SCHEDULE_TITLE = "Расписание"
+WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+KIND_REGULAR, KIND_ONCE, KIND_CANCEL = "🔁 Регулярно", "📌 Разово", "🚫 Отмена"
+SCHEDULE_SCHEMA = {
+    "Событие": {"title": {}},
+    "Вид": {"select": {"options": [{"name": KIND_REGULAR, "color": "blue"}, {"name": KIND_ONCE, "color": "green"}, {"name": KIND_CANCEL, "color": "red"}]}},
+    "Дни": {"multi_select": {"options": [{"name": d} for d in WEEKDAYS]}},  # для регулярных
+    "Дата": {"date": {}},  # для разовых и отмен
+    "Начало": {"rich_text": {}},
+    "Конец": {"rich_text": {}},
+    "Автор ID": {"number": {}},
+}
+
+
+async def schedule_db_id() -> str:
+    """Таблица «Расписание» рядом с «Входящими идеями»: регулярные блоки, разовые события и отмены."""
+    global _schedule_db_id
+    if _schedule_db_id:
+        return _schedule_db_id
+    found = next((d for d in await _search("database", SCHEDULE_TITLE) if _plain(d["title"]) == SCHEDULE_TITLE), None)
+    if found:
+        missing = {n: spec for n, spec in SCHEDULE_SCHEMA.items() if n not in found["properties"] and "title" not in spec}
+        if missing:
+            await _call("PATCH", f"/databases/{found['id']}", {"properties": missing})
+        _schedule_db_id = found["id"]
+    else:
+        ideas = await _call("GET", f"/databases/{await db_id()}")
+        parent = ideas["parent"].get("page_id") or await _first_shared_page()
+        db = await _call(
+            "POST",
+            "/databases",
+            {
+                "parent": {"type": "page_id", "page_id": parent},
+                "title": [{"type": "text", "text": {"content": SCHEDULE_TITLE}}],
+                "properties": SCHEDULE_SCHEMA,
+            },
+        )
+        _schedule_db_id = db["id"]
+    return _schedule_db_id
+
+
+def _slot(p: dict) -> dict:
+    props = p["properties"]
+    return {
+        "page": p["id"],
+        "title": _plain((props.get("Событие") or {}).get("title") or []) or "Без названия",
+        "kind": ((props.get("Вид") or {}).get("select") or {}).get("name"),
+        "days": [o["name"] for o in (props.get("Дни") or {}).get("multi_select") or []],
+        "date": ((props.get("Дата") or {}).get("date") or {}).get("start"),
+        "start": _text_prop(p, "Начало"),
+        "end": _text_prop(p, "Конец"),
+    }
+
+
+async def schedule_slots(user_id: int) -> list[dict]:
+    """Все строки расписания человека: их немного, поэтому без фильтра по датам."""
+    slots, cursor = [], None
+    while True:
+        body = {"filter": {"property": "Автор ID", "number": {"equals": user_id}}, "page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        data = await _call("POST", f"/databases/{await schedule_db_id()}/query", body)
+        slots += [_slot(p) for p in data["results"]]
+        if not data.get("has_more"):
+            return slots
+        cursor = data["next_cursor"]
+
+
+async def add_slot(user_id: int, title: str, kind: str, start: str = "", end: str = "", days: list[str] | None = None, date: str | None = None) -> None:
+    props = {
+        "Событие": {"title": [{"text": {"content": title[:200]}}]},
+        "Вид": {"select": {"name": kind}},
+        "Начало": {"rich_text": [{"text": {"content": start}}] if start else []},
+        "Конец": {"rich_text": [{"text": {"content": end}}] if end else []},
+        "Автор ID": {"number": user_id},
+    }
+    if days:
+        props["Дни"] = {"multi_select": [{"name": d} for d in days]}
+    if date:
+        props["Дата"] = {"date": {"start": date}}
+    await _call("POST", "/pages", {"parent": {"database_id": await schedule_db_id()}, "properties": props})
+
+
+async def remove_slot(page_id: str) -> None:
+    await trash(page_id)
+
+
+async def dated_events(user_id: int, start: str, end: str) -> list[dict]:
+    """События из заметок (тип со словом «событ» и сроком) за период — они попадают в расписание сами."""
+    data = await _call(
+        "POST",
+        f"/databases/{await db_id()}/query",
+        {
+            "filter": {
+                "and": [
+                    {"property": c.P_WHEN, "date": {"on_or_after": start}},
+                    {"property": c.P_WHEN, "date": {"on_or_before": end}},
+                    _by_author(user_id),
+                ]
+            },
+            "page_size": 100,
+        },
+    )
+    items = [_item(p) for p in data["results"]]
+    return [i for i in items if "событ" in ((i.get("type") or i.get("ai_type") or "").lower())]

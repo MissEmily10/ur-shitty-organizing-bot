@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -395,3 +396,62 @@ async def parse_when(text: str, now: datetime) -> str | None:
         temperature=0,
     )
     return _when_from(response.choices[0].message.content or "", now)
+
+
+# ---------- 🗓 расписание словами ----------
+
+SCHEDULE_PROMPT = """Сейчас у пользователя {now}. Его текущее базовое расписание (регулярные блоки):
+{base}
+
+Пользователь пишет: «{text}»
+
+{task}
+
+Ответь строго одним JSON-объектом без пояснений:
+{{"replace_base": false,
+ "base_add": [{{"title": "Работа", "days": ["пн","ср","пт"], "start": "10:00", "end": "14:00"}}],
+ "base_remove": ["название регулярного блока"],
+ "add": [{{"title": "Стоматолог", "date": "ГГГГ-ММ-ДД", "start": "14:00", "end": "15:00"}}],
+ "cancel": [{{"title": "название регулярного блока", "date": "ГГГГ-ММ-ДД"}}]}}
+Пустые списки — если таких изменений нет. Время в формате ЧЧ:ММ; если конец не назван, оставь "end" пустым.
+Дни недели: пн, вт, ср, чт, пт, сб, вс. Даты считай от текущего момента («в эту среду», «завтра»)."""
+
+ROUTINE_TASK = """Это описание базового распорядка, который повторяется каждую неделю. Разложи его в base_add и поставь
+"replace_base": true. Остальные списки пустые."""
+CHANGE_TASK = """Это изменение расписания: разовое событие (add), отмена регулярного блока в конкретный день (cancel),
+или изменение базового распорядка (base_add / base_remove; чтобы поменять время блока — удали старый и добавь новый).
+"replace_base" — false."""
+
+
+def _json_object(raw: str) -> dict:
+    m = re.search(r"\{.*\}", raw or "", re.S)
+    try:
+        data = json.loads(m.group(0)) if m else {}
+    except json.JSONDecodeError:
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+async def parse_schedule(text: str, base: str, now: datetime, routine: bool) -> dict:
+    """Расписание или изменение словами → план изменений для schedule.apply."""
+    prompt = SCHEDULE_PROMPT.format(now=_now_text(now), base=base, text=text[:2000], task=ROUTINE_TASK if routine else CHANGE_TASK)
+    response = await _client().chat_completion(
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=1500, temperature=0
+    )
+    plan = _json_object(response.choices[0].message.content or "")
+    clean = {"replace_base": bool(plan.get("replace_base")) and routine}
+    for key in ("base_add", "base_remove", "add", "cancel"):
+        value = plan.get(key) or []
+        clean[key] = [v for v in value if isinstance(v, (dict, str))] if isinstance(value, list) else []
+    for item in clean["add"] + clean["cancel"]:
+        if isinstance(item, dict) and item.get("date"):
+            item["date"] = (_when_from(item["date"], now) or "")[:10]
+    clean["add"] = [a for a in clean["add"] if isinstance(a, dict) and a.get("date")]
+    clean["cancel"] = [a for a in clean["cancel"] if isinstance(a, dict) and a.get("date")]
+    for item in clean["base_add"] + clean["add"]:
+        if isinstance(item, dict):
+            for key in ("start", "end"):
+                value = str(item.get(key) or "")
+                m = re.fullmatch(r"\s*(\d{1,2})(?::(\d{2}))?\s*", value)
+                item[key] = f"{int(m.group(1)):02d}:{m.group(2) or '00'}" if m and int(m.group(1)) < 24 else ""
+    return clean

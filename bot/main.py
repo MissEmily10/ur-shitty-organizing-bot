@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import re
@@ -22,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, documents, notion, scheduler, whenparse
+from . import ai, documents, notion, pdf, schedule, scheduler, whenparse
 from . import config as c
 from .markdown import tg_html, to_blocks
 
@@ -78,6 +79,7 @@ MENU = (
     "/addproject — добавить проект (бот спросит название)\n"
     "/types, /addtype — типы записей\n"
     "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
+    "/schedule — расписание и календарь в PDF\n"
     "/settings — часовой пояс, время разбора и дневных чек-инов\n"
     "{owner_commands}"
     "/start — это меню\n\n"
@@ -92,7 +94,8 @@ def menu(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     rows = [
         [Btn("🗂 Разобрать входящие", callback_data="m:razbor")],
         [Btn("📁 Проекты", callback_data="m:projects"), Btn("➕ Добавить проект", callback_data="m:add")],
-        [Btn("🔎 Спросить по заметкам", callback_data="m:ask"), Btn("⚙️ Настройки", callback_data="m:settings")],
+        [Btn("🔎 Спросить по заметкам", callback_data="m:ask"), Btn("🗓 Расписание", callback_data="m:schedule")],
+        [Btn("⚙️ Настройки", callback_data="m:settings")],
     ]
     if is_owner(uid):
         rows.append([Btn("👥 Участники", callback_data="m:members"), Btn("🎟 Пригласить", callback_data="m:invite")])
@@ -440,6 +443,9 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         elif action == "settings":
             text, kb = await _settings_view(uid)
             await q.message.reply_text(text, reply_markup=kb)
+        elif action == "schedule":
+            text, kb = await _schedule_view(uid)
+            await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.exception("menu failed")
         await q.message.reply_text(f"❌ Ошибка: {e}"[:4000])
@@ -599,6 +605,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == ADD_PROMPT:
         await update.message.reply_text(await _add_projects_text(update.message.text))
+        return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text in (ROUTINE_PROMPT, CHANGE_PROMPT):
+        await _schedule_reply(update.message, routine=reply.text == ROUTINE_PROMPT)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == TYPE_PROMPT:
         await update.message.reply_text(await _add_types_text(update.message.text))
@@ -1609,6 +1618,163 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await q.edit_message_text(text, reply_markup=kb)
 
 
+# ---------- 🗓 расписание ----------
+# callback_data: sc:week:<0|1> (эта/следующая неделя текстом) | sc:pdfw:<0|1> | sc:pdfm:<0|1> (этот/следующий месяц)
+#                sc:base (задать базовое) | sc:edit (изменить словами) | sc:rev → sc:rev:<week|2weeks|month|off>
+#                sc:keep (пересмотр: всё как есть) | sca (применить понятое) | scx (отмена)
+
+ROUTINE_PROMPT = (
+    "🗓 Опишите свой обычный распорядок на неделю ответом на это сообщение, своими словами. Например:\n"
+    "«пн, ср, пт 10–14 работа в студии; вт и чт 19:00–20:30 зал; каждый день 23:00 сон»"
+)
+CHANGE_PROMPT = (
+    "✏️ Что изменить или добавить? Ответьте на это сообщение своими словами. Например:\n"
+    "«в эту среду зала не будет», «стоматолог 15.10 в 14:00 на час», «работа теперь с 11 до 15»"
+)
+REVIEW_OPTIONS = {"week": "раз в неделю", "2weeks": "раз в две недели", "month": "раз в месяц", "off": "не напоминать"}
+# Понятые ИИ планы изменений по id сообщения с предпросмотром
+_schedule_plans: dict[int, tuple[dict, str]] = {}
+
+
+def _monday(day, weeks: int = 0):
+    return day - timedelta(days=day.weekday()) + timedelta(weeks=weeks)
+
+
+async def _schedule_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    st = await scheduler.get_settings(uid)
+    base = schedule.base_text(await notion.schedule_slots(uid))
+    review = REVIEW_OPTIONS.get(st.get("schedule_review", "week"), "раз в неделю")
+    return (
+        f"🗓 Расписание\n\n<b>Базовое (каждую неделю):</b>\n{escape(base)}\n\nПересмотр: {review}",
+        InlineKeyboardMarkup(
+            [
+                [Btn("📅 Эта неделя", callback_data="sc:week:0"), Btn("📅 Следующая", callback_data="sc:week:1")],
+                [Btn("📄 PDF недели", callback_data="sc:pdfw:0"), Btn("📄 PDF месяца", callback_data="sc:pdfm:0")],
+                [Btn("✍️ Задать базовое", callback_data="sc:base"), Btn("✏️ Изменить / добавить", callback_data="sc:edit")],
+                [Btn("🔁 Как часто пересматривать", callback_data="sc:rev")],
+            ]
+        ),
+    )
+
+
+async def schedule_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = await _schedule_view(update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+def _plan_text(plan: dict) -> str:
+    lines = []
+    if plan.get("replace_base"):
+        lines.append("Новое базовое расписание (старое заменится):")
+    for b in plan.get("base_add", []):
+        time_ = f"{b.get('start', '')}–{b['end']}" if b.get("end") else b.get("start", "") or "весь день"
+        lines.append(f"🔁 {', '.join(b.get('days', []))} {time_} — {b.get('title')}")
+    for name in plan.get("base_remove", []):
+        lines.append(f"🗑 убрать из базового: {name}")
+    for e in plan.get("add", []):
+        time_ = f"{e.get('start', '')}–{e['end']}" if e.get("end") else e.get("start", "")
+        lines.append(f"📌 {e['date']} {time_} — {e.get('title')}".replace("  ", " "))
+    for x in plan.get("cancel", []):
+        lines.append(f"🚫 {x['date']}: без «{x.get('title')}»")
+    return "\n".join(lines)
+
+
+async def _schedule_reply(message: Message, routine: bool) -> None:
+    uid = message.chat_id
+    if not await ai_allowed(message):
+        return
+    status = await message.reply_text("🗓 Разбираю…")
+    try:
+        now = scheduler.local_now(await scheduler.get_settings(uid))
+        base = schedule.base_text(await notion.schedule_slots(uid))
+        plan = await ai.parse_schedule(message.text, base, now, routine)
+    except Exception as e:
+        log.exception("schedule parse failed")
+        await status.edit_text(f"❌ Не получилось разобрать: {e}"[:4000])
+        return
+    text = _plan_text(plan)
+    if not text:
+        await status.edit_text("🤷 Не понял, что поменять. Попробуйте сформулировать иначе.")
+        return
+    sent = await status.edit_text(
+        f"Вот что я понял:\n\n{text}\n\nПрименить?",
+        reply_markup=InlineKeyboardMarkup([[Btn("✅ Применить", callback_data="sca"), Btn("✖️ Отмена", callback_data="scx")]]),
+    )
+    _schedule_plans[getattr(sent, "message_id", status.message_id)] = (plan, text)
+
+
+async def _send_schedule_pdf(message: Message, uid: int, kind: str, offset: int) -> None:
+    today = scheduler.local_now(await scheduler.get_settings(uid)).date()
+    if kind == "pdfw":
+        start = _monday(today, offset)
+        items = await schedule.occurrences(uid, start, start + timedelta(days=6))
+        data, name = pdf.week_pdf(items, start, today), f"неделя-{start.strftime('%d.%m')}.pdf"
+    else:
+        first = (today.replace(day=1) + timedelta(days=32 * offset)).replace(day=1)
+        last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        items = await schedule.occurrences(uid, first, last)
+        data, name = pdf.month_pdf(items, first.year, first.month, today), f"месяц-{first.strftime('%m.%Y')}.pdf"
+    await message.reply_document(io.BytesIO(data), filename=name, caption="🗓 Для печати на A4")
+
+
+async def on_schedule_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    parts = q.data.split(":")
+    try:
+        if parts[0] == "scx":
+            _schedule_plans.pop(q.message.message_id, None)
+            await q.answer()
+            await q.edit_message_reply_markup(None)
+            return
+        if parts[0] == "sca":
+            stored = _schedule_plans.pop(q.message.message_id, None)
+            if not stored:
+                await q.answer("Устарело — опишите изменение ещё раз", show_alert=True)
+                return
+            await q.answer("Применяю…")
+            done = await schedule.apply(uid, stored[0])
+            await q.edit_message_text("✅ Расписание обновлено:\n\n" + (stored[1] if done else "ничего не поменялось"))
+            return
+        action = parts[1]
+        if action == "week":
+            await q.answer()
+            today = scheduler.local_now(await scheduler.get_settings(uid)).date()
+            start = _monday(today, int(parts[2]))
+            items = await schedule.occurrences(uid, start, start + timedelta(days=6))
+            await q.message.reply_text(
+                f"🗓 Неделя {start.strftime('%d.%m')}–{(start + timedelta(days=6)).strftime('%d.%m')}\n\n"
+                + schedule.week_text(items, start),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[Btn("📄 В PDF", callback_data=f"sc:pdfw:{parts[2]}")]]),
+            )
+        elif action in ("pdfw", "pdfm"):
+            await q.answer("Собираю PDF…")
+            await _send_schedule_pdf(q.message, uid, action, int(parts[2]))
+        elif action in ("base", "edit"):
+            await q.answer()
+            prompt = ROUTINE_PROMPT if action == "base" else CHANGE_PROMPT
+            await q.message.reply_text(prompt, reply_markup=ForceReply(input_field_placeholder="своими словами"))
+        elif action == "keep":
+            await q.answer("Оставляем как есть ✓")
+            await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("✅ Оставили как есть", callback_data="noop")]]))
+        elif action == "rev" and len(parts) == 2:
+            await q.answer()
+            rows = [[Btn(label, callback_data=f"sc:rev:{key}")] for key, label in REVIEW_OPTIONS.items()]
+            await q.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+        elif action == "rev":
+            await scheduler.update_settings(uid, schedule_review=parts[2])
+            await q.answer(f"Пересмотр: {REVIEW_OPTIONS[parts[2]]} ✓")
+            text, kb = await _schedule_view(uid)
+            await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.exception("schedule button failed")
+        await _fail(q, e)
+
+
 # ---------- 🏷 типы (общие, как проекты: добавлять могут все, удалять — только владелица) ----------
 # callback_data: ta:<номер> (спросить про удаление)  |  tk:<номер> (удалить)  |  tl (список)
 
@@ -1838,6 +2004,7 @@ COMMANDS = [
     ("addproject", "Добавить проект"),
     ("ask", "Спросить ИИ по заметкам"),
     ("settings", "Часовой пояс и время разбора"),
+    ("schedule", "Расписание и PDF"),
     ("types", "Типы записей"),
     ("addtype", "Добавить тип"),
 ]
@@ -1993,6 +2160,8 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_when_button, pattern=r"^w[vcx]?:"))
     app.add_handler(CallbackQueryHandler(on_deadline_button, pattern=r"^(dl:|ov$)"))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))
+    app.add_handler(CommandHandler("schedule", schedule_cmd, filters=member))
+    app.add_handler(CallbackQueryHandler(on_schedule_button, pattern=r"^(sc:|sca$|scx$)"))
     app.add_handler(CallbackQueryHandler(on_quick_button, pattern=r"^k[qan]"))
     app.add_handler(CallbackQueryHandler(on_batch_button, pattern=r"^b(t|a|p|pp|y|yy|d|dd|r|x|b)(:|$)"))
     app.add_handler(CallbackQueryHandler(on_settings_button, pattern=r"^st:"))

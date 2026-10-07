@@ -41,6 +41,8 @@ async def _fake_post(self, endpoint, data=None, *args, **kwargs):
         if "message_id" in data:
             msg["message_id"] = data["message_id"]
         return msg
+    if endpoint == "sendDocument":
+        return _message_for({**data, "text": ""})
     if endpoint == "editMessageReplyMarkup":
         return _message("", message_id=data.get("message_id", next(_ids)))
     return True
