@@ -31,6 +31,8 @@ PORT = int(env("PORT", "8080"))
 MEMBER_DAILY_LIMIT = int(env("MEMBER_DAILY_LIMIT", "30"))  # заметок в день
 MEMBER_AI_LIMIT = int(env("MEMBER_AI_LIMIT", "20"))  # запросов к ИИ в день: 🤖, ✨ раскрытие, /ask
 INVITE_DAYS = int(env("INVITE_DAYS", "7"))  # сколько дней действует код приглашения
+# Командные проекты пока создаёт только владелица; «1» — разрешить всем участникам
+TEAM_PROJECTS_BY_MEMBERS = env("TEAM_PROJECTS_BY_MEMBERS", "") == "1"
 
 
 

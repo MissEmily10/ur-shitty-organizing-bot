@@ -31,9 +31,10 @@ async def trash(pid):
     notes.pop(pid, None)
 
 
-async def file_to_project(pid, name):
+async def file_to_project(pid, name, skip_review=False):
     log.append(("project", pid, name))
     notes[pid]["project"] = name
+    return {"id": "p", "name": name, "kind": notion.KIND_SHARED}
 
 
 async def set_type(pid, name):

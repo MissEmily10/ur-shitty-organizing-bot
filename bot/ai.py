@@ -383,6 +383,17 @@ async def ask_notes(question: str, notes: list[str], scope: str, history: str = 
     return answer or "🤷 Модель вернула пустой ответ.", truncated
 
 
+SUMMARY_QUESTION = """Сделай сводку командного проекта{about} по этим заметкам участников (у каждой в скобках автор).
+Структура: 1) что нового и главное — 3–6 пунктов; 2) решения и договорённости; 3) открытые вопросы и что обсудить;
+4) кто что делает — по авторам. Коротко, без воды, только то, что есть в заметках."""
+
+
+async def project_summary(notes: list[str], project: str, about: str = "") -> tuple[str, bool]:
+    """Сводка командного проекта: тот же разбор по частям, что и вопрос по заметкам."""
+    question = SUMMARY_QUESTION.format(about=f" ({about})" if about else "")
+    return await ask_notes(question, notes, f"проект «{project}»")
+
+
 WHEN_PROMPT = """Сейчас у пользователя {now}. Он написал срок: «{text}».
 Переведи в дату. Ответь одной строкой: ГГГГ-ММ-ДД ЧЧ:ММ, или ГГГГ-ММ-ДД, если время не названо, или слово нет, если это не срок."""
 

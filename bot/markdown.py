@@ -73,3 +73,20 @@ def tg_html(md: str) -> str:
             text = "• " + m.group(1)
         out.append(text)
     return "\n".join(out).strip()
+
+
+def chunks(html_text: str, limit: int = 3800) -> list[str]:
+    """Режет HTML на сообщения по строкам, не разрывая блоки <pre>."""
+    parts = re.split(r"(<pre>.*?</pre>)", html_text, flags=re.S)
+    pieces = []
+    for part in parts:
+        pieces += [part] if part.startswith("<pre>") else part.split("\n")
+    out, current = [], ""
+    for piece in pieces:
+        candidate = f"{current}\n{piece}" if current else piece
+        if len(candidate) > limit and current:
+            out.append(current)
+            current = piece
+        else:
+            current = candidate
+    return [c for c in out + [current] if c.strip()]

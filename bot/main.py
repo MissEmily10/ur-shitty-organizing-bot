@@ -23,9 +23,9 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, documents, notion, pdf, schedule, scheduler, weekly, whenparse
+from . import ai, documents, notion, pdf, schedule, scheduler, team, weekly, whenparse
 from . import config as c
-from .markdown import tg_html, to_blocks
+from .markdown import chunks as _chunks, tg_html, to_blocks
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -77,6 +77,7 @@ MENU = (
     "/razbor — разобрать свои входящие\n"
     "/projects — проекты: карточки, описание, закрыть\n"
     "/addproject — добавить проект (бот спросит название)\n"
+    "/feed — лента заметок проекта; в командном — от всех участников\n"
     "/types, /addtype — типы записей\n"
     "/areas, /addarea — сферы деятельности (фотограф, дизайнер…)\n"
     "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
@@ -89,6 +90,7 @@ MENU = (
 )
 OWNER_COMMANDS = (
     "/invite — пригласить участника\n/members — участники и приглашения\n"
+    "/teamproject — командный проект: заметки вместе с участниками\n"
 )
 
 
@@ -291,6 +293,7 @@ def _tz_label(tz: str) -> str:
 
 async def _settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     st = await scheduler.get_settings(uid)
+    pinned = await _pinned_project(uid)
     now = scheduler.local_now(st).strftime("%H:%M")
     checkins = ", ".join(st.get("checkins") or []) or "выключены"
     text = (
@@ -298,12 +301,15 @@ async def _settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"🌍 Часовой пояс: {_tz_label(st['tz'])}, у вас сейчас {now}\n"
         f"🌙 Вечерний разбор: {st['evening']}\n"
         f"☀️ Дневные чек-ины: {checkins}\n"
-        f"😊 Вопрос о настроении: {'вместе с вечерним разбором' if st.get('mood', True) else 'выключен'}"
+        f"😊 Вопрос о настроении: {'вместе с вечерним разбором' if st.get('mood', True) else 'выключен'}\n"
+        f"📌 Новые заметки: {'сразу в «' + pinned['name'] + '», без разбора' if pinned else 'во входящие, разбор вечером'}\n"
+        f"👥 Новости командных проектов: {'присылать' if st.get('team_notify', True) else 'не присылать'}"
     )
     return text, InlineKeyboardMarkup(
         [
             [Btn("🌍 Часовой пояс", callback_data="st:tz"), Btn("🌙 Время разбора", callback_data="st:ev")],
             [Btn("☀️ Чек-ины", callback_data="st:ci"), Btn("😊 Настроение: вкл/выкл", callback_data="st:mood")],
+            [Btn("📌 Куда писать", callback_data="st:ap"), Btn("👥 Новости команды: вкл/выкл", callback_data="st:tn")],
         ]
     )
 
@@ -362,6 +368,31 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
             return
         elif parts[1] == "ci":
             await scheduler.update_settings(uid, checkins=CHECKIN_PRESETS[parts[2]])
+            await q.answer("Сохранено ✓")
+        elif parts[1] == "ap" and len(parts) == 2:
+            projects = await notion.projects(uid)
+            buttons = [Btn(f"📌 {p}", callback_data=f"st:ap:{i}") for i, p in enumerate(projects)]
+            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+            rows.append([Btn("📥 Во входящие", callback_data="st:ap:off"), Btn("↩️ Назад", callback_data="st:back")])
+            await q.answer()
+            await q.edit_message_text(
+                "📌 Куда класть новые заметки? Если выбрать проект, они сразу попадают в него и не ждут вечернего разбора.",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+        elif parts[1] == "ap":
+            if parts[2] == "off":
+                await scheduler.update_settings(uid, active_project=None)
+            else:
+                projects = await notion.project_list(uid)
+                if int(parts[2]) >= len(projects):
+                    await q.answer("Список проектов изменился, попробуйте ещё раз")
+                    return
+                await scheduler.update_settings(uid, active_project=projects[int(parts[2])]["id"])
+            await q.answer("Сохранено ✓")
+        elif parts[1] == "tn":
+            st = await scheduler.get_settings(uid)
+            await scheduler.update_settings(uid, team_notify=not st.get("team_notify", True))
             await q.answer("Сохранено ✓")
         elif parts[1] == "mood":
             st = await scheduler.get_settings(uid)
@@ -536,12 +567,22 @@ async def _save(
         log.exception("save failed")
         await status.edit_text(f"❌ Не получилось сохранить: {e}"[:4000])
         return
+    pinned = await _pinned_project(user.id)
+    if pinned:
+        # Режим «📌 Писать в»: заметка сразу в проекте и без разбора
+        try:
+            await _file(update.get_bot(), user.id, page_id, pinned["name"], skip_review=True)
+        except Exception as e:
+            log.exception("pinned project failed")
+            note += f"\n\n⚠️ Не получилось положить в «{escape(pinned['name'])}»: {escape(str(e)[:300])}"
+            pinned = None
     when_line = f"\n⏰ Напомню: {escape(await _when_label(user.id, idea.when))}" if idea.when else ""
+    pin_line = f"\n📌 Сразу в «{escape(pinned['name'])}», без разбора (выключить: /settings)" if pinned else ""
     await status.edit_text(
-        f'✅ <b>{escape(idea.title)}</b>\n📄 <a href="{url}">Заметка — тут</a>{when_line}{note}',
+        f'✅ <b>{escape(idea.title)}</b>\n📄 <a href="{url}">Заметка — тут</a>{pin_line}{when_line}{note}',
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
-        reply_markup=_panel(page_id, when=idea.when),
+        reply_markup=_panel(page_id, pinned["name"] if pinned else None, when=idea.when),
     )
 
 
@@ -588,7 +629,7 @@ async def on_panel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             if idx >= len(projects):
                 await q.answer("Список проектов изменился, попробуйте ещё раз")
                 return
-            await notion.file_to_project(page_id, projects[idx])
+            await _file(q.get_bot(), q.from_user.id, page_id, projects[idx])
             await q.answer(f"→ {projects[idx]}")
             item = await notion.page_info(page_id)
             await q.edit_message_reply_markup(_panel(page_id, projects[idx], item["when"]))
@@ -615,6 +656,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(PROJECT_DESC_MARK):
         await _project_desc_reply(update.message, reply.text)
+        return
+    if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == TEAM_PROMPT:
+        if can_create_team(update.effective_user.id):
+            await _create_team(update.message, update.message.text)
         return
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and reply.text == AREA_PROMPT:
         await update.message.reply_text(await _area_reply(update.message, update.message.text))
@@ -858,23 +903,6 @@ def _ai_page(message: Message) -> str | None:
             if m := re.search(r"([0-9a-f]{32})(?:\?|$)", entity.url.replace("-", "")):
                 return m.group(1)
     return None
-
-
-def _chunks(html_text: str, limit: int = 3800) -> list[str]:
-    """Режет HTML на сообщения по строкам, не разрывая блоки <pre>."""
-    parts = re.split(r"(<pre>.*?</pre>)", html_text, flags=re.S)
-    pieces = []
-    for part in parts:
-        pieces += [part] if part.startswith("<pre>") else part.split("\n")
-    chunks, current = [], ""
-    for piece in pieces:
-        candidate = f"{current}\n{piece}" if current else piece
-        if len(candidate) > limit and current:
-            chunks.append(current)
-            current = piece
-        else:
-            current = candidate
-    return [c for c in chunks + [current] if c.strip()]
 
 
 async def start_ai(message: Message, page_id: str) -> None:
@@ -1612,7 +1640,7 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             if action == "bpp":
                 name = (await notion.projects(uid))[int(arg)]
                 for page_id in picked:
-                    await notion.file_to_project(page_id, name)
+                    await _file(q.get_bot(), uid, page_id, name)
                 await q.answer(f"→ {name}: {len(picked)}")
             elif action == "byy":
                 name = (await notion.types())[int(arg)]
@@ -1984,10 +2012,17 @@ async def _project_card(uid: int, project: dict) -> tuple[str, InlineKeyboardMar
     areas = {a["id"]: a for a in await notion.spheres()}
     area = areas.get(project["sphere_id"] or "")
     count = await notion.project_note_count(project["id"])
+    team_line = ""
+    if project["kind"] == notion.KIND_TEAM:
+        names = {m["tg"]: m["name"] for m in await notion.members()}
+        names.setdefault(c.OWNER_ID, "владелица")
+        people = [names.get(t, str(t)) for t in notion.team_people(project)]
+        team_line = "👥 В проекте: " + escape(", ".join(people)) + "\n"
+    pinned = (await scheduler.get_settings(uid)).get("active_project") == project["id"]
     text = (
         f"📁 <b>{escape(project['name'])}</b>\n"
         f"{project['status']} · {project['kind']} · сфера: {escape(area['name']) if area else '—'}\n"
-        f"Заметок: {count}\n\n"
+        f"Заметок: {count}\n{team_line}" + ("📌 Новые заметки сразу идут сюда\n" if pinned else "") + "\n"
         + (escape(project["description"]) if project["description"] else "<i>Описания пока нет. ИИ учитывает его при раскрытии заметок.</i>")
     )
     pid = project["id"]
@@ -2003,7 +2038,15 @@ async def _project_card(uid: int, project: dict) -> tuple[str, InlineKeyboardMar
             to_shared = project["kind"] == notion.KIND_PERSONAL
             row.append(Btn("🌐 Сделать общим" if to_shared else "👤 Сделать личным", callback_data=f"pr:{pid}:kind"))
         rows.append(row)
-    rows.append([Btn("🔎 Спросить по проекту", callback_data=f"pr:{pid}:ask")])
+        if project["kind"] == notion.KIND_TEAM:
+            rows.append([Btn("👥 Участники", callback_data=f"tm:{pid}")])
+        elif can_create_team(uid):
+            rows.append([Btn("👥 Сделать командным", callback_data=f"pr:{pid}:team")])
+    if project["status"] != notion.STATUS_CLOSED:
+        rows.append([Btn("📌 Пишу сюда ✓ — выключить" if pinned else "📌 Писать сюда", callback_data=f"pr:{pid}:pin")])
+    rows.append([Btn("📰 Лента", callback_data=f"fd:{pid}"), Btn("🔎 Спросить по проекту", callback_data=f"pr:{pid}:ask")])
+    if project["kind"] == notion.KIND_TEAM:
+        rows.append([Btn("🤖 Сводка сейчас", callback_data=f"fs:{pid}")])
     if is_owner(uid) or (project["creator"] == uid and project["kind"] == notion.KIND_PERSONAL):
         rows.append([Btn("🗑 Удалить проект", callback_data=f"pr:{pid}:del")])
     rows.append([Btn("↩️ Все проекты", callback_data="pl")])
@@ -2068,7 +2111,7 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
                 raise PermissionError("Этот проект недоступен.")
             action = parts[2] if len(parts) > 2 else "show"
             manage = _can_manage(uid, project)
-            if action in ("close", "open", "desc", "sph") and not manage:
+            if action in ("close", "open", "desc", "sph", "team") and not manage:
                 raise PermissionError("Менять проект может только его автор или владелица.")
             if action == "close":
                 await notion.update_project(project["id"], status=notion.STATUS_CLOSED)
@@ -2080,6 +2123,20 @@ async def on_project_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
                 new = notion.KIND_SHARED if project["kind"] == notion.KIND_PERSONAL else notion.KIND_PERSONAL
                 await notion.update_project(project["id"], kind=new)
                 await q.answer(new)
+            elif action == "pin":
+                pinned = (await scheduler.get_settings(uid)).get("active_project") == project["id"]
+                if not pinned and project["status"] == notion.STATUS_CLOSED:
+                    raise PermissionError("Проект закрыт: сначала откройте его.")
+                await scheduler.update_settings(uid, active_project=None if pinned else project["id"])
+                await q.answer("📌 Выключено: заметки снова во входящие" if pinned else f"📌 Новые заметки сразу в «{project['name']}»", show_alert=not pinned)
+            elif action == "team":
+                if not can_create_team(uid):
+                    raise PermissionError("Командные проекты пока создаёт только владелица.")
+                await notion.update_project(project["id"], kind=notion.KIND_TEAM)
+                await q.answer("Теперь проект командный")
+                text, kb = await _team_members_view(await notion.get_project(project["id"]))
+                await q.edit_message_text(text, reply_markup=kb)
+                return
             elif action == "desc":
                 await q.answer()
                 await q.message.reply_text(
@@ -2175,6 +2232,233 @@ async def areas_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Сферы деятельности:\n\n" + "\n".join(lines) + "\n\nОбновить описание: /addarea Название — новое описание", parse_mode=ParseMode.HTML)
 
 
+# ---------- 👥 командные проекты ----------
+# Проект, в который несколько участников вместе вносят заметки. Создаёт владелица (или все, если TEAM_PROJECTS_BY_MEMBERS=1).
+# Участники видят заметки друг друга в ленте и сводке, удалять могут только свои.
+# callback_data: tm:<проект> (выбор участников) | tm:<проект>:<tg> (добавить/убрать) | fd:<проект> (лента)
+#                fv:<page_id> (заметка из ленты целиком) | fs:<проект> (ИИ-сводка сейчас)
+
+TEAM_PROMPT = "👥 Как назовём командный проект? Напишите название ответом на это сообщение."
+FEED_SIZE = 15
+
+
+def can_create_team(uid: int) -> bool:
+    return is_owner(uid) or c.TEAM_PROJECTS_BY_MEMBERS
+
+
+async def _pinned_project(uid: int) -> dict | None:
+    """Проект режима «📌 Писать в», если он ещё открыт и человеку виден."""
+    pid = (await scheduler.get_settings(uid)).get("active_project")
+    if not pid:
+        return None
+    project = await notion.get_project(pid)
+    if not project or not notion.can_see(project, uid) or project["status"] == notion.STATUS_CLOSED:
+        return None
+    return project
+
+
+async def notify_team(bot, project: dict, page_id: str, author_id: int) -> None:
+    """Остальным участникам командного проекта — короткое сообщение о новой заметке (если не выключили)."""
+    item = await notion.page_info(page_id)
+    who = item.get("author") or "Участник"
+    text = (
+        f"👥 «{escape(project['name'])}»: новая заметка\n"
+        f'✍️ {escape(who)}: <a href="{item["url"]}">{escape(item["title"])}</a>'
+    )
+    kb = InlineKeyboardMarkup([[Btn("👁 Открыть", callback_data=f"fv:{page_id}"), Btn("📰 Лента", callback_data=f"fd:{project['id']}")]])
+    for uid in notion.team_people(project):
+        if uid == author_id or not is_member(uid):
+            continue
+        try:
+            if not (await scheduler.get_settings(uid)).get("team_notify", True):
+                continue
+            await bot.send_message(uid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb)
+        except Exception:
+            log.exception("team notify %s failed", uid)
+
+
+async def _file(bot, uid: int, page_id: str, name: str, skip_review: bool = False) -> dict:
+    """Кладёт заметку в проект; в командном проекте сообщает остальным участникам."""
+    project = await notion.file_to_project(page_id, name, skip_review)
+    if project["kind"] == notion.KIND_TEAM:
+        try:
+            await notify_team(bot, project, page_id, uid)
+        except Exception:
+            log.exception("team notify failed")
+    return project
+
+
+async def can_read(uid: int, page_id: str) -> dict:
+    """Читать заметку можно свою, а в командном проекте — заметки всех его участников. Владелица — любые."""
+    item = await notion.page_info(page_id)
+    if is_owner(uid) or item.get("author_id") == uid:
+        return item
+    project = await notion.get_project(item["project_id"]) if item.get("project_id") else None
+    if project and notion.is_team_member(project, uid):
+        return item
+    raise PermissionError("Эта заметка вам недоступна.")
+
+
+async def _team_members_view(project: dict) -> tuple[str, InlineKeyboardMarkup]:
+    people = [m for m in await notion.members() if m["tg"] != project["creator"]]
+    pid = project["id"]
+    if people:
+        text = f"👥 Кто в проекте «{project['name']}»? Нажмите на человека, чтобы добавить или убрать."
+    else:
+        text = "Участников бота пока нет. Пригласите их: /invite — и потом добавьте в проект здесь."
+    rows = [
+        [Btn(("✅ " if m["tg"] in project["members"] else "▫️ ") + m["name"], callback_data=f"tm:{pid}:{m['tg']}")]
+        for m in people
+    ]
+    rows.append([Btn("✔️ Готово", callback_data=f"pr:{pid}")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _create_team(message: Message, raw: str) -> None:
+    uid = message.chat_id
+    name = raw.strip().splitlines()[0][:100] if raw.strip() else ""
+    if not name:
+        await message.reply_text("Напишите название, например: /teamproject Сайт студии")
+        return
+    if await notion.get_project(name):
+        await message.reply_text(f"Проект «{name}» уже есть. Сделать его командным: /projects → проект → «👥 Командный».")
+        return
+    project = await notion.create_project(name, notion.KIND_TEAM, uid, [])
+    text, kb = await _team_members_view(project)
+    await message.reply_text(f"✅ Командный проект «{name}» создан.\n\n" + text, reply_markup=kb)
+
+
+async def teamproject_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not can_create_team(update.effective_user.id):
+        await update.message.reply_text("Командные проекты пока создаёт только владелица бота.")
+        return
+    raw = re.sub(r"^/teamproject(@\w+)?", "", update.message.text, count=1)
+    if not raw.strip():
+        await update.message.reply_text(TEAM_PROMPT, reply_markup=ForceReply(input_field_placeholder="Сайт студии"))
+        return
+    await _create_team(update.message, raw)
+
+
+async def _feed_view(uid: int, project: dict) -> tuple[str, InlineKeyboardMarkup]:
+    items = await notion.notes_in_scope(uid, project=project["name"], limit=FEED_SIZE)
+    pid = project["id"]
+    if not items:
+        text = f"📰 «{escape(project['name'])}»: заметок пока нет."
+    else:
+        lines = [
+            f'{i}. <a href="{it["url"]}">{escape(it["title"])}</a> — {escape(it.get("author") or "—")}, {it["created"][8:10]}.{it["created"][5:7]}'
+            for i, it in enumerate(items, 1)
+        ]
+        text = f"📰 <b>«{escape(project['name'])}»</b> — последние заметки:\n\n" + "\n".join(lines) + "\n\n👁 Номер — открыть заметку здесь."
+    buttons = [Btn(str(i), callback_data=f"fv:{it['id']}") for i, it in enumerate(items[:10], 1)]
+    rows = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+    if project["kind"] == notion.KIND_TEAM:
+        rows.append([Btn("🤖 Сводка сейчас", callback_data=f"fs:{pid}")])
+    rows.append([Btn("↩️ Карточка проекта", callback_data=f"pr:{pid}")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def feed_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    raw = re.sub(r"^/feed(@\w+)?", "", update.message.text, count=1).strip()
+    if raw:
+        project = await notion.get_project(raw)
+        if not project or not notion.can_see(project, uid):
+            await update.message.reply_text(f"Проекта «{raw}» нет. Список: /projects")
+            return
+        text, kb = await _feed_view(uid, project)
+        await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    projects = await notion.project_list(uid)
+    projects.sort(key=lambda p: p["kind"] != notion.KIND_TEAM)  # командные первыми
+    if not projects:
+        await update.message.reply_text("Проектов пока нет: /addproject")
+        return
+    rows = [[Btn(("👥 " if p["kind"] == notion.KIND_TEAM else "📁 ") + p["name"], callback_data=f"fd:{p['id']}")] for p in projects]
+    await update.message.reply_text("📰 Ленту какого проекта показать?", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _send_summary(message: Message, uid: int, project: dict) -> None:
+    if not await ai_allowed(message):
+        return
+    status = await message.reply_text(f"📚 Читаю заметки «{project['name']}»…")
+    try:
+        text, count, truncated = await team.summary(project, uid)
+    except Exception as e:
+        log.exception("summary failed")
+        await status.edit_text(f"❌ ИИ не ответил: {e}"[:4000])
+        return
+    if not text:
+        await status.edit_text("🤷 В проекте пока нет заметок.")
+        return
+    parts = team.summary_messages(project, text, count, "Сводка")
+    if truncated:
+        parts[-1] += "\n\n⚠️ Заметок очень много, ИИ прочитал не все."
+    for i, part in enumerate(parts):
+        if i == 0:
+            await status.edit_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        else:
+            await message.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def on_team_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    action, key, *rest = q.data.split(":")
+    try:
+        if action == "fv":
+            await can_read(uid, key)
+            await q.answer()
+            await show_note(q.message, key)
+            return
+        project = await notion.get_project(key)
+        if not project or not notion.can_see(project, uid):
+            raise PermissionError("Этот проект недоступен.")
+        if action == "fd":
+            await q.answer()
+            text, kb = await _feed_view(uid, project)
+            await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        if action == "fs":
+            await q.answer()
+            await _send_summary(q.message, uid, project)
+            return
+        # tm — участники проекта
+        if not _can_manage(uid, project) or project["kind"] != notion.KIND_TEAM:
+            raise PermissionError("Состав проекта меняет его автор или владелица.")
+        if rest:
+            tg = int(rest[0])
+            if tg not in {m["tg"] for m in await notion.members()}:
+                raise PermissionError("Такого участника нет.")
+            members = [m for m in project["members"] if m != tg] if tg in project["members"] else project["members"] + [tg]
+            await notion.update_project(project["id"], members=members)
+            added = tg in members
+            await q.answer("Добавлен(а) ✓" if added else "Убран(а) из проекта")
+            if added:
+                try:
+                    await q.get_bot().send_message(
+                        tg,
+                        f"👥 Вас добавили в командный проект «{project['name']}».\n"
+                        "Заметки туда: кнопка «📁 В проект» под заметкой, или «📌 Писать сюда» в карточке проекта — "
+                        "тогда все новые заметки сразу попадают в него.",
+                        reply_markup=InlineKeyboardMarkup([[Btn("📁 Открыть проект", callback_data=f"pr:{project['id']}")]]),
+                    )
+                except Exception:
+                    log.exception("could not tell %s about team", tg)
+            project = await notion.get_project(project["id"])
+        else:
+            await q.answer()
+        text, kb = await _team_members_view(project)
+    except Exception as e:
+        log.exception("team button failed")
+        await _fail(q, e)
+        return
+    await q.edit_message_text(text, reply_markup=kb)
+
+
 async def razbor(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     text, kb = await _review_view(update.effective_user.id, 0)
     await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -2232,7 +2516,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             if idx >= len(projects):
                 await q.answer("Список проектов изменился, попробуйте ещё раз")
             else:
-                await notion.file_to_project(page_id, projects[idx])
+                await _file(q.get_bot(), q.from_user.id, page_id, projects[idx])
                 await q.answer(f"→ {projects[idx]}")
         elif action == "d":
             page_id, k = args[0], int(args[1])
@@ -2260,6 +2544,7 @@ COMMANDS = [
     ("razbor", "Разобрать входящие"),
     ("projects", "Список проектов"),
     ("addproject", "Добавить проект"),
+    ("feed", "Лента заметок проекта"),
     ("ask", "Спросить ИИ по заметкам"),
     ("settings", "Часовой пояс и время разбора"),
     ("schedule", "Расписание и PDF"),
@@ -2271,6 +2556,7 @@ COMMANDS = [
 OWNER_EXTRA = [
     ("invite", "Пригласить участника"),
     ("members", "Участники и приглашения"),
+    ("teamproject", "Командный проект"),
 ]
 
 
@@ -2417,6 +2703,9 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("projects", projects_cmd, filters=member))
     app.add_handler(CommandHandler("ask", ask_cmd, filters=member))
     app.add_handler(CommandHandler("addproject", addproject, filters=member))
+    app.add_handler(CommandHandler("teamproject", teamproject_cmd, filters=member))
+    app.add_handler(CommandHandler("feed", feed_cmd, filters=member))
+    app.add_handler(CallbackQueryHandler(on_team_button, pattern=r"^(tm|fd|fv|fs):"))
     app.add_handler(CommandHandler("settings", settings_cmd, filters=member))
     app.add_handler(CommandHandler("types", types_cmd, filters=member))
     app.add_handler(CommandHandler("addtype", addtype, filters=member))

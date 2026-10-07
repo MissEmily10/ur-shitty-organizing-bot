@@ -244,6 +244,7 @@ def _item(p: dict) -> dict:
         "when": ((p["properties"].get(c.P_WHEN) or {}).get("date") or {}).get("start"),
         "done": bool((p["properties"].get(c.P_DONE) or {}).get("checkbox")),
         "ai_type": _select(p, c.P_AI_TYPE),
+        "author": _select(p, c.P_AUTHOR) or "",
     }
 
 
@@ -392,12 +393,17 @@ async def preview(page_id: str, limit: int = 600) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
-async def file_to_project(page_id: str, project: str) -> None:
-    """Только проект: из разбора заметка уходит, когда ей выбран тип."""
+async def file_to_project(page_id: str, project: str, skip_review: bool = False) -> dict:
+    """Только проект: из разбора заметка уходит, когда ей выбран тип. skip_review — режим «📌 Писать в»:
+    заметка сразу считается разобранной. Возвращает проект."""
     found = await get_project(project)
     if not found:
         raise RuntimeError(f"Проект «{project}» не найден")
-    await _call("PATCH", f"/pages/{page_id}", {"properties": {c.P_PROJECT: {"relation": [{"id": found["id"]}]}}})
+    props = {c.P_PROJECT: {"relation": [{"id": found["id"]}]}}
+    if skip_review:
+        props[c.P_STATUS] = {"select": {"name": c.STATUS_DONE}}
+    await _call("PATCH", f"/pages/{page_id}", {"properties": props})
+    return found
 
 
 async def types() -> list[str]:
@@ -495,7 +501,7 @@ async def add_expansion(page_id: str, type_name: str, blocks: list[dict]) -> Non
 
 
 async def notes_in_scope(user_id: int, project: str | None = None, days: int | None = None, limit: int = 150) -> list[dict]:
-    """Заметки проекта или за последние N дней, новые первыми (не больше limit). Свои — а в командном проекте
+    """Заметки проекта и/или за последние N дней, новые первыми (не больше limit). Свои — а в командном проекте
     заметки всех его участников."""
     await _load_projects()
     team = False
@@ -503,12 +509,20 @@ async def notes_in_scope(user_id: int, project: str | None = None, days: int | N
         found = await get_project(project)
         if not found:
             return []
+        if not can_see(found, user_id):
+            return []
         scope = {"property": c.P_PROJECT, "relation": {"contains": found["id"]}}
         team = found["kind"] == KIND_TEAM
     else:
         since = (datetime.now(timezone.utc) - timedelta(days=days or 7)).isoformat()
         scope = {"timestamp": "created_time", "created_time": {"on_or_after": since}}
-    flt = scope if team else {"and": [scope, _by_author(user_id)]}
+    parts = [scope]
+    if project and days:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        parts.append({"timestamp": "created_time", "created_time": {"on_or_after": since}})
+    if not team:
+        parts.append(_by_author(user_id))
+    flt = parts[0] if len(parts) == 1 else {"and": parts}
     notes, cursor = [], None
     while len(notes) < limit:
         body = {"filter": flt, "sorts": [{"timestamp": "created_time", "direction": "descending"}], "page_size": 100}
@@ -1073,6 +1087,16 @@ async def _load_projects(force: bool = False) -> list[dict]:
     _project_names.update({p["id"]: p["name"] for p in rows})
     _projects_cache = (loop.time(), rows)
     return rows
+
+
+def is_team_member(project: dict, user_id: int) -> bool:
+    """Состоит ли человек в командном проекте (автор проекта тоже участник)."""
+    return project["kind"] == KIND_TEAM and (user_id == project["creator"] or user_id in project["members"])
+
+
+def team_people(project: dict) -> list[int]:
+    """Кому приходят новости командного проекта: автор и участники."""
+    return list(dict.fromkeys([project["creator"], *project["members"]]))
 
 
 def can_see(project: dict, user_id: int | None) -> bool:

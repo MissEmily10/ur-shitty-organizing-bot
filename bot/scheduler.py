@@ -19,7 +19,7 @@ from telegram import Bot
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup
 
-from . import notion, weekly
+from . import notion, team, weekly
 from .whenparse import human
 
 log = logging.getLogger("scheduler")
@@ -330,12 +330,18 @@ async def _report_run(bot: Bot, uid: int, now: datetime) -> str:
     return await weekly.send_report(bot, uid, monday, now.tzinfo, automatic=True)
 
 
+async def _team_run(bot: Bot, uid: int, now: datetime) -> str:
+    """👥 Сводки командных проектов за неделю — в то же утро понедельника, что и отчёт."""
+    return await team.weekly(bot, uid, now, _report_due(now, {}) or now.date().isoformat(), is_done, mark_done)
+
+
 JOBS = [
     Job("evening", _evening_due, _evening_run),
     Job("mood", _mood_due, _mood_run),
     Job("checkin", _checkin_due, _checkin_run),
     Job("schedule_review", _review_due, _review_run),
     Job("weekly_report", _report_due, _report_run),
+    Job("team_summary", _report_due, _team_run),
 ]
 
 
