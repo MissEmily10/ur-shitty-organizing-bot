@@ -96,14 +96,17 @@ async def run():
     # 🔕 сегодня хватит
     await app.process_update(h.callback("ci:off"))
     assert any(k.startswith("checkin_off:42:") for k in h.service)
+    # кнопка ставит отметку на реальную дату; для тика на 7 октября ставим её на 7-е
+    for k in [k for k in h.service if k.startswith("checkin_off:")]:
+        del h.service[k]
     h.service["checkin_off:42:2026-10-07"] = "1"
     await scheduler.tick(bot, [42], now=utc(15, 0))  # 18:00
     assert len(checkins()) == 2
     # на следующий день снова, а слот рядом с вечерним разбором не шлётся
     h.service["settings:42"] = '{"tz": "Europe/Moscow", "evening": "18:15", "checkins": ["12:00", "18:00"]}'
     scheduler._settings_cache.clear()
-    await scheduler.tick(bot, [42], now=utc(9, 0, day=8))
-    assert len(checkins()) == 3
+    report = await scheduler.tick(bot, [42], now=utc(9, 0, day=8))
+    assert len(checkins()) == 3, report
     await scheduler.tick(bot, [42], now=utc(15, 0, day=8))
     assert len(checkins()) == 3, "18:00 рядом с разбором в 18:15 — пропускаем"
 
