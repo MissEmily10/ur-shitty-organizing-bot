@@ -529,3 +529,48 @@ async def draw(prompt: str, size: int | tuple[int, int] = 512) -> bytes:
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     return buf.getvalue()
+
+
+# ---------- 🎨 Арт-директор (студия, этап 13) ----------
+
+ART_PROMPT = """Ты арт-директор и колорист. Разбери референс на картинке для автора: {context}.
+Палитра, найденная по пикселям (HEX и доля площади): {palette}
+
+Ответь в Markdown, по-русски, конкретно и без воды, с такими разделами:
+## Палитра
+роль каждого цвета из списка выше (фон, акцент, кожа, тени…), чем палитра держится вместе; можно добавить 1–2 цвета-акцента в HEX, которые с ней сработают
+## Свет
+направление, жёсткость, источник, температура, контраст, время суток или студийная схема
+## Цвет и тонирование
+что в тенях, средних тонах и светах; насыщенность; плёночность, зерно; общее настроение
+## {craft_title}
+{craft}
+## Как повторить
+{repeat}"""
+
+CRAFT = {
+    "photo": ("Ретушь", "кожа, частотка или аккуратная ретушь, dodge & burn, резкость, чистка фона",
+              "по шагам для Lightroom (баланс белого, экспозиция, кривые, HSL, цветокоррекция теней и светов — примерные значения ползунков) и что доделать в Photoshop"),
+    "design": ("Композиция и типографика", "сетка, иерархия, фокус, ритм, отступы; какие шрифты и начертания сюда подойдут",
+               "по шагам для Figma: сетка, стили цвета (HEX), стили текста, эффекты"),
+}
+
+
+def craft_for(context: str) -> str:
+    """Фотографии — по умолчанию; если сфера или проект про дизайн, разбор через композицию и типографику."""
+    return "design" if re.search(r"дизайн|айдентик|логотип|веб|ui|ux|типограф|плакат|верстк", context.lower()) else "photo"
+
+
+async def art_director(image: bytes, palette: list[tuple[str, float]], context: str = "") -> str:
+    title, craft, repeat = CRAFT[craft_for(context)]
+    text = ART_PROMPT.format(
+        context=context or "автор — фотограф и дизайнер",
+        palette=", ".join(f"{h} ({share:.0%})" for h, share in palette),
+        craft_title=title,
+        craft=craft,
+        repeat=repeat,
+    )
+    response = await _client().chat_completion(
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": _with_images([image], text)}], max_tokens=2500, temperature=0.4
+    )
+    return (response.choices[0].message.content or "").strip() or "🤷 Модель вернула пустой ответ."

@@ -23,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, banners, documents, notion, pdf, schedule, scheduler, styles, team, weekly, whenparse
+from . import ai, banners, documents, notion, pdf, schedule, scheduler, studio, styles, team, weekly, whenparse
 from . import config as c
 from .markdown import chunks as _chunks, tg_html, to_blocks
 
@@ -85,6 +85,7 @@ MENU = (
     "/report — недельный отчёт: настроение и дела\n"
     "/settings — часовой пояс, время разбора и дневных чек-инов\n"
     "/style — как бот с тобой разговаривает: стиль или свой персонаж\n"
+    "/artdirector — 🎨 разбор референса: палитра в HEX, свет, цвет, как повторить\n"
     "{owner_commands}"
     "/start — это меню\n\n"
     "Или жми кнопку 👇"
@@ -871,6 +872,11 @@ async def on_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         _albums.setdefault(msg.media_group_id, []).append(update)
         if first:
             await _flush_album(msg.media_group_id)
+        return
+    reply = msg.reply_to_message
+    if (reply and reply.text == AD_PROMPT) or AD_CAPTION.match(msg.caption or ""):
+        # Референс для Арт-директора, а не заметка
+        await _art_director(msg, await _download_image(msg))
         return
     await _save(update, "Фото", text=msg.caption or "", images=[await _download_image(msg)])
 
@@ -2395,6 +2401,76 @@ async def areas_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Сферы деятельности:\n\n" + "\n".join(lines) + "\n\nОбновить описание: /addarea Название — новое описание", parse_mode=ParseMode.HTML)
 
 
+# ---------- 🎨 Арт-директор (ИИ-студия, этап 13) ----------
+# /artdirector → фото-референс ответом (или фото с подписью /ad) → карточка палитры в HEX и разбор света, цвета,
+# ретуши и «как повторить». У заметки-референса кнопка «🎨 Арт-директор»: разбор дописывается в саму заметку.
+# callback_data: ad:<page_id>
+
+AD_PROMPT = "🎨 Пришлите фото-референс ответом на это сообщение — разберу палитру, свет, цвет и как это повторить."
+AD_CAPTION = re.compile(r"^/(ad|artdirector)(@\w+)?\b", re.I)
+
+
+async def artdirector_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(AD_PROMPT, reply_markup=ForceReply(input_field_placeholder="фото"))
+
+
+async def _art_director(message: Message, image: bytes, context: str = "", page_id: str | None = None) -> None:
+    if not await ai_allowed(message):
+        return
+    try:
+        colors = studio.palette(image)
+        await message.reply_photo(studio.palette_card(colors), caption="🎨 Палитра: " + "  ".join(h for h, _ in colors))
+    except Exception as e:
+        log.exception("palette failed")
+        await message.reply_text(f"❌ Не получилось прочитать картинку: {e}"[:4000])
+        return
+    status = await message.reply_text("🎨 Арт-директор разбирает свет и цвет…")
+    try:
+        analysis = await ai.art_director(image, colors, context)
+    except Exception as e:
+        log.exception("art director failed")
+        await status.edit_text(f"❌ ИИ не ответил: {e}"[:4000])
+        return
+    saved = ""
+    if page_id:
+        try:
+            await notion.add_section(page_id, "🎨 Арт-директор", to_blocks("**Палитра:**\n" + studio.palette_markdown(colors) + "\n\n" + analysis))
+            saved = "\n\n📄 Разбор дописан в заметку."
+        except Exception as e:
+            log.exception("art director to notion failed")
+            saved = f"\n\n⚠️ В заметку не записалось: {escape(str(e)[:300])}"
+    parts = _chunks(tg_html(analysis))
+    for i, part in enumerate(parts):
+        text = ("🎨 <b>Арт-директор</b>\n\n" if i == 0 else "") + part + (saved if i == len(parts) - 1 else "")
+        if i == 0:
+            await status.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        else:
+            await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def on_ad_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    page_id = q.data.split(":")[1]
+    try:
+        item = await own_page(uid, page_id)
+        note = await notion.read_note(page_id)
+        if not note["images"]:
+            await q.answer("В заметке нет фото: пришлите референс через /artdirector", show_alert=True)
+            return
+        await q.answer()
+        image = await notion.download(note["images"][0])
+    except Exception as e:
+        log.exception("art director button failed")
+        await _fail(q, e)
+        return
+    context = await project_context(item.get("project")) or ""
+    await _art_director(q.message, image, context, page_id)
+
+
 # ---------- 🎭 стиль бота ----------
 # Тон реплик у каждого свой: встроенные стили, «Эминемовна» (когда заполним профиль) или свой персонаж из Character.AI.
 # callback_data: sy:<стиль> (выбрать) | sy:new (перенести своего персонажа) | sy:redo (переписать реплики) | sy:ok
@@ -2889,6 +2965,7 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                             if not item.get("when") and re.search(r"напомин|событ|задач", names[idx].lower())
                             else []
                         )
+                        + ([[Btn("🎨 Арт-директор", callback_data=f"ad:{page_id}")]] if "референс" in names[idx].lower() else [])
                     ),
                 )
                 return
@@ -2942,6 +3019,7 @@ COMMANDS = [
     ("ask", "Спросить ИИ по заметкам"),
     ("settings", "Часовой пояс и время разбора"),
     ("style", "Стиль общения бота"),
+    ("artdirector", "Арт-директор: палитра и свет референса"),
     ("schedule", "Расписание и PDF"),
     ("report", "Недельный отчёт"),
     ("types", "Типы записей"),
@@ -3104,6 +3182,8 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_team_button, pattern=r"^(tm|fd|fv|fs):"))
     app.add_handler(CallbackQueryHandler(on_icon_button, pattern=r"^ic:"))
     app.add_handler(CommandHandler("style", style_cmd, filters=member))
+    app.add_handler(CommandHandler(["artdirector", "ad"], artdirector_cmd, filters=member))
+    app.add_handler(CallbackQueryHandler(on_ad_button, pattern=r"^ad:"))
     app.add_handler(CommandHandler("banners", banners_cmd, filters=owner))
     app.add_handler(CallbackQueryHandler(on_banner_button, pattern=r"^bn:"))
     app.add_handler(CallbackQueryHandler(on_style_button, pattern=r"^sy:"))

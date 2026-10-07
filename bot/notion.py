@@ -504,6 +504,12 @@ async def project_titles(project: str, exclude: str, user_id: int, limit: int = 
     return [_title(p) for p in data["results"] if p["id"].replace("-", "") != exclude][:limit]
 
 
+async def add_section(page_id: str, title: str, blocks: list[dict]) -> None:
+    """Дописывает в заметку раздел с заголовком (например, разбор Арт-директора)."""
+    heading = {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": title}}]}}
+    await _append(page_id, [heading] + blocks)
+
+
 async def add_expansion(page_id: str, type_name: str, blocks: list[dict]) -> None:
     """Расширенное описание дописывается в заметку открыто, под заголовком «✨ <тип>: подробно»."""
     heading = {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"✨ {type_name}: подробно"}}]}}
