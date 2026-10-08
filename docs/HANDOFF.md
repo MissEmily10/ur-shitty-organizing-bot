@@ -64,7 +64,9 @@ Telegram-бот «организатор мыслей»: заметки (тек�
   Сфера в кнопках — **номер**, не id: callback_data ≤ 64 байт (harness теперь падает на длинных кнопках).
 - 🧹 Навести порядок (16): `ai.tidy_plan` (проверяет ответ модели), `notion.notes_without_project`, в `main.py` раздел
   «🧹 навести порядок» (`td:`, план в памяти `_tidy`), разовая задача `tidy_offer` в планировщике (8–12, только владелица;
-  в harness убрана из JOBS — `h.TIDY_JOB`). Этап 17 (пересекающиеся цели) — только в ROADMAP, ждёт «делаем».
+  в harness убрана из JOBS — `h.TIDY_JOB`). - 🔗 Похожие цели (17): `ai.find_overlaps` (проверяет ответ), `ai.merge_notes`, `notion.open_goals`, `notion.mark_merged`
+  (колонка «Объединено»), в `main.py` раздел «🔗 пересекающиеся цели» (`og:`, состояние `_overlaps`, «это разное» —
+  `distinct:<хэш id>` в «Служебном»), субботняя задача `overlaps` (в harness убрана — `h.OVERLAPS_JOB`).
 - `team.py` — 👥 сводки командных проектов (по кнопке и задача `team_summary` в понедельник).
 - `report.py` + `weekly.py` — недельный отчёт (Pillow). `documents.py` — PDF/Word/Excel/CSV/TXT.
 - Оформление картинок и PDF — `design/tokens.json` + шрифт PT Sans в `design/fonts/` (временное, под её дизайн).

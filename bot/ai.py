@@ -677,3 +677,63 @@ async def tidy_plan(spheres: list[str], projects: list[tuple[str, str]], notes: 
     ]
     used = {p for _, p in plan_notes}
     return {"notes": plan_notes, "new_projects": [p for p in new if p[0] in used], "spheres": plan_spheres}
+
+
+# ---------- 🔗 пересекающиеся цели ----------
+
+OVERLAP_PROMPT = """Ниже цели, планы, задачи и идеи одного человека (номер. название [тип] {{проект / сфера}}).
+Найди группы, которые пересекаются: повторяют друг друга или одна — часть другой.
+Для каждой группы укажи вид:
+- "same" — по сути одно и то же, стоит объединить в одну запись;
+- "parent" — одна запись — большая цель, остальные — её шаги (укажи главную в "main").
+Не объединяй просто похожие по теме, если это разные дела. Лучше меньше, но точно. Не больше {max_groups} групп.
+
+{items}
+
+Ответь только JSON: {{"groups": [{{"n": [1, 4], "kind": "same", "main": 1, "why": "коротко почему"}}]}}"""
+
+
+async def find_overlaps(items: list[str], max_groups: int = 8) -> list[dict]:
+    """Группы пересекающихся записей: [{"n": [номера с 1], "kind": "same"|"parent", "main": номер, "why": "…"}].
+    Ответ модели проверяется: номера в пределах списка, без повторов между группами, в группе от двух записей."""
+    text = OVERLAP_PROMPT.format(items="\n".join(f"{i}. {t}" for i, t in enumerate(items, 1)), max_groups=max_groups)
+    raw = _json_object(await _complete(text, 2000))
+    used: set[int] = set()
+    groups = []
+    for g in raw.get("groups") or []:
+        if not isinstance(g, dict):
+            continue
+        try:
+            numbers = [int(x) for x in g.get("n") or []]
+        except (TypeError, ValueError):
+            continue
+        numbers = [n for n in dict.fromkeys(numbers) if 1 <= n <= len(items) and n not in used]
+        if len(numbers) < 2:
+            continue
+        kind = "parent" if g.get("kind") == "parent" else "same"
+        try:
+            main = int(g.get("main") or numbers[0])
+        except (TypeError, ValueError):
+            main = numbers[0]
+        used.update(numbers)
+        groups.append({"n": numbers, "kind": kind, "main": main if main in numbers else numbers[0], "why": str(g.get("why") or "")[:300]})
+    return groups[:max_groups]
+
+
+MERGE_PROMPT = """Объедини эти записи одного человека в одну: они про одно и то же.
+Ничего не теряй: все факты, шаги, сроки, ссылки и мысли из каждой записи должны остаться; повторы убери.
+Ответь строго в формате:
+===НАЗВАНИЕ===
+короткое общее название, до 8 слов
+===ТЕКСТ===
+объединённая запись в Markdown: суть, затем шаги списком "- [ ] ", затем остальные детали
+
+{notes}"""
+
+
+async def merge_notes(notes: list[str]) -> tuple[str, str]:
+    raw = await _complete(MERGE_PROMPT.format(notes="\n\n".join(notes)[:24000]), 3000)
+    m = re.search(r"===НАЗВАНИЕ===\s*(.+?)\s*===ТЕКСТ===\s*(.*)", raw, re.S)
+    if not m:
+        raise RuntimeError("ИИ не собрал объединённую запись, попробуйте ещё раз.")
+    return m.group(1).strip().splitlines()[0][:120], m.group(2).strip()

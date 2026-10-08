@@ -73,6 +73,7 @@ SCHEMA = {
     c.P_WHEN: {"date": {}},  # срок, время напоминания или события
     c.P_DONE: {"checkbox": {}},
     c.P_AI_TYPE: {"select": {}},  # тип, который предложил ИИ; сам тип выбирает человек в разборе
+    c.P_MERGED: {"checkbox": {}},  # объединена с похожими в новую заметку
     "Создано": {"created_time": {}},
 }
 
@@ -561,12 +562,49 @@ async def notes_without_project(user_id: int, limit: int = 80) -> list[dict]:
         "POST",
         f"/databases/{await db_id()}/query",
         {
-            "filter": {"and": [{"property": c.P_PROJECT, "relation": {"is_empty": True}}, _by_author(user_id)]},
+            "filter": {"and": [
+                {"property": c.P_PROJECT, "relation": {"is_empty": True}},
+                {"property": c.P_MERGED, "checkbox": {"equals": False}},
+                _by_author(user_id),
+            ]},  # fmt: skip
             "sorts": [{"timestamp": "created_time", "direction": "descending"}],
             "page_size": min(limit, 100),
         },
     )
     return [_item(p) for p in data["results"]][:limit]
+
+
+NOT_GOALS = re.compile(r"быстр|референс|напомин|событ|встреч", re.I)
+
+
+async def open_goals(user_id: int, limit: int = 120) -> list[dict]:
+    """Открытые цели, планы, задачи и идеи человека (не выполненные и не объединённые), новые первыми.
+    Быстрые заметки, референсы, напоминания и события сюда не входят."""
+    await _load_projects()
+    data = await _call(
+        "POST",
+        f"/databases/{await db_id()}/query",
+        {
+            "filter": {"and": [
+                {"property": c.P_DONE, "checkbox": {"equals": False}},
+                {"property": c.P_MERGED, "checkbox": {"equals": False}},
+                _by_author(user_id),
+            ]},  # fmt: skip
+            "sorts": [{"timestamp": "created_time", "direction": "descending"}],
+            "page_size": 100,
+        },
+    )
+    items = [_item(p) for p in data["results"]]
+    return [i for i in items if not NOT_GOALS.search(i.get("type") or i.get("ai_type") or "")][:limit]
+
+
+async def mark_merged(page_id: str) -> None:
+    """Заметка вошла в объединённую: помечаем, убираем из разбора и снимаем срок (он перешёл в новую)."""
+    await _call(
+        "PATCH",
+        f"/pages/{page_id}",
+        {"properties": {c.P_MERGED: {"checkbox": True}, c.P_STATUS: {"select": {"name": c.STATUS_DONE}}, c.P_WHEN: {"date": None}}},
+    )
 
 
 async def created_today(user_id: int) -> int:

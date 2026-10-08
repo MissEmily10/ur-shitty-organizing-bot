@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -79,6 +80,7 @@ MENU = (
     "/addproject — добавить проект (бот спросит название)\n"
     "/feed — лента заметок проекта; в командном — от всех участников\n"
     "/tidy — 🧹 разложить заметки без проекта по сферам и проектам\n"
+    "/overlaps — 🔗 найти цели и планы, которые повторяют друг друга\n"
     "/types, /addtype — типы записей\n"
     "/areas, /addarea — сферы деятельности (фотограф, дизайнер…)\n"
     "/ask — спросить ИИ по проекту или по всем своим заметкам за период\n"
@@ -246,10 +248,11 @@ def _section(uid: int, name: str) -> tuple[str, list[list[tuple[str, str]]]]:
             "📌 <b>Куда писать</b> — новые заметки сразу в проект, без разбора\n"
             "🔥 <b>Горящие дедлайны</b> — просроченное, сегодня и завтра: что уже закрыто?\n"
             "🧹 <b>Навести порядок</b> — ИИ предложит разложить заметки по сферам и проектам\n"
+            "🔗 <b>Похожие цели</b> — найти цели и планы, которые повторяют друг друга, и объединить\n"
             "🏷 <b>Типы</b> — виды записей: идея, задача, референс…\n"
             "☀️ <b>Чек-ины</b> — когда днём спрашивать о неразобранном",
             [[("🗂 Разобрать", "m:razbor"), ("📌 Куда писать", "st:ap")],
-             [("🔥 Горящие дедлайны", "hd:show"), ("🧹 Навести порядок", "td:plan")],
+             [("🔥 Горящие дедлайны", "hd:show"), ("🧹 Навести порядок", "td:plan")], [("🔗 Похожие цели", "og:find")],
              [("🏷 Типы", "m:types"), ("☀️ Чек-ины", "st:ci")]],
         )  # fmt: skip
     if name == "projects":
@@ -628,7 +631,8 @@ async def _settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"📌 Новые заметки: {'сразу в «' + pinned['name'] + '», без разбора' if pinned else 'во входящие, разбор вечером'}\n"
         f"👥 Новости командных проектов: {'присылать' if st.get('team_notify', True) else 'не присылать'}\n"
         f"🖼 Меню с картинками: {'да' if st.get('banners') else 'нет, только текст'}\n"
-        f"🔥 Горящие дедлайны: {'каждое утро в ' + st['deadlines'] if st.get('deadlines') else 'выключены'}"
+        f"🔥 Горящие дедлайны: {'каждое утро в ' + st['deadlines'] if st.get('deadlines') else 'выключены'}\n"
+        f"🔗 Проверка похожих целей: {'по субботам' if st.get('overlaps', True) else 'выключена'}"
     )
     return text, InlineKeyboardMarkup(
         [
@@ -636,6 +640,7 @@ async def _settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
             [Btn("☀️ Чек-ины", callback_data="st:ci"), Btn("😊 Настроение: вкл/выкл", callback_data="st:mood")],
             [Btn("📌 Куда писать", callback_data="st:ap"), Btn("👥 Новости команды: вкл/выкл", callback_data="st:tn")],
             [Btn("🖼 Картинки в меню: вкл/выкл", callback_data="st:bn"), Btn("🔥 Горящие дедлайны", callback_data="st:dd")],
+            [Btn("🔗 Похожие цели по субботам: вкл/выкл", callback_data="st:ol")],
         ]
     )
 
@@ -727,6 +732,10 @@ async def on_settings_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
             return
         elif parts[1] == "dd":
             await scheduler.update_settings(uid, deadlines="" if parts[2] == "off" else f"{parts[2][:2]}:{parts[2][2:]}")
+            await q.answer("Сохранено ✓")
+        elif parts[1] == "ol":
+            st = await scheduler.get_settings(uid)
+            await scheduler.update_settings(uid, overlaps=not st.get("overlaps", True))
             await q.answer("Сохранено ✓")
         elif parts[1] == "bn":
             st = await scheduler.get_settings(uid)
@@ -2049,7 +2058,7 @@ def _tidy_summary(applied: list[int]) -> str:
     if not any(applied):
         return "Ничего не меняла. Захочешь — /tidy."
     parts = [f"заметок разложено: {notes}"] + ([f"новых проектов: {new}"] if new else []) + ([f"сфер проставлено: {areas}"] if areas else [])
-    return "✅ Готово — " + ", ".join(parts) + ".\nВсё видно в /projects и в Notion."
+    return "✅ Готово — " + ", ".join(parts) + ".\nВсё видно в /projects и в Notion.\nПроверить, не повторяют ли цели друг друга: /overlaps"
 
 
 async def tidy_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2115,6 +2124,233 @@ async def on_tidy_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.exception("tidy failed")
+        await _fail(q, e)
+
+
+# ---------- 🔗 пересекающиеся цели: найти и объединить ----------
+# ИИ ищет среди открытых целей, задач и идей группы, которые повторяют друг друга (same) или где одна — часть
+# другой (parent). По каждой группе: объединить в одну новую заметку (старые помечаются «Объединено», не удаляются),
+# сделать одну главной, а остальные её шагами, или «это разное» (больше не предлагать). Можно отметить самой.
+# callback_data: og:find | og:man | og:t:<номер> | og:mm / og:mp (объединить / главная — по отмеченным)
+#                og:m / og:p (объединить / главная — текущая группа) | og:d (это разное) | og:s (пропустить) | og:no
+
+OVERLAP_MANUAL_LIMIT = 20
+_overlaps: dict[int, dict] = {}
+
+
+def overlaps_offer_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [Btn("🔗 Найти похожие", callback_data="og:find"), Btn("✋ Отмечу сама", callback_data="og:man")],
+        [Btn("Не сейчас", callback_data="og:no")],
+    ])  # fmt: skip
+
+
+def _signature(ids: list[str]) -> str:
+    return "distinct:" + hashlib.sha1(",".join(sorted(ids)).encode()).hexdigest()[:12]
+
+
+async def _goal_labels(uid: int, items: list[dict]) -> list[str]:
+    areas = {a["id"]: a["name"] for a in await notion.spheres()}
+    sphere_of = {p["name"]: areas.get(p["sphere_id"] or "", "") for p in await notion.project_list(uid, include_closed=True)}
+    labels = []
+    for it in items:
+        kind = it.get("type") or it.get("ai_type") or ""
+        where = " / ".join(x for x in (it.get("project"), sphere_of.get(it.get("project") or "")) if x)
+        labels.append(it["title"] + (f" [{kind}]" if kind else "") + (f" {{{where}}}" if where else ""))
+    return labels
+
+
+def _short(title: str, n: int = 28) -> str:
+    return title if len(title) <= n else title[: n - 1] + "…"
+
+
+def _group_view(state: dict) -> tuple[str, InlineKeyboardMarkup]:
+    i, groups = state["i"], state["groups"]
+    g = groups[i]
+    items = [state["items"][n - 1] for n in g["n"]]
+    main_item = state["items"][g["main"] - 1]
+    kind = "повторяют друг друга" if g["kind"] == "same" else "цель и её шаги"
+    lines = [f"{k}. {escape(it['title'])}" + (f" · 📁 {escape(it['project'])}" if it.get("project") else "") for k, it in enumerate(items, 1)]
+    text = (
+        f"🔗 <b>Группа {i + 1} из {len(groups)}</b> · {kind}\n\n" + "\n".join(lines)
+        + (f"\n\n💬 {escape(g['why'])}" if g["why"] else "") + "\n\nЧто сделать?"
+    )
+    merge = Btn("🧩 Объединить в одну", callback_data="og:m")
+    parent = Btn(f"🌳 Главная — «{_short(main_item['title'])}»", callback_data="og:p")
+    first = [parent, merge] if g["kind"] == "parent" else [merge, parent]
+    kb = InlineKeyboardMarkup([
+        [first[0]], [first[1]],
+        [Btn("Это разное", callback_data="og:d"), Btn("⏭ Пропустить", callback_data="og:s")],
+        [Btn("✋ Хватит", callback_data="og:no")],
+    ])  # fmt: skip
+    return text, kb
+
+
+def _manual_view(state: dict) -> tuple[str, InlineKeyboardMarkup]:
+    picked = state["picked"]
+    rows = [
+        [Btn(("☑️ " if i in picked else "▫️ ") + _short(it["title"], 40), callback_data=f"og:t:{i}")]
+        for i, it in enumerate(state["items"][:OVERLAP_MANUAL_LIMIT])
+    ]
+    rows.append([Btn("🧩 Объединить отмеченные", callback_data="og:mm")])
+    rows.append([Btn("🌳 Первая отмеченная — главная", callback_data="og:mp")])
+    rows.append([Btn("✋ Хватит", callback_data="og:no")])
+    text = (
+        "✋ Отметь записи, которые пересекаются (две и больше), и выбери:\n"
+        "🧩 объединить — соберу одну общую запись, старые останутся с пометкой «Объединено»;\n"
+        "🌳 главная — первая отмеченная станет целью, остальные — её шагами."
+        + (f"\n\nОтмечено: {len(picked)}" if picked else "")
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _merge(bot, uid: int, author: str, items: list[dict]) -> tuple[str, str]:
+    """Новая общая заметка из нескольких. Старые не удаляются: пометка «Объединено» и ссылка на новую."""
+    texts = []
+    for it in items:
+        await own_page(uid, it["id"])
+        note = await notion.read_note(it["id"])
+        texts.append("\n".join(x for x in (f"### «{it['title']}»", note["summary"], note["details"]) if x))
+    title, body = await ai.merge_notes(texts)
+    whens = sorted(it["when"] for it in items if it.get("when"))
+    kind = next((it["type"] for it in items if it.get("type")), None)
+    sources = "**Собрано из:**\n" + "\n".join(f"- {it['title']}" for it in items)
+    page_id, url = await notion.create_idea(
+        title, "Объединение", [], to_blocks(body) + to_blocks(sources), [], uid, author,
+        when=whens[0] if whens else None, ai_type=kind,
+    )  # fmt: skip
+    if kind:
+        await notion.set_type(page_id, kind)
+    project = next((it["project"] for it in items if it.get("project")), None)
+    if project:
+        await _file(bot, uid, page_id, project)
+    for it in items:
+        await notion.add_section(it["id"], "🔗 Объединено", to_blocks(f"Эта запись вошла в «{title}»: {url}"))
+        await notion.mark_merged(it["id"])
+    return title, url
+
+
+async def _make_parent(uid: int, main_item: dict, subs: list[dict]) -> None:
+    """Главная цель и её шаги: взаимные ссылки в Notion, группа больше не предлагается."""
+    for it in [main_item, *subs]:
+        await own_page(uid, it["id"])
+    steps = "\n".join(f"- [ ] {it['title']} — {it['url']}" for it in subs)
+    await notion.add_section(main_item["id"], "🌳 Шаги этой цели", to_blocks(steps))
+    for it in subs:
+        await notion.add_section(it["id"], "🌳 Шаг цели", to_blocks(f"Главная цель: «{main_item['title']}» — {main_item['url']}"))
+    await notion.set_value(_signature([it["id"] for it in [main_item, *subs]]), "parent")
+
+
+async def overlaps_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🔗 Проверим, не повторяют ли цели и планы друг друга? Я найду похожие и предложу объединить их "
+        "или сделать одну главной, а остальные — её шагами. Без твоего выбора ничего не меняю.",
+        reply_markup=overlaps_offer_markup(),
+    )
+
+
+async def _overlap_next(q, state: dict, uid: int, done: str) -> None:
+    state["i"] += 1
+    if state["i"] >= len(state["groups"]):
+        _overlaps.pop(uid, None)
+        await _edit(q, f"{done}\n\nВсё, групп больше нет. Проверить снова: /overlaps".strip(), reply_markup=None, parse_mode=ParseMode.HTML)
+        return
+    text, kb = _group_view(state)
+    await _edit(q, (f"{done}\n\n" if done else "") + text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def on_overlap_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    action, *rest = q.data.split(":")[1:]
+    try:
+        if action == "no":
+            _overlaps.pop(uid, None)
+            await q.answer()
+            await _edit(q, "Хорошо. Проверить похожие цели: /overlaps", reply_markup=None)
+            return
+        if action == "find":
+            await q.answer()
+            if not await ai_allowed(q.message):
+                return
+            await _edit(q, "🔗 Ищу пересечения среди целей и планов…", reply_markup=None)
+            items = await notion.open_goals(uid)
+            if len(items) < 2:
+                await _edit(q, "Открытых целей и задач пока меньше двух — сравнивать нечего.", reply_markup=None)
+                return
+            groups = await ai.find_overlaps(await _goal_labels(uid, items))
+            fresh = [g for g in groups if not await notion.get_value(_signature([items[n - 1]["id"] for n in g["n"]]))]
+            if not fresh:
+                await _edit(q, "🎉 Пересечений не нашла: цели не повторяют друг друга.\nЕсли заметила сама — «✋ Отмечу сама».",
+                            reply_markup=InlineKeyboardMarkup([[Btn("✋ Отмечу сама", callback_data="og:man")]]))  # fmt: skip
+                return
+            state = _overlaps[uid] = {"items": items, "groups": fresh, "i": 0, "picked": set()}
+            text, kb = _group_view(state)
+            await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+        if action == "man":
+            await q.answer()
+            items = await notion.open_goals(uid, OVERLAP_MANUAL_LIMIT)
+            if len(items) < 2:
+                await _edit(q, "Открытых целей и задач пока меньше двух.", reply_markup=None)
+                return
+            state = _overlaps[uid] = {"items": items, "groups": [], "i": 0, "picked": set(), "manual": True}
+            text, kb = _manual_view(state)
+            await _edit(q, text, reply_markup=kb)
+            return
+        state = _overlaps.get(uid)
+        if not state:
+            await q.answer("Список устарел — начните заново: /overlaps", show_alert=True)
+            return
+        if action == "t":
+            i = int(rest[0])
+            state["picked"] ^= {i}
+            await q.answer()
+            text, kb = _manual_view(state)
+            await _edit(q, text, reply_markup=kb)
+            return
+        if action in ("mm", "mp"):
+            picked = sorted(state["picked"])
+            if len(picked) < 2:
+                await q.answer("Отметь хотя бы две записи", show_alert=True)
+                return
+            chosen = [state["items"][i] for i in picked]
+            await q.answer()
+            if action == "mm":
+                await _edit(q, "🧩 Собираю общую запись…", reply_markup=None)
+                title, url = await _merge(q.get_bot(), uid, q.from_user.full_name, chosen)
+                done = f'🧩 Готово: <a href="{url}">{escape(title)}</a>. Старые записи помечены «Объединено».'
+            else:
+                await _make_parent(uid, chosen[0], chosen[1:])
+                done = f"🌳 «{escape(chosen[0]['title'])}» — главная цель, остальные стали её шагами (ссылки в Notion)."
+            _overlaps.pop(uid, None)
+            await _edit(q, done, reply_markup=None, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        g = state["groups"][state["i"]]
+        group_items = [state["items"][n - 1] for n in g["n"]]
+        if action == "m":
+            await q.answer()
+            await _edit(q, "🧩 Собираю общую запись…", reply_markup=None)
+            title, url = await _merge(q.get_bot(), uid, q.from_user.full_name, group_items)
+            done = f'🧩 Объединено в <a href="{url}">{escape(title)}</a>.'
+        elif action == "p":
+            main_item = state["items"][g["main"] - 1]
+            await _make_parent(uid, main_item, [it for it in group_items if it is not main_item])
+            await q.answer("Готово ✓")
+            done = f"🌳 «{escape(main_item['title'])}» — главная, остальные — её шаги."
+        elif action == "d":
+            await notion.set_value(_signature([it["id"] for it in group_items]), "distinct")
+            await q.answer("Запомнила: это разное")
+            done = ""
+        else:
+            await q.answer("Пропущено")
+            done = ""
+        await _overlap_next(q, state, uid, done)
+    except Exception as e:
+        log.exception("overlaps failed")
         await _fail(q, e)
 
 
@@ -3594,6 +3830,7 @@ COMMANDS = [
     ("addproject", "Добавить проект"),
     ("feed", "Лента заметок проекта"),
     ("tidy", "Навести порядок: разложить заметки"),
+    ("overlaps", "Похожие цели: найти и объединить"),
     ("ask", "Спросить ИИ по заметкам"),
     ("settings", "Часовой пояс и время разбора"),
     ("style", "Стиль общения бота"),
@@ -3779,6 +4016,8 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_hot_button, pattern=r"^hd:"))
     app.add_handler(CommandHandler("tidy", tidy_cmd, filters=member))
     app.add_handler(CallbackQueryHandler(on_tidy_button, pattern=r"^td:"))
+    app.add_handler(CommandHandler("overlaps", overlaps_cmd, filters=member))
+    app.add_handler(CallbackQueryHandler(on_overlap_button, pattern=r"^og:"))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))
     app.add_handler(CommandHandler("schedule", schedule_cmd, filters=member))
     app.add_handler(CommandHandler("report", report_cmd, filters=member))

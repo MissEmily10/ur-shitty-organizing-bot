@@ -429,6 +429,32 @@ async def _team_run(bot: Bot, uid: int, now: datetime) -> str:
     return await team.weekly(bot, uid, now, _report_due(now, {}) or now.date().isoformat(), is_done, mark_done)
 
 
+OVERLAPS_AT = time(12, 0)  # по субботам: предложить проверить похожие цели
+OVERLAPS_MIN = 6  # если открытых целей меньше — не беспокоим
+
+
+def _overlaps_due(now: datetime, settings: dict) -> str | None:
+    if not settings.get("overlaps", True) or now.weekday() != 5 or now.time() < OVERLAPS_AT:
+        return None
+    return now.date().isoformat()
+
+
+async def _overlaps_run(bot: Bot, uid: int, now: datetime) -> str:
+    goals = await notion.open_goals(uid)
+    if len(goals) < OVERLAPS_MIN:
+        return f"целей мало ({len(goals)})"
+    await bot.send_message(
+        uid,
+        f"🔗 Субботняя проверка: открытых целей и планов — {len(goals)}. Посмотреть, не повторяют ли они друг друга? "
+        "Предложу объединить похожие или сделать одну главной, остальные — её шагами.",
+        reply_markup=InlineKeyboardMarkup([
+            [Btn("🔗 Найти похожие", callback_data="og:find"), Btn("✋ Отмечу сама", callback_data="og:man")],
+            [Btn("Не сейчас", callback_data="og:no")],
+        ]),  # fmt: skip
+    )
+    return f"предложена проверка: {len(goals)}"
+
+
 TIDY_FROM, TIDY_TILL = time(8, 0), time(12, 0)
 
 
@@ -459,6 +485,7 @@ JOBS = [
     Job("team_summary", _report_due, _team_run),
     Job("deadlines", _hot_due, _hot_run),
     Job("tidy_offer", _tidy_due, _tidy_run),
+    Job("overlaps", _overlaps_due, _overlaps_run),
 ]
 
 

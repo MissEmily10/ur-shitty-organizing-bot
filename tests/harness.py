@@ -114,6 +114,9 @@ main.HINT_TIMES = 0
 # Разовое утреннее «навести порядок» — тоже (проверяется в test_tidy)
 TIDY_JOB = next(j for j in _scheduler.JOBS if j.name == "tidy_offer")
 _scheduler.JOBS.remove(TIDY_JOB)
+# и субботняя проверка похожих целей (test_overlaps)
+OVERLAPS_JOB = next(j for j in _scheduler.JOBS if j.name == "overlaps")
+_scheduler.JOBS.remove(OVERLAPS_JOB)
 
 REAL = {"_load_projects": _notion._load_projects, "spheres": _notion.spheres}
 _notion._load_projects, _notion.spheres = _no_projects, _no_spheres
