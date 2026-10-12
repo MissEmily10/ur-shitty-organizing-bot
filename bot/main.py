@@ -4354,6 +4354,14 @@ async def set_commands(app: Application) -> None:
     try:
         log.info("projects: %s", await notion.ensure_projects())
         log.info("spheres: %s", await notion.seed_spheres())
+        seeded = await timetable.seed_owner(c.OWNER_ID)
+        log.info("timetable: %s", seeded)
+        if seeded.startswith("загружено"):
+            text, kb = await _tt_view(c.OWNER_ID)
+            await app.bot.send_message(
+                c.OWNER_ID, "🎒 Внесла твоё расписание уроков: звонки за 5 минут до конца урока включены.\n\n" + text,
+                reply_markup=kb, parse_mode=ParseMode.HTML,
+            )  # fmt: skip
     except Exception:
         log.exception("could not prepare projects")
     try:

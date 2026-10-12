@@ -1,6 +1,7 @@
 """🎒 Индивидуальное расписание владелицы: уроки (время, кабинет, номер, предмет, преподаватель), занятия вне школы,
 уроки, которые чередуются через неделю («ИЛИ»), звонок за 5 минут до конца урока с тем, куда идти дальше,
-и выгрузка в основное расписание. Хранится в «Служебном» Notion (`timetable:<uid>`), не в коде: репозиторий публичный.
+и выгрузка в основное расписание. Хранится в «Служебном» Notion (`timetable:<uid>`). Первый раз владелица попросила
+внести её расписание за неё: оно лежит в data/owner_timetable.txt и загружается один раз при запуске (seed_owner).
 
 Формат, который понимает разбор (как владелица пишет расписание):
     понедельник, среда - 14:00 китайский, 16:00 английский
@@ -14,11 +15,11 @@
     19:30 - 20:45 - танцы
 """
 
+import asyncio
 import json
 import re
+from pathlib import Path
 from datetime import date, datetime, timedelta
-
-import asyncio
 
 from . import notion, pdf
 from .notion import KIND_REGULAR, WEEKDAYS
@@ -310,3 +311,24 @@ def week_pdf(data: dict, day: date) -> bytes:
         days, f"Моё расписание · {start:%d.%m}–{end:%d.%m}",
         f"неделя {'А' if week == 0 else 'Б'} · синие — уроки, зелёные — вне школы", other,
     )  # fmt: skip
+
+
+# ---------- разовая загрузка расписания владелицы из файла (она попросила внести его за неё) ----------
+
+SEED_FILE = Path(__file__).resolve().parent.parent / "data" / "owner_timetable.txt"
+SEED_ANCHOR = "2026-10-12"  # неделя, на которой идут первые варианты «ИЛИ»: вторник — химия, пятница — информатика
+
+
+async def seed_owner(uid: int) -> str:
+    """Один раз: если у владелицы ещё нет расписания, берём его из data/owner_timetable.txt."""
+    if not uid or not SEED_FILE.exists() or await notion.get_value("seed:timetable:1"):
+        return "не нужно"
+    if await load(uid):
+        await notion.set_value("seed:timetable:1", "уже было")
+        return "уже было"
+    items = parse(SEED_FILE.read_text(encoding="utf-8"))
+    data = {"anchor": SEED_ANCHOR, "items": items, "bells": True}
+    await save(uid, data)
+    slots = await sync_main_schedule(uid, data)
+    await notion.set_value("seed:timetable:1", f"{len(items)} занятий")
+    return f"загружено: {len(items)} занятий, строк в основном расписании: {slots}"

@@ -139,6 +139,18 @@ async def run():
     await scheduler.tick(app.bot, [42, 77], now=moscow)
     bells = [t for t in h.texts(chat=42) if t.startswith("🔔 Через 5 минут")]
     assert len(bells) == 1 and not [t for t in h.texts(chat=77) if t.startswith("🔔")]
+    # 8. разовая загрузка расписания владелицы из data/owner_timetable.txt
+    real = timetable.parse(timetable.SEED_FILE.read_text(encoding="utf-8"))
+    assert len(real) == 30 and len(timetable.alternatives({"items": real})) == 2
+    h.service.pop("timetable:42", None)
+    h.service.pop("seed:timetable:1", None)
+    slots.clear()
+    result = await timetable.seed_owner(42)
+    assert result.startswith("загружено: 30") and (await timetable.load(42))["anchor"] == timetable.SEED_ANCHOR
+    assert await timetable.seed_owner(42) == "не нужно", "только один раз"
+    seeded = await timetable.load(42)
+    tue = [i["title"] for i in timetable.for_day(seeded, date(2026, 10, 13))]
+    assert "Химия" in tue and "Биология" not in tue, tue
     print("timetable OK")
 
 
