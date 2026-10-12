@@ -151,6 +151,43 @@ async def run():
     seeded = await timetable.load(42)
     tue = [i["title"] for i in timetable.for_day(seeded, date(2026, 10, 13))]
     assert "Химия" in tue and "Биология" not in tue, tue
+    # 9. репетиторы пн/ср: по часу, ссылка за 5 минут до начала, «сделала домашку?» после
+    h.service.pop("seed:timetable:2", None)
+    assert (await timetable.upgrade_owner(42)).startswith("репетиторы")
+    assert await timetable.upgrade_owner(42) == "не нужно"
+    data = await timetable.load(42)
+    tutors = [i for i in data["items"] if i["days"] == ["Пн", "Ср"]]
+    assert [(i["start"], i["end"], i["homework"]) for i in tutors] == [("14:00", "15:00", True), ("16:00", "17:00", True), ("18:00", "19:00", True)]
+    assert not any(i.get("link") for i in data["items"] if i["days"] != ["Пн", "Ср"]), "ссылки только у репетиторов"
+    mon = lambda hh, mm: datetime(2026, 10, 19, hh, mm, tzinfo=timezone.utc)  # noqa: E731
+    (key, text), = timetable.due_joins(data, mon(13, 55))
+    assert "Китайский (14:00–15:00)" in text and "telemost.yandex.ru" in text and key == "join:2026-10-19:14:00"
+    assert timetable.due_joins(data, mon(13, 50)) == [] and timetable.due_joins(data, mon(14, 0)) == []
+    assert [i["title"] for _, i in timetable.due_homework(data, mon(15, 0))] == ["Китайский"]
+    assert timetable.due_homework(data, mon(14, 55)) == []
+    notes = []
+
+    async def create_idea(title, source, tags, blocks, details, author_id=0, author="", when=None, ai_type=None):
+        notes.append((title, when, ai_type))
+        return "f" * 32, "u"
+
+    async def set_type(pid, name):
+        pass
+    notion.create_idea, notion.set_type = create_idea, set_type
+    await app.process_update(h.callback("hw:y:1400"))
+    assert "Домашка по «Китайский» сделана" in h.texts("editMessageText")[-1]
+    await app.process_update(h.callback("hw:n:1800"))
+    await app.process_update(h.callback("hw:l:1800:2h"))
+    assert notes and notes[-1][0] == "Домашка: Обществознание" and notes[-1][2] == "⏰ Напоминание"
+    await app.process_update(h.callback("hw:y:1400", user=h.person(77, "Аня")))
+    assert len(notes) == 1
+    # через планировщик: ссылка и вопрос приходят по одному разу
+    timetable._cache.clear()
+    for t in (datetime(2026, 10, 19, 10, 55, tzinfo=timezone.utc), datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)):  # 13:55 и 15:00 МСК
+        await scheduler.tick(app.bot, [42], now=t)
+        await scheduler.tick(app.bot, [42], now=t)
+    assert len([t for t in h.texts(chat=42) if t.startswith("🔗 Через 5 мин: Китайский")]) == 1
+    assert len([t for t in h.texts(chat=42) if "Сделала домашку?" in t]) == 1
     print("timetable OK")
 
 

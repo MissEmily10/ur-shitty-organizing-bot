@@ -260,13 +260,24 @@ async def _bells(bot: Bot, uid: int, now: datetime) -> list[str]:
     if not data or not data.get("bells", True):
         return []
     sent = []
-    for key, text in timetable.due_bells(data, now):
+    for key, text in timetable.due_bells(data, now) + timetable.due_joins(data, now):
         if await is_done(key):
             continue
         await mark_done(key)
-        await bot.send_message(uid, text)
+        await bot.send_message(uid, text, disable_web_page_preview=True)
+        sent.append(key)
+    for key, item in timetable.due_homework(data, now):
+        if await is_done(key):
+            continue
+        await mark_done(key)
+        await bot.send_message(uid, f"📚 Занятие «{item['title']}» закончилось. Сделала домашку?", reply_markup=homework_markup(item["start"]))
         sent.append(key)
     return sent
+
+
+def homework_markup(start: str) -> InlineKeyboardMarkup:
+    hhmm = start.replace(":", "")
+    return InlineKeyboardMarkup([[Btn("✅ Да", callback_data=f"hw:y:{hhmm}"), Btn("❌ Нет", callback_data=f"hw:n:{hhmm}")]])
 
 
 # ---------- 🔥 горящие дедлайны ----------

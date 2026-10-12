@@ -2614,6 +2614,50 @@ async def on_timetable_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> N
     await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
+# ---------- 📚 «сделала домашку?» после занятия с репетитором ----------
+# callback_data: hw:y:<ЧЧММ> | hw:n:<ЧЧММ> | hw:l:<ЧЧММ>:<2h|ev> (напомнить) | hw:x (не напоминать)
+
+
+async def on_homework_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_owner(uid):
+        await q.answer()
+        return
+    parts = q.data.split(":")
+    action = parts[1]
+    try:
+        data = await timetable.load_cached(uid) or {"items": []}
+        start = f"{parts[2][:2]}:{parts[2][2:]}" if len(parts) > 2 else ""
+        title = next((i["title"] for i in data["items"] if i["start"] == start and i.get("homework")), "занятие")
+        if action == "y":
+            await q.answer()
+            praise = await styles.line(uid, "praise")
+            await _edit(q, f"✅ Домашка по «{title}» сделана. {praise or 'Умница!'}", reply_markup=None)
+        elif action == "n":
+            await q.answer()
+            await q.edit_message_reply_markup(InlineKeyboardMarkup([
+                [Btn("⏰ Напомнить через 2 часа", callback_data=f"hw:l:{parts[2]}:2h")],
+                [Btn("🌙 Напомнить вечером", callback_data=f"hw:l:{parts[2]}:ev"), Btn("Не надо", callback_data="hw:x")],
+            ]))  # fmt: skip
+        elif action == "l":
+            settings = await scheduler.get_settings(uid)
+            now = scheduler.local_now(settings)
+            when = (now + timedelta(hours=2)).replace(second=0, microsecond=0).isoformat() if parts[3] == "2h" else _quick_when("t", now, settings)
+            page_id, url = await notion.create_idea(
+                f"Домашка: {title}", "Текст", ["задача"], [], [], uid, q.from_user.full_name, when=when, ai_type="⏰ Напоминание"
+            )
+            await notion.set_type(page_id, "⏰ Напоминание")
+            await q.answer("Напомню ⏰")
+            await _edit(q, f"⏰ Напомню про домашку по «{title}»: {await _when_label(uid, when)}.", reply_markup=None)
+        else:
+            await q.answer()
+            await _edit(q, "Хорошо, не напоминаю.", reply_markup=None)
+    except Exception as e:
+        log.exception("homework button failed")
+        await _fail(q, e)
+
+
 # ---------- 🔗 пересекающиеся цели: найти и объединить ----------
 # ИИ ищет среди открытых целей, задач и идей группы, которые повторяют друг друга (same) или где одна — часть
 # другой (parent). По каждой группе: объединить в одну новую заметку (старые помечаются «Объединено», не удаляются),
@@ -4356,6 +4400,7 @@ async def set_commands(app: Application) -> None:
         log.info("spheres: %s", await notion.seed_spheres())
         seeded = await timetable.seed_owner(c.OWNER_ID)
         log.info("timetable: %s", seeded)
+        log.info("timetable upgrade: %s", await timetable.upgrade_owner(c.OWNER_ID))
         if seeded.startswith("загружено"):
             text, kb = await _tt_view(c.OWNER_ID)
             await app.bot.send_message(
@@ -4543,6 +4588,7 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("notes", notes_cmd, filters=member))
     app.add_handler(CommandHandler("timetable", timetable_cmd, filters=owner))
     app.add_handler(CallbackQueryHandler(on_timetable_button, pattern=r"^(tt|td2):"))
+    app.add_handler(CallbackQueryHandler(on_homework_button, pattern=r"^hw:"))
     app.add_handler(CallbackQueryHandler(on_browse_button, pattern=r"^nb:"))
     app.add_handler(CallbackQueryHandler(on_card_button, pattern=r"^nc:"))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))

@@ -32,6 +32,7 @@ TIME = r"(\d{1,2})[:.](\d{2})"
 LESSON_RE = re.compile(rf"^{TIME}\s*[-–—]\s*{TIME}\s*[•·.]\s*(\S+)\s*$")  # 9:00-9:45 • 410
 RANGE_RE = re.compile(rf"^{TIME}\s*[-–—]\s*{TIME}\s*[-–—:]\s*(.+)$")  # 19:30 - 20:45 - танцы
 UNTIL_RE = re.compile(rf"^до\s+{TIME}\s*(?:[-–—•:]\s*(.+))?$", re.I)  # До 16:00 - добираюсь
+INLINE_RANGE_RE = re.compile(rf"^{TIME}\s*[-–—]\s*{TIME}\s+(.+)$")  # 14:00-15:00 китайский
 AT_RE = re.compile(rf"^{TIME}\s*(?:[-–—:]\s*)?(.+)$")  # 16:20 - танцы, 14:00 китайский
 NUMBERED_RE = re.compile(r"^([0-9ЗзOО])\s+(.+)$")  # «2 Английский», «З Химия» (З вместо 3)
 SLOT_MARK = "🎒 "  # строки основного расписания, которые сделаны из этого (их бот обновляет сам)
@@ -78,7 +79,10 @@ def parse(text: str) -> list[dict]:
             days, current = found_days, None
             rest = re.split(r"[:\-–—]", line, maxsplit=1)[1] if re.search(r"[:\-–—]", line) else ""
             for part in re.split(r",\s*(?=\d)", rest):
-                if m := AT_RE.match(part.strip()):
+                if m := INLINE_RANGE_RE.match(part.strip()):
+                    items.append({"days": days, "start": _hhmm(m[1], m[2]), "end": _hhmm(m[3], m[4]), "title": m[5].strip().capitalize(),
+                                  "room": "", "num": "", "teacher": "", "lesson": True, "week": None})  # fmt: skip
+                elif m := AT_RE.match(part.strip()):
                     items.append({"days": days, "start": _hhmm(m[1], m[2]), "end": "", "title": m[3].strip().capitalize(),
                                   "room": "", "num": "", "teacher": "", "lesson": True, "week": None})  # fmt: skip
             continue
@@ -242,6 +246,36 @@ def due_bells(data: dict, now: datetime) -> list[tuple[str, str]]:
     return out
 
 
+# ---------- ссылка на занятие и «сделала домашку?» (репетиторы) ----------
+
+JOIN_BEFORE = 5  # минут до начала — прислать ссылку на вход
+
+
+def due_joins(data: dict, now: datetime) -> list[tuple[str, str]]:
+    """За 5 минут до занятия со ссылкой — ссылка на вход."""
+    out = []
+    minute = now.hour * 60 + now.minute
+    for item in for_day(data, now.date()):
+        if not (item.get("link") and item["start"]):
+            continue
+        start = _minutes(item["start"])
+        if start - JOIN_BEFORE <= minute < start:
+            time = f"{item['start']}–{item['end']}" if item["end"] else item["start"]
+            out.append((f"join:{now.date().isoformat()}:{item['start']}",
+                        f"🔗 Через {start - minute} мин: {item['title']} ({time})\nВход: {item['link']}"))  # fmt: skip
+    return out
+
+
+def due_homework(data: dict, now: datetime) -> list[tuple[str, dict]]:
+    """Сразу после занятия с отметкой «домашка» — вопрос «сделала домашку?» (в первые 30 минут после конца)."""
+    out = []
+    minute = now.hour * 60 + now.minute
+    for item in for_day(data, now.date()):
+        if item.get("homework") and item["end"] and 0 <= minute - _minutes(item["end"]) < 30:
+            out.append((f"hw:{now.date().isoformat()}:{item['start']}", item))
+    return out
+
+
 # ---------- текст и основное расписание ----------
 
 
@@ -332,3 +366,34 @@ async def seed_owner(uid: int) -> str:
     slots = await sync_main_schedule(uid, data)
     await notion.set_value("seed:timetable:1", f"{len(items)} занятий")
     return f"загружено: {len(items)} занятий, строк в основном расписании: {slots}"
+
+
+# Пн и ср — занятия с репетиторами по часу: ссылка на вход за 5 минут и «сделала домашку?» после
+TUTOR_LINKS = {
+    "14:00": "https://telemost.yandex.ru/j/61862118303727",  # китайский
+    "16:00": "https://chattern.ru/duo?rid=D-KzCkJaQW",  # подписана владелицей как «математика»
+    "18:00": "https://m1qa3quv.ktalk.ru/opvjrcj0okbg",  # обществознание
+}
+
+
+def _tutors(data: dict) -> None:
+    for item in data["items"]:
+        if item["days"] == ["Пн", "Ср"] and item["lesson"] and item["start"] in TUTOR_LINKS:
+            if not item["end"]:
+                item["end"] = f"{_minutes(item['start']) // 60 + 1:02d}:{item['start'][3:]}"
+            item["link"] = TUTOR_LINKS[item["start"]]
+            item["homework"] = True
+
+
+async def upgrade_owner(uid: int) -> str:
+    """Один раз: занятия с репетиторами (пн, ср) — по часу, ссылки на вход, вопрос про домашку."""
+    if not uid or await notion.get_value("seed:timetable:2"):
+        return "не нужно"
+    data = await load(uid)
+    if not data:
+        return "расписания нет"
+    _tutors(data)
+    await save(uid, data)
+    await sync_main_schedule(uid, data)
+    await notion.set_value("seed:timetable:2", "ok")
+    return "репетиторы: по часу, ссылки, домашка"
