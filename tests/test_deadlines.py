@@ -150,7 +150,7 @@ async def run():
     msgs = [t for t in h.texts(chat=42) if t.startswith(("📌", "⏰"))]
     import re
     msgs = [re.sub("<[^>]+>", "", m) for m in msgs]
-    assert [m.split(":")[0] for m in msgs] == ["📌 Завтра срок", "📌 Завтра срок", "⏰ Напоминание", "📌 Сегодня срок", "📌 Через час срок"], msgs
+    assert [m.split("\n")[0] for m in msgs] == ["📌 Завтра срок", "📌 Завтра срок", "⏰ Напоминание", "📌 Сегодня срок", "📌 Через час срок"], msgs
 
     # Перенос срока — напоминания по новому сроку приходят снова
     await set_when(PID, "2026-10-09T15:00:00+03:00")

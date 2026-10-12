@@ -809,7 +809,7 @@ async def _settings_reply(message: Message, prompt: str) -> None:
             return
         await scheduler.update_settings(uid, evening=value)
     text, kb = await _settings_view(uid)
-    await message.reply_text(await styles.wrap(uid, "ok", "Сохранено ✓\n\n" + text), reply_markup=kb)
+    await message.reply_text(await styles.wrap(uid, "ok", "Сохранено ✓\n\n" + text, replace=True), reply_markup=kb)
 
 
 # ---------- приём заметок ----------
@@ -1270,7 +1270,7 @@ async def _review_view(
     group — на шаге 1 выбрана сфера: показываем её проекты."""
     items = await notion.review_items(uid)
     if not items:
-        return await styles.wrap(uid, "all_done", "🎉 Всё разобрано!", html=True), None
+        return await styles.wrap(uid, "all_done", "🎉 Всё разобрано!", html=True, replace=True), None
     if k >= len(items):
         return f"Остальное пропущено. В разборе ещё: {len(items)}.", InlineKeyboardMarkup(
             [[Btn("↩️ Сначала", callback_data="r:0")]]
@@ -1982,7 +1982,7 @@ async def send_overdue(bot, uid: int) -> None:
     settings = await scheduler.get_settings(uid)
     items = await scheduler.overdue(uid, settings)
     if not items:
-        await bot.send_message(uid, await styles.wrap(uid, "empty", "🎉 Просроченного нет!"))
+        await bot.send_message(uid, await styles.wrap(uid, "empty", "🎉 Просроченного нет!", replace=True))
         return
     for item in items[:10]:
         await bot.send_message(
@@ -2101,7 +2101,7 @@ def _tidy_summary(applied: list[int]) -> str:
     if not any(applied):
         return "Ничего не меняла. Захочешь — /tidy."
     parts = [f"заметок разложено: {notes}"] + ([f"новых проектов: {new}"] if new else []) + ([f"сфер проставлено: {areas}"] if areas else [])
-    return "✅ Готово — " + ", ".join(parts) + ".\nВсё видно в /projects и в Notion.\nПроверить, не повторяют ли цели друг друга: /overlaps"
+    return "✅ Готово!\n" + ", ".join(parts) + ".\nВсё видно в /projects и в Notion.\nПроверить, не повторяют ли цели друг друга: /overlaps"
 
 
 async def tidy_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2131,7 +2131,7 @@ async def on_tidy_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await _edit(q, "🧹 Смотрю заметки и проекты…", reply_markup=None)
             plan = await _tidy_build(uid)
             if not plan:
-                await _edit(q, await styles.wrap(uid, "empty", "🎉 Всё уже разложено по проектам и сферам — менять нечего."), reply_markup=None)
+                await _edit(q, await styles.wrap(uid, "empty", "🎉 Всё уже разложено.\nЗаметки по проектам и сферам — менять нечего.", replace=True), reply_markup=None)
                 return
             _tidy[uid] = plan
             kb = InlineKeyboardMarkup([
@@ -2150,7 +2150,7 @@ async def on_tidy_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             for step in plan["steps"][plan["i"]:]:
                 await _tidy_apply(q.get_bot(), uid, step, plan["applied"])
             _tidy.pop(uid, None)
-            await _edit(q, await styles.wrap(uid, "ok", _tidy_summary(plan["applied"])), reply_markup=None)
+            await _edit(q, await styles.wrap(uid, "ok", _tidy_summary(plan["applied"]), replace=True), reply_markup=None)
             return
         if action in ("y", "s"):
             if action == "y":
@@ -2159,7 +2159,7 @@ async def on_tidy_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer("Готово ✓" if action == "y" else "Пропущено")
             if plan["i"] >= len(plan["steps"]):
                 _tidy.pop(uid, None)
-                await _edit(q, await styles.wrap(uid, "ok", _tidy_summary(plan["applied"])), reply_markup=None)
+                await _edit(q, await styles.wrap(uid, "ok", _tidy_summary(plan["applied"]), replace=True), reply_markup=None)
                 return
         else:
             await q.answer()
@@ -2228,7 +2228,7 @@ async def _browse_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     status = "закрытые" if state["closed"] else "открытые"
     head = f"📒 <b>Заметки: {escape(state['title'])}</b> · {status} · {len(items)}{'+' if len(items) >= 100 else ''}"
     if not chunk:
-        text = head + "\n\n" + await styles.wrap(uid, "empty", "Здесь пока пусто.", html=True)
+        text = head + "\n\n" + await styles.wrap(uid, "empty", "Здесь пока пусто.", html=True, replace=True)
     else:
         lines = [f"{page * BROWSE_PAGE + k}. {_note_line(it, None)}" for k, it in enumerate(chunk, 1)]
         text = head + (f" · стр. {page + 1}/{pages}" if pages > 1 else "") + "\n\n" + "\n".join(lines) + "\n\nНажми номер — карточка заметки."
@@ -2425,7 +2425,7 @@ async def _sphere_feed_view(uid: int, key: str) -> tuple[str, InlineKeyboardMark
     notes = notes[:FEED_SIZE]
     title = area["name"] if area else "📁 Без сферы"
     if not notes:
-        text = f"📰 <b>{escape(title)}</b>\n\n" + await styles.wrap(uid, "empty", "Заметок в проектах этой сферы пока нет.", html=True)
+        text = f"📰 <b>{escape(title)}</b>\n\n" + await styles.wrap(uid, "empty", "Пусто.\nЗаметок в проектах этой сферы пока нет.", html=True, replace=True)
     else:
         lines = [
             f'{i}. <a href="{it["url"]}">{escape(it["title"])}</a> — 📁 {escape(it.get("project") or "")}'
@@ -2598,7 +2598,7 @@ async def on_overlap_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
             groups = await ai.find_overlaps(await _goal_labels(uid, items))
             fresh = [g for g in groups if not await notion.get_value(_signature([items[n - 1]["id"] for n in g["n"]]))]
             if not fresh:
-                await _edit(q, await styles.wrap(uid, "empty", "🎉 Пересечений не нашла: цели не повторяют друг друга.\nЕсли заметила сама — «✋ Отмечу сама»."),
+                await _edit(q, await styles.wrap(uid, "empty", "🎉 Пересечений не нашла.\nЦели не повторяют друг друга. Если заметила сама — «✋ Отмечу сама».", replace=True),
                             reply_markup=InlineKeyboardMarkup([[Btn("✋ Отмечу сама", callback_data="og:man")]]))  # fmt: skip
                 return
             state = _overlaps[uid] = {"items": items, "groups": fresh, "i": 0, "picked": set()}
@@ -2797,7 +2797,7 @@ async def on_checkin_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
             await q.answer()
             state = await _new_batch(uid)
             if not state["items"]:
-                await q.message.reply_text(await styles.wrap(uid, "empty", "🎉 Разбирать нечего!"))
+                await q.message.reply_text(await styles.wrap(uid, "empty", "🎉 Разбирать нечего!", replace=True))
                 return
             text, kb = _batch_view(state)
             sent = await q.message.reply_text(text, reply_markup=kb)
@@ -2900,7 +2900,7 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer()
         if not state["items"]:
             _batches.pop(key, None)
-            await _edit(q, await styles.wrap(uid, "all_done", "🎉 Всё разобрано!"))
+            await _edit(q, await styles.wrap(uid, "all_done", "🎉 Всё разобрано!", replace=True))
             return
         text, kb = _batch_view(state)
     except Exception as e:
@@ -3481,7 +3481,7 @@ async def _project_desc_reply(message: Message, prompt: str) -> None:
         return
     await notion.update_project(project["id"], description=message.text)
     text, kb = await _project_card(message.chat_id, await notion.get_project(project["id"]))
-    await message.reply_text(await styles.wrap(message.chat_id, "ok", "Описание сохранено ✓\n\n" + text, html=True), reply_markup=kb, parse_mode=ParseMode.HTML)
+    await message.reply_text(await styles.wrap(message.chat_id, "ok", "Описание сохранено ✓\n\n" + text, html=True, replace=True), reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 async def _area_reply(message: Message, raw: str) -> str:
@@ -4282,7 +4282,11 @@ async def _ask(message: Message, prompt: str, **placeholder) -> Message:
 async def _ack(q, default: str = "Сохранено ✓") -> None:
     """Короткое «готово» на нажатие кнопки — в стиле человека, если стиль выбран."""
     phrase = await styles.line(q.from_user.id, "ok")
-    await q.answer(f"{phrase} {default}".strip() if phrase else default)
+    if not phrase:
+        await q.answer(default)
+    else:
+        # «Сохранено» говорит то же, что реплика стиля, — оставляем одну; конкретику («→ Проект») — дописываем
+        await q.answer(phrase if default == "Сохранено ✓" else f"{phrase} {default}")
 
 
 async def _fail(q, error: Exception) -> None:

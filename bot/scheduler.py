@@ -154,14 +154,14 @@ async def _evening_run(bot: Bot, uid: int, now: datetime) -> str:
     late = await overdue(uid, await get_settings(uid), now)
     if not items and not late:
         return "разбирать нечего"
-    lines, buttons = [], []
+    lines, buttons = ["🌙 Вечерний разбор"], []
     if items:
-        lines.append(f"🌙 Вечерний разбор: заметок без категории {len(items)}")
+        lines.append(f"Заметок без категории: {len(items)}")
         buttons.append(Btn("Разобрать", callback_data="r:0"))
     if late:
         lines.append(f"🔥 Просрочено: {len(late)}")
         buttons.append(Btn("🔥 Показать", callback_data="ov"))
-    text = await styles.wrap(uid, "evening", "\n".join(lines))
+    text = await styles.wrap(uid, "evening", "\n".join(lines), replace=True)
     await push(bot, uid, "evening", text, InlineKeyboardMarkup([buttons]))
     return f"пуш: разбор {len(items)}, просрочено {len(late)}"
 
@@ -231,12 +231,16 @@ async def _reminders(bot: Bot, uid: int, now: datetime, settings: dict) -> list[
             if await is_done(key):
                 continue
             await mark_done(key)
-            text = f'{label}: <a href="{item["url"]}">{escape(item["title"])}</a> — {escape(human(item["when"], local))}'
+            link = f'<a href="{item["url"]}">{escape(item["title"])}</a> — {escape(human(item["when"], local))}'
             if kind == "after":
-                text += "\nЗадача закрыта?"
+                # «Срок прошёл» — смысл, а не обёртка: реплика стиля сверху, текст как есть
+                text = await styles.wrap(uid, "reminder", f"{label}: {link}\nЗадача закрыта?", html=True)
+            else:
+                # Первая строка «📌 Завтра срок» заменяется репликой стиля; когда — видно по дате в ссылке
+                text = await styles.wrap(uid, "reminder", f"{label}\n{link}", html=True, replace=True)
             await bot.send_message(
                 uid,
-                await styles.wrap(uid, "reminder", text, html=True),
+                text,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
                 reply_markup=closed_markup(item["id"]) if kind == "after" else reminder_markup(item["id"]),
@@ -262,7 +266,7 @@ async def hot_items(uid: int, now: datetime) -> list[dict]:
 async def hot_view(uid: int, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]:
     items = await hot_items(uid, now)
     if not items:
-        return await styles.wrap(uid, "empty", "🎉 Горящих дедлайнов нет: всё просроченное закрыто, на сегодня и завтра сроков нет.", html=True), None
+        return await styles.wrap(uid, "empty", "🎉 Горящих дедлайнов нет.\nВсё просроченное закрыто, на сегодня и завтра сроков нет.", html=True, replace=True), None
     lines, rows = [], []
     for n, item in enumerate(items[:HOT_LIMIT], 1):
         late = _deadline(item["when"], now) < now
@@ -340,8 +344,8 @@ async def _checkin_run(bot: Bot, uid: int, now: datetime) -> str:
         uid,
         "checkin",
         await styles.wrap(uid, "checkin",
-            f"☀️ Неразобранных заметок: {len(items)}. Сколько у тебя сейчас времени?\n"
-            "⚡ пара минут — пробежимся по актуальности\n📦 побольше — разберём пачкой\n🌙 нет — всё подождёт вечера"),
+            f"☀️ Есть минутка разобрать заметки?\nНеразобранных заметок: {len(items)}. Сколько у тебя сейчас времени?\n"
+            "⚡ пара минут — пробежимся по актуальности\n📦 побольше — разберём пачкой\n🌙 нет — всё подождёт вечера", replace=True),
         checkin_markup(),
     )
     return f"чек-ин, заметок {len(items)}"
@@ -411,7 +415,7 @@ async def _mood_run(bot: Bot, uid: int, now: datetime) -> str:
     day = now.date().isoformat()
     if (await notion.moods(uid)).get(day, (None, ""))[0]:
         return "уже отмечено"
-    await bot.send_message(uid, await styles.wrap(uid, "mood", "😊 Как настроение сегодня?"), reply_markup=mood_markup(day))
+    await bot.send_message(uid, await styles.wrap(uid, "mood", "😊 Как настроение сегодня?", replace=True), reply_markup=mood_markup(day))
     return "спросили настроение"
 
 
@@ -470,8 +474,8 @@ async def _tidy_run(bot: Bot, uid: int, now: datetime) -> str:
         return "только владелице"
     await bot.send_message(
         uid,
-        await styles.wrap(uid, "greeting",
-            "🧹 Доброе утро! Предлагаю аккуратно навести порядок: разложить заметки без проекта по сферам и проектам "
+        await styles.wrap(uid, "greeting", replace=True, text=
+            "🧹 Доброе утро!\nПредлагаю аккуратно навести порядок: разложить заметки без проекта по сферам и проектам "
             "(📚 Образование, 📷 Фотография, 💼 Работа, 🏠 Бытовое…). Сначала покажу план — без твоего ✅ ничего не трону."),
         reply_markup=InlineKeyboardMarkup([[Btn("🧹 Показать план", callback_data="td:plan"), Btn("Не сейчас", callback_data="td:no")]]),
     )
