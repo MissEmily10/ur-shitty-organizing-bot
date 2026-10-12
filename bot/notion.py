@@ -574,6 +574,44 @@ async def notes_without_project(user_id: int, limit: int = 80) -> list[dict]:
     return [_item(p) for p in data["results"]][:limit]
 
 
+async def browse_notes(
+    user_id: int, project_ids: list[str] | None = None, type_name: str | None = None, done: bool | None = False, limit: int = 100
+) -> list[dict]:
+    """Свои заметки для «📒 Все заметки», новые первыми. project_ids: None — любые, [] — без проекта, иначе — в этих
+    проектах; done: False — открытые, True — закрытые, None — все. Объединённые не показываются."""
+    await _load_projects()
+    conds = [{"property": c.P_MERGED, "checkbox": {"equals": False}}, _by_author(user_id)]
+    if done is not None:
+        conds.append({"property": c.P_DONE, "checkbox": {"equals": done}})
+    if type_name:
+        conds.append({"property": c.P_TYPE, "select": {"equals": type_name}})
+    if project_ids is not None:
+        if project_ids:
+            conds.append({"or": [{"property": c.P_PROJECT, "relation": {"contains": pid}} for pid in project_ids[:100]]})
+        else:
+            conds.append({"property": c.P_PROJECT, "relation": {"is_empty": True}})
+    data = await _call(
+        "POST", f"/databases/{await db_id()}/query",
+        {"filter": {"and": conds}, "sorts": [{"timestamp": "created_time", "direction": "descending"}], "page_size": min(limit, 100)},
+    )  # fmt: skip
+    return [{**_item(p), "created": p["created_time"][:10]} for p in data["results"]]
+
+
+async def notes_in_projects(project_ids: list[str], limit: int = 40) -> list[dict]:
+    """Последние заметки всех авторов в этих проектах (лента сферы). Кому что показывать, решает вызывающий."""
+    if not project_ids:
+        return []
+    await _load_projects()
+    data = await _call(
+        "POST", f"/databases/{await db_id()}/query",
+        {"filter": {"and": [
+            {"property": c.P_MERGED, "checkbox": {"equals": False}},
+            {"or": [{"property": c.P_PROJECT, "relation": {"contains": pid}} for pid in project_ids[:100]]},
+        ]}, "sorts": [{"timestamp": "created_time", "direction": "descending"}], "page_size": min(limit, 100)},
+    )  # fmt: skip
+    return [{**_item(p), "created": p["created_time"][:10]} for p in data["results"]]
+
+
 NOT_GOALS = re.compile(r"быстр|референс|напомин|событ|встреч", re.I)
 
 

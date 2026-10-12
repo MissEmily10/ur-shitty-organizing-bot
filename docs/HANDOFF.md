@@ -67,6 +67,15 @@ Telegram-бот «организатор мыслей»: заметки (тек�
   в harness убрана из JOBS — `h.TIDY_JOB`). - 🔗 Похожие цели (17): `ai.find_overlaps` (проверяет ответ), `ai.merge_notes`, `notion.open_goals`, `notion.mark_merged`
   (колонка «Объединено»), в `main.py` раздел «🔗 пересекающиеся цели» (`og:`, состояние `_overlaps`, «это разное» —
   `distinct:<хэш id>` в «Служебном»), субботняя задача `overlaps` (в harness убрана — `h.OVERLAPS_JOB`).
+- Меню (уточнение): `/start` = тур, `/menu` = `send_menu`; разделы — `async _section` (spheres, projects, types, notes, ai,
+  plan, help, team), сфера — `_sphere_view` (`m:sp:<n>`). При новой кнопке раздела — описать её строкой в тексте раздела
+  (тест навигации проверяет).
+- 📒 Все заметки: `notion.browse_notes`, раздел «📒 все заметки» в `main.py` (`nb:` список и фильтры, состояние `_browse`;
+  `nc:` карточка заметки; срок из карточки — `w:<page>:c`). Лента по сферам: `notion.notes_in_projects`, `_sphere_feed_view`
+  (`fd:s:<n>`, `fd:all`).
+- Стиль везде: ключи `ok`, `empty`, `ask` в `styles.KEYS`; `_ack(q)` для всплывашек, `_ask(message, PROMPT, ...)` для вопросов
+  (реплика стиля в конце; `on_text` узнаёт ответ через `asked(...)` по началу текста). Стилевые баннеры: `banners.get(section, style)`,
+  выкройка `banners.template_png()` → `design/templates/`.
 - `team.py` — 👥 сводки командных проектов (по кнопке и задача `team_summary` в понедельник).
 - `report.py` + `weekly.py` — недельный отчёт (Pillow). `documents.py` — PDF/Word/Excel/CSV/TXT.
 - Оформление картинок и PDF — `design/tokens.json` + шрифт PT Sans в `design/fonts/` (временное, под её дизайн).

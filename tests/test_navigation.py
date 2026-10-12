@@ -40,46 +40,54 @@ async def run():
     main.HINT_TIMES = 3
     app = await h.make_app()
 
-    # 1. первый /start — знакомство, «Дальше», «Пропустить»; потом меню
+    # 1. /start — всегда знакомство; в конце «📋 Открыть меню»
     await app.process_update(h.text("/start"))
     assert "1 из 5" in h.texts(chat=42)[-1] and "Дальше ▶️" in buttons(last("sendMessage"))
     await app.process_update(h.callback("tour:1"))
     assert "2 из 5" in last("editMessageText")["text"]
     await app.process_update(h.callback("tour:4"))
-    assert buttons(last("editMessageText")) == ["🚀 Начать"]
+    assert buttons(last("editMessageText")) == ["📋 Открыть меню"]
     await app.process_update(h.callback("tour:end"))
-    assert "📥 Заметки" in buttons(last("sendMessage"))
-    # второй раз — сразу меню
+    assert "🗂 Сферы" in buttons(last("sendMessage"))
     await app.process_update(h.text("/start"))
-    menu_msg = last("sendMessage")
-    assert "📥 Заметки" in buttons(menu_msg) and "👥 Команда" in buttons(menu_msg)
-    await app.process_update(h.text("/tour"))
-    assert "1 из 5" in h.texts(chat=42)[-1]
+    assert "1 из 5" in h.texts(chat=42)[-1], "/start — снова знакомство, не меню"
 
-    # 2. разделы открываются в том же сообщении, у каждой кнопки строка пояснения, «↩️ В меню» возвращает
-    await app.process_update(h.callback("m:s:notes", message_text="меню"))
-    section = last("editMessageText")
-    assert "Куда писать</b> — " in section["text"] and "↩️ В меню" in buttons(section)
-    for name in ("projects", "ai", "plan", "help", "team"):
+    # 2. /menu — главные разделы в нужном порядке
+    await app.process_update(h.text("/menu"))
+    menu_msg = last("sendMessage")
+    assert buttons(menu_msg) == ["🗂 Сферы", "📁 Проекты", "🏷 Типы", "📒 Все заметки", "🤖 ИИ", "🗓 Планы",
+                                 "⚙️ Настройки", "🧭 Навигация", "👥 Команда"], buttons(menu_msg)
+    assert "/notes" in menu_msg["text"] and "/feed" in menu_msg["text"]
+
+    # 3. разделы открываются в том же сообщении, у каждой постоянной кнопки строка пояснения, «↩️ В меню» возвращает
+    async def spheres():
+        return [{"id": "a" * 32, "name": "📚 Образование", "description": "учёба"}]
+    notion.spheres = spheres
+    dynamic = {"spheres": ["📚 Образование"], "types": h.TYPES}
+    for name in ("spheres", "projects", "types", "notes", "ai", "plan", "help", "team"):
         await app.process_update(h.callback(f"m:s:{name}", message_text="меню"))
-        text = last("editMessageText")["text"]
-        # каждая кнопка раздела описана в тексте
-        for label in buttons(last("editMessageText"))[:-1]:
-            assert label.split(" ", 1)[1] in re.sub(r"<[^>]+>", "", text), (name, label)
+        section = last("editMessageText")
+        text = re.sub(r"<[^>]+>", "", section["text"])
+        assert buttons(section)[-1] == "↩️ В меню", (name, buttons(section))
+        for label in buttons(section)[:-1]:
+            if label not in dynamic.get(name, []):
+                assert label.split(" ", 1)[1] in text, (name, label)
     await app.process_update(h.callback("m:home", message_text="раздел"))
     assert "/razbor" in last("editMessageText")["text"]
+    # сфера → её проекты, лента и заметки
+    await app.process_update(h.callback("m:sp:0", message_text="меню"))
+    assert "📚 Образование" in last("editMessageText")["text"] and "📰 Лента" in buttons(last("editMessageText"))
 
-    # 3. у участницы нет раздела «Команда»
+    # 4. у участницы нет раздела «Команда»
     main.member.add_user_ids(77)
     anya = h.person(77, "Аня")
-    scheduler._settings_cache[77] = (asyncio.get_running_loop().time(), {**scheduler.DEFAULT_SETTINGS, "toured": True})
-    await app.process_update(h.text("/start", user=anya))
+    await app.process_update(h.text("/menu", user=anya))
     assert "👥 Команда" not in buttons(last("sendMessage"))
     count = len(h.sent)
     await app.process_update(h.callback("m:s:team", message_text="меню", user=anya))
     assert not any(e == "editMessageText" for e, _ in h.sent[count:])
 
-    # 4. подсказки: первые 3 раза сами, потом только по кнопке «❔»
+    # 5. подсказки: первые 3 раза сами, потом только по кнопке «❔»
     for i in range(4):
         await app.process_update(h.text("/razbor"))
         card = h.texts(chat=42)[-1]

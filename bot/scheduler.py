@@ -113,9 +113,11 @@ async def mark_done(key: str) -> None:
 
 async def push(bot: Bot, uid: int, section: str, text: str, markup=None, parse_mode=None) -> None:
     """Сообщение по расписанию: с картинкой раздела, если у человека меню с картинками, иначе текстом."""
-    if (await get_settings(uid)).get("banners") and len(text) <= 1000:
-        msg = await bot.send_photo(uid, await banners.get(section), caption=text, reply_markup=markup, parse_mode=parse_mode)
-        banners.remember(section, msg)
+    settings = await get_settings(uid)
+    if settings.get("banners") and len(text) <= 1000:
+        style = settings.get("style")
+        msg = await bot.send_photo(uid, await banners.get(section, style), caption=text, reply_markup=markup, parse_mode=parse_mode)
+        banners.remember(section, msg, style)
         return
     await bot.send_message(uid, text, reply_markup=markup, parse_mode=parse_mode)
 
@@ -260,7 +262,7 @@ async def hot_items(uid: int, now: datetime) -> list[dict]:
 async def hot_view(uid: int, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]:
     items = await hot_items(uid, now)
     if not items:
-        return "🎉 Горящих дедлайнов нет: всё просроченное закрыто, на сегодня и завтра сроков нет.", None
+        return await styles.wrap(uid, "empty", "🎉 Горящих дедлайнов нет: всё просроченное закрыто, на сегодня и завтра сроков нет.", html=True), None
     lines, rows = [], []
     for n, item in enumerate(items[:HOT_LIMIT], 1):
         late = _deadline(item["when"], now) < now

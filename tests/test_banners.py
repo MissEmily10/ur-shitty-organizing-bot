@@ -44,7 +44,7 @@ async def run():
     app = await h.make_app()
 
     # 1. /start — картинка с короткой подписью и кнопками, полный список команд — кнопкой
-    await app.process_update(h.text("/start"))
+    await app.process_update(h.text("/menu"))
     start = last("sendPhoto")
     assert start["caption"] == main.MENU_SHORT and "📜 Все команды" in keys(start)
     await app.process_update(h.callback("m:help", photo=True))
@@ -110,7 +110,7 @@ async def run():
 
     # 8. выключить картинки — снова текстовое меню
     await app.process_update(h.callback("st:bn"))
-    await app.process_update(h.text("/start"))
+    await app.process_update(h.text("/menu"))
     assert h.sent[-1][0] == "sendMessage" and "/razbor" in h.sent[-1][1]["text"]
     print("banners OK")
 

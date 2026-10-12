@@ -614,7 +614,7 @@ async def art_director(image: bytes, palette: list[tuple[str, float]], context: 
 
 GUIDE_FILE = Path(__file__).resolve().parent.parent / "docs" / "GUIDE.md"
 HELP_PROMPT = """Ты справка Telegram-бота для заметок. Ответь на вопрос пользователя коротко, по шагам и только по справке ниже.
-Называй команды и кнопки точно так, как в справке. Если в справке ответа нет, честно скажи и предложи /start.
+Называй команды и кнопки точно так, как в справке. Если в справке ответа нет, честно скажи и предложи /menu.
 
 {guide}
 
@@ -623,7 +623,7 @@ HELP_PROMPT = """Ты справка Telegram-бота для заметок. О
 
 async def help_answer(question: str) -> str:
     guide = GUIDE_FILE.read_text(encoding="utf-8")
-    return await _complete(HELP_PROMPT.format(guide=guide, question=question[:1000]), 1200) or "🤷 Не нашёл ответа. Загляните в /start."
+    return await _complete(HELP_PROMPT.format(guide=guide, question=question[:1000]), 1200) or "🤷 Не нашёл ответа. Загляните в /menu."
 
 
 # ---------- 🧹 навести порядок ----------
