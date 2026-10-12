@@ -481,9 +481,10 @@ def _json_object(raw: str) -> dict:
 
 async def parse_schedule(text: str, base: str, now: datetime, routine: bool) -> dict:
     """Расписание или изменение словами → план изменений для schedule.apply."""
-    prompt = SCHEDULE_PROMPT.format(now=_now_text(now), base=base, text=text[:2000], task=ROUTINE_TASK if routine else CHANGE_TASK)
+    # Расписание на неделю целиком легко длиннее 2000 символов: раньше хвост (пятница, суббота) отрезался
+    prompt = SCHEDULE_PROMPT.format(now=_now_text(now), base=base, text=text[:8000], task=ROUTINE_TASK if routine else CHANGE_TASK)
     response = await _client().chat_completion(
-        model=c.VISION_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=1500, temperature=0
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=4000, temperature=0
     )
     plan = _json_object(response.choices[0].message.content or "")
     clean = {"replace_base": bool(plan.get("replace_base")) and routine}

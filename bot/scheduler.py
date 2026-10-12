@@ -19,7 +19,7 @@ from telegram import Bot
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup
 
-from . import banners, notion, styles, team, weekly
+from . import banners, notion, styles, team, timetable, weekly
 from . import config as c
 from .whenparse import human
 
@@ -246,6 +246,26 @@ async def _reminders(bot: Bot, uid: int, now: datetime, settings: dict) -> list[
                 reply_markup=closed_markup(item["id"]) if kind == "after" else reminder_markup(item["id"]),
             )
             sent.append(f"{kind} {item['title'][:20]}")
+    return sent
+
+
+# ---------- 🎒 звонки по индивидуальному расписанию ----------
+
+
+async def _bells(bot: Bot, uid: int, now: datetime) -> list[str]:
+    """За 5 минут до конца урока — куда идти дальше. Только у владелицы и только если расписание загружено."""
+    if uid != c.OWNER_ID:
+        return []
+    data = await timetable.load_cached(uid)
+    if not data or not data.get("bells", True):
+        return []
+    sent = []
+    for key, text in timetable.due_bells(data, now):
+        if await is_done(key):
+            continue
+        await mark_done(key)
+        await bot.send_message(uid, text)
+        sent.append(key)
     return sent
 
 
@@ -521,6 +541,8 @@ async def tick(bot: Bot, user_ids: list[int], now: datetime | None = None, force
                 if not force:
                     for item in await _reminders(bot, uid, now or datetime.now(timezone.utc), settings):
                         report.append(f"{uid} напоминание: {item}")
+                    for item in await _bells(bot, uid, current):
+                        report.append(f"{uid} звонок: {item}")
             except Exception as e:
                 # Один заблокировавший бота человек или сбой Notion не должен оставить остальных без уведомлений
                 log.exception("tick failed for %s", uid)

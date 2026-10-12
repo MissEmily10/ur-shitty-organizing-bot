@@ -79,6 +79,10 @@ Telegram-бот «организатор мыслей»: заметки (тек�
 - Стиль везде: ключи `ok`, `empty`, `ask` в `styles.KEYS`; `_ack(q)` для всплывашек, `_ask(message, PROMPT, ...)` для вопросов
   (реплика стиля в конце; `on_text` узнаёт ответ через `asked(...)` по началу текста). Стилевые баннеры: `banners.get(section, style)`,
   выкройка `banners.template_png()` → `design/templates/`.
+- 🎒 Моё расписание (только владелица): `timetable.py` — разбор её формата без ИИ (`parse`), недели А/Б от `anchor`
+  (`week_index`, `swap`), звонки `due_bells` (вызов в `scheduler._bells` на каждом тике), выгрузка в основное
+  расписание с меткой «🎒 » (`sync_main_schedule`), PDF `week_pdf` → `pdf.timetable_pdf`. Данные — `timetable:<uid>` в
+  «Служебном» (НЕ коммитить её расписание: репозиторий публичный). В `main.py` раздел «🎒 моё расписание» (`tt:`, черновик `td2:`).
 - `team.py` — 👥 сводки командных проектов (по кнопке и задача `team_summary` в понедельник).
 - `report.py` + `weekly.py` — недельный отчёт (Pillow). `documents.py` — PDF/Word/Excel/CSV/TXT.
 - Оформление картинок и PDF — `design/tokens.json` + шрифт PT Sans в `design/fonts/` (временное, под её дизайн).

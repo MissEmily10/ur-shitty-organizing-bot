@@ -1,0 +1,312 @@
+"""🎒 Индивидуальное расписание владелицы: уроки (время, кабинет, номер, предмет, преподаватель), занятия вне школы,
+уроки, которые чередуются через неделю («ИЛИ»), звонок за 5 минут до конца урока с тем, куда идти дальше,
+и выгрузка в основное расписание. Хранится в «Служебном» Notion (`timetable:<uid>`), не в коде: репозиторий публичный.
+
+Формат, который понимает разбор (как владелица пишет расписание):
+    понедельник, среда - 14:00 китайский, 16:00 английский
+    вторник:
+    9:00-9:45 • 410
+    2 Английский язык
+    Фамилия Имя Отчество
+    ИЛИ
+    ...
+    До 16:00 - добираюсь до серфа
+    19:30 - 20:45 - танцы
+"""
+
+import json
+import re
+from datetime import date, datetime, timedelta
+
+import asyncio
+
+from . import notion, pdf
+from .notion import KIND_REGULAR, WEEKDAYS
+
+DAY_NAMES = {
+    "понедельник": "Пн", "вторник": "Вт", "среда": "Ср", "среду": "Ср", "четверг": "Чт",
+    "пятница": "Пт", "пятницу": "Пт", "суббота": "Сб", "субботу": "Сб", "воскресенье": "Вс",
+}  # fmt: skip
+TIME = r"(\d{1,2})[:.](\d{2})"
+LESSON_RE = re.compile(rf"^{TIME}\s*[-–—]\s*{TIME}\s*[•·.]\s*(\S+)\s*$")  # 9:00-9:45 • 410
+RANGE_RE = re.compile(rf"^{TIME}\s*[-–—]\s*{TIME}\s*[-–—:]\s*(.+)$")  # 19:30 - 20:45 - танцы
+UNTIL_RE = re.compile(rf"^до\s+{TIME}\s*(?:[-–—•:]\s*(.+))?$", re.I)  # До 16:00 - добираюсь
+AT_RE = re.compile(rf"^{TIME}\s*(?:[-–—:]\s*)?(.+)$")  # 16:20 - танцы, 14:00 китайский
+NUMBERED_RE = re.compile(r"^([0-9ЗзOО])\s+(.+)$")  # «2 Английский», «З Химия» (З вместо 3)
+SLOT_MARK = "🎒 "  # строки основного расписания, которые сделаны из этого (их бот обновляет сам)
+BELL_BEFORE = timedelta(minutes=5)
+
+
+def _hhmm(h: str, m: str) -> str:
+    return f"{int(h):02d}:{m}"
+
+
+def _minutes(hhmm: str) -> int:
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+
+def _days_in(line: str) -> list[str] | None:
+    """«понедельник, среда - …» → ["Пн", "Ср"]; None, если строка не начинается с дня недели."""
+    words = re.findall(r"[а-яё]+", line.lower())
+    if not words or words[0] not in DAY_NAMES:
+        return None
+    days = []
+    for w in words:
+        if w in DAY_NAMES:
+            days.append(DAY_NAMES[w])
+        elif w not in ("и",):
+            break
+    return days
+
+
+def parse(text: str) -> list[dict]:
+    """Текст расписания → список занятий:
+    {"days", "start", "end", "title", "room", "num", "teacher", "lesson": урок ли, "week": None | 0 | 1}.
+    week 0/1 — урок через неделю (первый вариант «ИЛИ» — 0, второй — 1)."""
+    items: list[dict] = []
+    days: list[str] = []
+    current: dict | None = None  # урок, к которому дописываются предмет и преподаватель
+    alternative = False
+    for raw in text.splitlines():
+        line = raw.strip().strip("•").strip()
+        if not line:
+            continue
+        found_days = _days_in(line)
+        if found_days:
+            days, current = found_days, None
+            rest = re.split(r"[:\-–—]", line, maxsplit=1)[1] if re.search(r"[:\-–—]", line) else ""
+            for part in re.split(r",\s*(?=\d)", rest):
+                if m := AT_RE.match(part.strip()):
+                    items.append({"days": days, "start": _hhmm(m[1], m[2]), "end": "", "title": m[3].strip().capitalize(),
+                                  "room": "", "num": "", "teacher": "", "lesson": True, "week": None})  # fmt: skip
+            continue
+        if line.upper() == "ИЛИ":
+            alternative = True
+            continue
+        if m := LESSON_RE.match(line):
+            current = {"days": days, "start": _hhmm(m[1], m[2]), "end": _hhmm(m[3], m[4]), "title": "", "room": m[5],
+                       "num": "", "teacher": "", "lesson": True, "week": None}  # fmt: skip
+            if alternative:
+                prev = next((i for i in reversed(items) if i["lesson"] and i["start"] == current["start"] and i["days"] == days), None)
+                if prev:
+                    prev["week"], current["week"] = 0, 1
+                alternative = False
+            items.append(current)
+            continue
+        if m := UNTIL_RE.match(line):
+            current = {"days": days, "start": "", "end": _hhmm(m[1], m[2]), "title": (m[3] or "").strip(), "room": "",
+                       "num": "", "teacher": "", "lesson": False, "week": None, "until": True}  # fmt: skip
+            items.append(current)
+            if current["title"]:
+                current = None
+            continue
+        if m := RANGE_RE.match(line):
+            items.append({"days": days, "start": _hhmm(m[1], m[2]), "end": _hhmm(m[3], m[4]), "title": m[5].strip(),
+                          "room": "", "num": "", "teacher": "", "lesson": False, "week": None})  # fmt: skip
+            current = None
+            continue
+        if m := AT_RE.match(line):
+            items.append({"days": days, "start": _hhmm(m[1], m[2]), "end": "", "title": m[3].strip(),
+                          "room": "", "num": "", "teacher": "", "lesson": False, "week": None})  # fmt: skip
+            current = None
+            continue
+        if current is None:
+            continue
+        if not current["title"]:
+            if current["lesson"] and (m := NUMBERED_RE.match(line)):
+                current["num"] = {"З": "3", "з": "3", "O": "0", "О": "0"}.get(m[1], m[1])
+                current["title"] = m[2].strip()
+            else:
+                current["title"] = line
+            if not current["lesson"]:
+                current = None
+        elif current["lesson"] and not current["teacher"]:
+            current["teacher"] = line
+    # «До 16:00»: начало — конец предыдущего занятия в тот же день
+    for item in items:
+        if not item["start"]:
+            before = [i for i in items if i["days"] == item["days"] and i["end"] and i["end"] <= item["end"] and i is not item]
+            item["start"] = max((i["end"] for i in before), default="")
+    for item in items:
+        item["title"] = item["title"][:1].upper() + item["title"][1:]
+    return [i for i in items if i["title"]]
+
+
+# ---------- хранение и недели ----------
+
+
+def monday(day: date) -> date:
+    return day - timedelta(days=day.weekday())
+
+
+_cache: dict[int, tuple[float, dict | None]] = {}
+CACHE_TTL = 600  # секунд: планировщик заглядывает каждые 5 минут, Notion лишний раз не дёргаем
+
+
+async def load_cached(uid: int) -> dict | None:
+    now = asyncio.get_running_loop().time()
+    if uid in _cache and now - _cache[uid][0] < CACHE_TTL:
+        return _cache[uid][1]
+    data = await load(uid)
+    _cache[uid] = (now, data)
+    return data
+
+
+async def load(uid: int) -> dict | None:
+    raw = await notion.get_value(f"timetable:{uid}")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+async def save(uid: int, data: dict) -> None:
+    await notion.set_value(f"timetable:{uid}", json.dumps(data, ensure_ascii=False))
+    _cache.pop(uid, None)
+
+
+def week_index(data: dict, day: date) -> int:
+    """0 — неделя первого варианта «ИЛИ», 1 — второго; считается от недели, отмеченной при сохранении."""
+    anchor = date.fromisoformat(data["anchor"])
+    return ((monday(day) - anchor).days // 7) % 2
+
+
+def for_day(data: dict, day: date) -> list[dict]:
+    """Занятия этого дня с учётом чередования, по времени."""
+    weekday, week = WEEKDAYS[day.weekday()], week_index(data, day)
+    items = [i for i in data["items"] if weekday in i["days"] and i["week"] in (None, week)]
+    return sorted(items, key=lambda i: i["start"] or "00:00")
+
+
+def alternatives(data: dict) -> list[tuple[dict, dict]]:
+    """Пары уроков «через неделю»: (вариант 0, вариант 1)."""
+    pairs = []
+    for a in data["items"]:
+        if a["week"] == 0:
+            b = next((i for i in data["items"] if i["week"] == 1 and i["days"] == a["days"] and i["start"] == a["start"]), None)
+            if b:
+                pairs.append((a, b))
+    return pairs
+
+
+def swap(data: dict, k: int) -> None:
+    """Поменять, какой из пары k идёт на неделе отсчёта."""
+    a, b = alternatives(data)[k]
+    a["week"], b["week"] = 1, 0
+
+
+# ---------- звонок: за 5 минут до конца урока ----------
+
+
+def bell_text(current: dict, nxt: dict | None, after: dict | None) -> str:
+    """Сообщение за 5 минут до конца урока: что дальше, где, у кого, сколько перемена."""
+    head = f"🔔 Через 5 минут конец урока «{current['title']}»."
+    if nxt:
+        gap = _minutes(nxt["start"]) - _minutes(current["end"])
+        lines = [head, "", f"Дальше: {(nxt['num'] + ' · ') if nxt['num'] else ''}{nxt['title']}"]
+        if nxt["room"]:
+            lines.append(f"🚪 Кабинет {nxt['room']}")
+        if nxt["teacher"]:
+            lines.append(f"👩‍🏫 {nxt['teacher']}")
+        lines.append(f"⏰ Начало в {nxt['start']} · перемена {gap} мин")
+        return "\n".join(lines)
+    text = head + "\nЭто последний урок на сегодня 🎉"
+    if after:
+        when = f"до {after['end']}" if after.get("until") or not after["start"] else after["start"]
+        text += f"\nДальше: {after['title']}" + (f" ({when})" if when else "")
+    return text
+
+
+def due_bells(data: dict, now: datetime) -> list[tuple[str, str]]:
+    """Звонки, которые пора отправить сейчас: [(ключ отметки, текст)]. Окно — последние 5 минут урока."""
+    today = for_day(data, now.date())
+    out = []
+    minute = now.hour * 60 + now.minute
+    for k, item in enumerate(today):
+        if not (item["lesson"] and item["end"]):
+            continue
+        end = _minutes(item["end"])
+        if not end - BELL_BEFORE.seconds // 60 <= minute < end:
+            continue
+        later = today[k + 1 :]
+        nxt = next((i for i in later if i["lesson"] and i["start"] and _minutes(i["start"]) >= end), None)
+        # следующий урок — только если между ними нет «внешнего» занятия (иначе уроки кончились)
+        if nxt and any(not i["lesson"] and i["start"] and _minutes(i["start"]) < _minutes(nxt["start"]) for i in later):
+            nxt = None
+        after = next((i for i in later if not i["lesson"]), None) if not nxt else None
+        out.append((f"bell:{now.date().isoformat()}:{item['start']}", bell_text(item, nxt, after)))
+    return out
+
+
+# ---------- текст и основное расписание ----------
+
+
+def lesson_line(i: dict) -> str:
+    if i.get("until"):
+        time = f"до {i['end']}"
+    else:
+        time = f"{i['start']}–{i['end']}" if i["start"] and i["end"] else i["start"]
+    bits = [f"{i['num']} · " if i["num"] else "", i["title"]]
+    extra = " · ".join(x for x in (f"каб. {i['room']}" if i["room"] else "", i["teacher"]) if x)
+    return f"{time} — {''.join(bits)}" + (f" ({extra})" if extra else "")
+
+
+def week_text(data: dict, day: date) -> str:
+    start = monday(day)
+    lines = []
+    for d in range(7):
+        current = start + timedelta(days=d)
+        items = for_day(data, current)
+        if not items:
+            continue
+        lines.append(f"\n{WEEKDAYS[d]} {current:%d.%m}")
+        lines += [("🎒 " if i["lesson"] else "📍 ") + lesson_line(i) for i in items]
+    return "\n".join(lines).strip()
+
+
+def main_slots(data: dict) -> list[dict]:
+    """Строки для основного расписания: уроки и занятия по дням; пара «через неделю» — одной строкой «А / Б (чередуются)»."""
+    pairs = {id(a): b for a, b in alternatives(data)}
+    second = {id(b) for b in pairs.values()}
+    slots = []
+    for i in data["items"]:
+        if id(i) in second:
+            continue
+        title = i["title"]
+        if id(i) in pairs:
+            title = f"{i['title']} / {pairs[id(i)]['title']} (чередуются через неделю)"
+        if i["room"]:
+            title += f" · каб. {i['room']}"
+        slots.append({"title": SLOT_MARK + title, "days": i["days"], "start": i["start"], "end": i["end"]})
+    return slots
+
+
+async def sync_main_schedule(uid: int, data: dict) -> int:
+    """Обновляет в основном расписании строки, сделанные из этого (с меткой 🎒): старые убирает, новые добавляет."""
+    for slot in await notion.schedule_slots(uid):
+        if slot["title"].startswith(SLOT_MARK):
+            await notion.remove_slot(slot["page"])
+    slots = main_slots(data)
+    for s in slots:
+        await notion.add_slot(uid, s["title"], KIND_REGULAR, s["start"], s["end"], days=s["days"])
+    return len(slots)
+
+
+def week_pdf(data: dict, day: date) -> bytes:
+    """PDF недели (с понедельника недели day): уроки по дням, у чередующихся — что будет через неделю."""
+    start = monday(day)
+    days = [(start + timedelta(days=i), for_day(data, start + timedelta(days=i))) for i in range(7)]
+    week = week_index(data, start)
+    other = {}
+    for a, b in alternatives(data):
+        hidden = b if week == 0 else a
+        for d in a["days"]:
+            other[(WEEKDAYS.index(d), a["start"])] = hidden["title"]
+    end = start + timedelta(days=6)
+    return pdf.timetable_pdf(
+        days, f"Моё расписание · {start:%d.%m}–{end:%d.%m}",
+        f"неделя {'А' if week == 0 else 'Б'} · синие — уроки, зелёные — вне школы", other,
+    )  # fmt: skip

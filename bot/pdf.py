@@ -182,3 +182,76 @@ def month_pdf(items: list[Occurrence], year: int, month: int, today: date | None
     c.showPage()
     c.save()
     return buf.getvalue()
+
+
+# ---------- 🎒 индивидуальное расписание (уроки по дням, отдельно от основного календаря) ----------
+# Выкройка под дизайн: колонки дней недели, в каждой — карточки занятий сверху вниз. У урока: время, кабинет,
+# номер и предмет, преподаватель; у урока «через неделю» — что будет на другой неделе. Занятия вне школы — другим цветом.
+
+
+def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str, other: dict | None = None) -> bytes:
+    """days — [(дата, занятия этого дня)] в порядке недели; other — {(день недели, начало): название варианта
+    другой недели} для уроков, которые чередуются."""
+    other = other or {}
+    buf = io.BytesIO()
+    c = Canvas(buf, pagesize=(PAGE_W, PAGE_H))
+    _title(c, title, subtitle)
+    days = [d for d in days if d[1]] or days[:5]
+    cols = max(1, len(days))
+    top, bottom = PAGE_H - MARGIN - 40, MARGIN
+    gap = 8
+    col_w = (PAGE_W - 2 * MARGIN - gap * (cols - 1)) / cols
+    rows = max([len(items) for _, items in days] + [1])
+    card_h = min(58, (top - 26 - bottom - 4 * (rows - 1)) / rows)
+    for n, (day, items) in enumerate(days):
+        x = MARGIN + n * (col_w + gap)
+        c.setFillColor(COLORS["header"])
+        c.roundRect(x, top - 20, col_w, 20, 4, stroke=0, fill=1)
+        c.setFillColor(COLORS["text"])
+        c.setFont("Bold", 11)
+        c.drawString(x + 6, top - 14, f"{WEEKDAYS[day.weekday()]} {day.strftime('%d.%m')}")
+        y = top - 26
+        for item in items:
+            lesson = item.get("lesson")
+            fill, border = _box_colors("regular" if lesson else "once")
+            c.setFillColor(fill)
+            c.setStrokeColor(border)
+            c.roundRect(x, y - card_h, col_w, card_h, 4, stroke=1, fill=1)
+            if item.get("until"):
+                time = f"до {item['end']}"
+            else:
+                time = f"{item['start']}–{item['end']}" if item["start"] and item["end"] else item["start"]
+            c.setFillColor(COLORS["text"])
+            c.setFont("Bold", 8)
+            c.drawString(x + 5, y - 10, time)
+            if item.get("room"):
+                c.setFont("Body", 8)
+                c.drawRightString(x + col_w - 5, y - 10, f"каб. {item['room']}")
+            name = (f"{item['num']}. " if item.get("num") else "") + item["title"]
+            line = y - 21
+            bottom_y = y - card_h + 4
+            # Название: в две строки, если места хватает, иначе с «…»
+            words, first = name.split(), ""
+            while words and c.stringWidth((first + " " + words[0]).strip(), "Bold", 9) <= col_w - 10:
+                first = (first + " " + words.pop(0)).strip()
+            c.setFont("Bold", 9)
+            if words and card_h >= 56:
+                c.drawString(x + 5, line, first or _fit(c, name, "Bold", 9, col_w - 10))
+                line -= 10
+                c.drawString(x + 5, line, _fit(c, " ".join(words), "Bold", 9, col_w - 10))
+            else:
+                c.drawString(x + 5, line, _fit(c, name, "Bold", 9, col_w - 10))
+            line -= 9.5
+            c.setFont("Body", 7)
+            c.setFillColor(COLORS["muted"])
+            if item.get("teacher") and line >= bottom_y:
+                c.drawString(x + 5, line, _fit(c, item["teacher"], "Body", 7, col_w - 10))
+                line -= 8.5
+            alt = other.get((day.weekday(), item["start"]))
+            if alt and item.get("week") is not None and line >= bottom_y:
+                c.setFillColor(COLORS["regular_border"])
+                c.drawString(x + 5, line, _fit(c, f"через неделю: {alt}", "Body", 7, col_w - 10))
+            y -= card_h + 4
+    c.showPage()
+    c.save()
+    return buf.getvalue()

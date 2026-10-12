@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 
 from telegram import InlineKeyboardButton as Btn
@@ -24,7 +24,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, banners, documents, notion, pdf, schedule, scheduler, studio, styles, team, weekly, whenparse
+from . import ai, banners, documents, notion, pdf, schedule, scheduler, studio, styles, team, timetable, weekly, whenparse
 from . import config as c
 from .markdown import chunks as _chunks, tg_html, to_blocks
 
@@ -88,7 +88,7 @@ MENU = (
 )
 OWNER_COMMANDS = (
     "👥 <b>Команда</b>: /invite — пригласить · /members — участники · /teamproject — командный проект · "
-    "/banners — картинки меню\n"
+    "/banners — картинки меню · /timetable — моё расписание уроков\n"
 )
 
 
@@ -294,8 +294,10 @@ async def _section(uid: int, name: str) -> tuple[str, list[list[tuple[str, str]]
             "🗓 <b>Планы</b>\n\n"
             "🗓 <b>Расписание</b> — обычная неделя словами, календарь в PDF A4\n"
             "📊 <b>Отчёт</b> — настроение и дела за неделю картинкой\n"
-            "☀️ <b>Чек-ины</b> — когда днём спрашивать о неразобранном",
-            [[("🗓 Расписание", "m:schedule"), ("📊 Отчёт", "m:report")], [("☀️ Чек-ины", "st:ci")]],
+            "☀️ <b>Чек-ины</b> — когда днём спрашивать о неразобранном"
+            + ("\n🎒 <b>Моё расписание</b> — уроки, звонок за 5 минут до конца урока, PDF" if is_owner(uid) else ""),
+            [[("🗓 Расписание", "m:schedule"), ("📊 Отчёт", "m:report")],
+             [("☀️ Чек-ины", "st:ci")] + ([("🎒 Моё расписание", "m:tt")] if is_owner(uid) else [])],
         )
     if name == "help":
         return (
@@ -903,6 +905,12 @@ async def on_menu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         elif action == "banners" and is_owner(uid):
             rows = [[Btn(f"🎨 {name}", callback_data=f"bn:{key}")] for key, name in banners.SECTIONS.items()]
             await q.message.reply_text("🖼 Какой баннер нарисовать ИИ?", reply_markup=InlineKeyboardMarkup(rows))
+        elif action == "tt" and is_owner(uid):
+            if await timetable.load(uid):
+                text, kb = await _tt_view(uid)
+                await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            else:
+                await _ask(q.message, TIMETABLE_PROMPT, input_field_placeholder="вторник: 9:00-9:45 • 410 …")
         elif action == "helpq":
             await _ask(q.message, HELP_PROMPT, input_field_placeholder="как добавить проект?")
         elif action == "help":
@@ -1084,6 +1092,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if asked(INVITE_PROMPT):
         if is_owner(update.effective_user.id):
             await _create_invite(update.message, ctx, update.message.text)
+        return
+    if asked(TIMETABLE_PROMPT):
+        if is_owner(update.effective_user.id):
+            await _timetable_reply(update.message)
         return
     if (prompt := asked(TZ_PROMPT, TIME_PROMPT, CHECKIN_PROMPT)):
         await _settings_reply(update.message, prompt)
@@ -2439,6 +2451,167 @@ async def _sphere_feed_view(uid: int, key: str) -> tuple[str, InlineKeyboardMark
     rows += [pb[i : i + 2] for i in range(0, len(pb), 2)]
     rows.append([Btn("📒 Заметки сферы", callback_data=f"nb:s:{key}"), Btn("↩️ Все сферы", callback_data="fd:all")])
     return text, InlineKeyboardMarkup(rows)
+
+
+# ---------- 🎒 моё расписание (только владелица) ----------
+# Уроки по дням с кабинетами и преподавателями, уроки через неделю («ИЛИ»), звонок за 5 минут до конца урока,
+# PDF недели и строки в основном расписании. Данные — в Notion («Служебное»), не в коде: репозиторий публичный.
+# callback_data: tt:pdf:<0|1> | tt:alt | tt:sw:<пара> | tt:save | tt:bell | tt:new | tt:no
+
+TIMETABLE_PROMPT = (
+    "🎒 Пришлите своё расписание ответом на это сообщение — как пишете обычно: день недели, "
+    "«9:00-9:45 • 410», номер и предмет, преподаватель, «ИЛИ» между уроками через неделю, "
+    "«До 16:00 — …», «19:30 - 20:45 - танцы»."
+)
+_tt_draft: dict[int, dict] = {}
+
+
+async def _tt_local_today(uid: int) -> date:
+    return scheduler.local_now(await scheduler.get_settings(uid)).date()
+
+
+def _alt_rows(data: dict, today: date, prefix: str) -> tuple[str, list]:
+    """Какой урок из пары «через неделю» идёт на этой неделе — с кнопкой поменять."""
+    week = timetable.week_index(data, today)
+    lines, rows = [], []
+    for k, (a, b) in enumerate(timetable.alternatives(data)):
+        now_item, later = (a, b) if week == 0 else (b, a)
+        where = f"{', '.join(a['days'])} {a['start']}"
+        lines.append(f"• {where}: на этой неделе — {now_item['title']}, на следующей — {later['title']}")
+        rows.append([Btn(f"🔄 {where}: на этой — {later['title'][:20]}", callback_data=f"{prefix}:sw:{k}")])
+    return "\n".join(lines), rows
+
+
+async def _tt_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    data = await timetable.load(uid)
+    today = await _tt_local_today(uid)
+    week = "А" if timetable.week_index(data, today) == 0 else "Б"
+    alt_text, _ = _alt_rows(data, today, "tt")
+    text = (
+        f"🎒 <b>Моё расписание</b> · эта неделя ({week})\n\n" + escape(timetable.week_text(data, today))
+        + (f"\n\n🔄 Через неделю:\n{escape(alt_text)}" if alt_text else "")
+        + f"\n\n🔔 Звонок за 5 минут до конца урока: {'включён' if data.get('bells', True) else 'выключен'}"
+    )
+    kb = InlineKeyboardMarkup([
+        [Btn("📄 PDF эта неделя", callback_data="tt:pdf:0"), Btn("📄 PDF следующая", callback_data="tt:pdf:1")],
+        [Btn("🔄 Что на этой неделе", callback_data="tt:alt"), Btn("🔔 Звонки: вкл/выкл", callback_data="tt:bell")],
+        [Btn("✏️ Загрузить заново", callback_data="tt:new")],
+    ])  # fmt: skip
+    return text, kb
+
+
+def _tt_draft_view(data: dict, today: date) -> tuple[str, InlineKeyboardMarkup]:
+    lessons = sum(1 for i in data["items"] if i["lesson"])
+    alt_text, rows = _alt_rows(data, today, "td2")
+    text = (
+        f"🎒 Вот что я поняла: занятий {len(data['items'])}, из них уроков {lessons}.\n\n"
+        + timetable.week_text(data, today)
+        + (f"\n\n🔄 Уроки через неделю — проверь, что идёт на этой:\n{alt_text}" if alt_text else "")
+        + "\n\nВсё верно?"
+    )[:4000]
+    rows.append([Btn("✅ Сохранить", callback_data="td2:save"), Btn("✖️ Отмена", callback_data="td2:no")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def timetable_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if not await timetable.load(uid):
+        await _ask(update.message, TIMETABLE_PROMPT, input_field_placeholder="вторник: 9:00-9:45 • 410 …")
+        return
+    text, kb = await _tt_view(uid)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def _timetable_reply(message: Message) -> None:
+    uid = message.chat_id
+    items = timetable.parse(message.text)
+    if not items:
+        await message.reply_text("Не поняла расписание. Пример строки урока: «9:00-9:45 • 410», ниже — предмет и преподаватель.")
+        return
+    today = await _tt_local_today(uid)
+    data = {"anchor": timetable.monday(today).isoformat(), "items": items, "bells": True}
+    _tt_draft[uid] = data
+    text, kb = _tt_draft_view(data, today)
+    await message.reply_text(text, reply_markup=kb)
+
+
+async def on_timetable_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_owner(uid):
+        await q.answer()
+        return
+    prefix, action, *rest = q.data.split(":")
+    try:
+        today = await _tt_local_today(uid)
+        if prefix == "td2":
+            data = _tt_draft.get(uid)
+            if not data:
+                await q.answer("Черновик устарел — пришлите расписание ещё раз: /timetable", show_alert=True)
+                return
+            if action == "sw":
+                timetable.swap(data, int(rest[0]))
+                await q.answer("Поменяла")
+                text, kb = _tt_draft_view(data, today)
+                await _edit(q, text, reply_markup=kb)
+                return
+            if action == "no":
+                _tt_draft.pop(uid, None)
+                await q.answer()
+                await _edit(q, "Не сохраняю. Загрузить: /timetable", reply_markup=None)
+                return
+            # save
+            await q.answer()
+            await _edit(q, "🎒 Сохраняю и переношу уроки в основное расписание…", reply_markup=None)
+            await timetable.save(uid, data)
+            slots = await timetable.sync_main_schedule(uid, data)
+            _tt_draft.pop(uid, None)
+            done = (
+                f"✅ Расписание сохранено. В основное расписание (/schedule) добавлено строк: {slots} — с пометкой 🎒, "
+                "уроки через неделю одной строкой «… / … (чередуются через неделю)».\n"
+                "🔔 За 5 минут до конца каждого урока пришлю, где следующий урок, кто ведёт и сколько перемена."
+            )
+            await _edit(q, await styles.wrap(uid, "ok", done), reply_markup=None)
+            text, kb = await _tt_view(uid)
+            await q.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+        data = await timetable.load(uid)
+        if action == "new" or not data:
+            await q.answer()
+            await _ask(q.message, TIMETABLE_PROMPT, input_field_placeholder="вторник: 9:00-9:45 • 410 …")
+            return
+        if action == "pdf":
+            await q.answer()
+            day = today + timedelta(days=7 * int(rest[0]))
+            start = timetable.monday(day)
+            await q.message.reply_document(
+                io.BytesIO(timetable.week_pdf(data, day)), filename=f"moe-raspisanie-{start:%d.%m}.pdf",
+                caption=f"🎒 Моё расписание на неделю с {start:%d.%m}",
+            )  # fmt: skip
+            return
+        if action == "bell":
+            data["bells"] = not data.get("bells", True)
+            await timetable.save(uid, data)
+            await _ack(q, "🔔 Звонки включены" if data["bells"] else "🔕 Звонки выключены")
+        elif action == "alt":
+            await q.answer()
+            alt_text, rows = _alt_rows(data, today, "tt")
+            rows.append([Btn("↩️ Назад", callback_data="tt:back")])
+            await _edit(q, "🔄 Уроки через неделю:\n" + (alt_text or "таких нет"), reply_markup=InlineKeyboardMarkup(rows))
+            return
+        elif action == "sw":
+            timetable.swap(data, int(rest[0]))
+            await timetable.save(uid, data)
+            await timetable.sync_main_schedule(uid, data)
+            await _ack(q, "Поменяла")
+        else:
+            await q.answer()
+        text, kb = await _tt_view(uid)
+    except Exception as e:
+        log.exception("timetable failed")
+        await _fail(q, e)
+        return
+    await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 # ---------- 🔗 пересекающиеся цели: найти и объединить ----------
@@ -4168,6 +4341,7 @@ OWNER_EXTRA = [
     ("invite", "Пригласить участника"),
     ("members", "Участники и приглашения"),
     ("teamproject", "Командный проект"),
+    ("timetable", "Моё расписание уроков"),
     ("banners", "Картинки разделов"),
 ]
 
@@ -4359,6 +4533,8 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("overlaps", overlaps_cmd, filters=member))
     app.add_handler(CallbackQueryHandler(on_overlap_button, pattern=r"^og:"))
     app.add_handler(CommandHandler("notes", notes_cmd, filters=member))
+    app.add_handler(CommandHandler("timetable", timetable_cmd, filters=owner))
+    app.add_handler(CallbackQueryHandler(on_timetable_button, pattern=r"^(tt|td2):"))
     app.add_handler(CallbackQueryHandler(on_browse_button, pattern=r"^nb:"))
     app.add_handler(CallbackQueryHandler(on_card_button, pattern=r"^nc:"))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))
