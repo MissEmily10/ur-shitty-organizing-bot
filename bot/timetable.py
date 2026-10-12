@@ -371,13 +371,15 @@ async def seed_owner(uid: int) -> str:
 # Пн и ср — занятия с репетиторами по часу: ссылка на вход за 5 минут и «сделала домашку?» после
 TUTOR_LINKS = {
     "14:00": "https://telemost.yandex.ru/j/61862118303727",  # китайский
-    "16:00": "https://chattern.ru/duo?rid=D-KzCkJaQW",  # подписана владелицей как «математика»
+    "16:00": "https://chattern.ru/duo?rid=D-KzCkJaQW",  # математика
     "18:00": "https://m1qa3quv.ktalk.ru/opvjrcj0okbg",  # обществознание
 }
 
 
 def _tutors(data: dict) -> None:
     for item in data["items"]:
+        if item["days"] == ["Пн", "Ср"] and item["start"] == "16:00" and item["title"] == "Английский":
+            item["title"] = "Математика"  # в 16:00 — репетитор по математике (по английскому репетитора пока нет)
         if item["days"] == ["Пн", "Ср"] and item["lesson"] and item["start"] in TUTOR_LINKS:
             if not item["end"]:
                 item["end"] = f"{_minutes(item['start']) // 60 + 1:02d}:{item['start'][3:]}"
@@ -387,7 +389,7 @@ def _tutors(data: dict) -> None:
 
 async def upgrade_owner(uid: int) -> str:
     """Один раз: занятия с репетиторами (пн, ср) — по часу, ссылки на вход, вопрос про домашку."""
-    if not uid or await notion.get_value("seed:timetable:2"):
+    if not uid or await notion.get_value("seed:timetable:3"):
         return "не нужно"
     data = await load(uid)
     if not data:
@@ -395,5 +397,5 @@ async def upgrade_owner(uid: int) -> str:
     _tutors(data)
     await save(uid, data)
     await sync_main_schedule(uid, data)
-    await notion.set_value("seed:timetable:2", "ok")
+    await notion.set_value("seed:timetable:3", "ok")
     return "репетиторы: по часу, ссылки, домашка"

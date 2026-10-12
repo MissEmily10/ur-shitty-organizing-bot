@@ -152,11 +152,12 @@ async def run():
     tue = [i["title"] for i in timetable.for_day(seeded, date(2026, 10, 13))]
     assert "Химия" in tue and "Биология" not in tue, tue
     # 9. репетиторы пн/ср: по часу, ссылка за 5 минут до начала, «сделала домашку?» после
-    h.service.pop("seed:timetable:2", None)
+    h.service.pop("seed:timetable:3", None)
     assert (await timetable.upgrade_owner(42)).startswith("репетиторы")
     assert await timetable.upgrade_owner(42) == "не нужно"
     data = await timetable.load(42)
     tutors = [i for i in data["items"] if i["days"] == ["Пн", "Ср"]]
+    assert [i["title"] for i in tutors] == ["Китайский", "Математика", "Обществознание"]
     assert [(i["start"], i["end"], i["homework"]) for i in tutors] == [("14:00", "15:00", True), ("16:00", "17:00", True), ("18:00", "19:00", True)]
     assert not any(i.get("link") for i in data["items"] if i["days"] != ["Пн", "Ср"]), "ссылки только у репетиторов"
     mon = lambda hh, mm: datetime(2026, 10, 19, hh, mm, tzinfo=timezone.utc)  # noqa: E731
