@@ -213,7 +213,7 @@ def bell_text(current: dict, nxt: dict | None, after: dict | None) -> str:
         gap = _minutes(nxt["start"]) - _minutes(current["end"])
         lines = [head, "", f"Дальше: {(nxt['num'] + ' · ') if nxt['num'] else ''}{nxt['title']}"]
         if nxt["room"]:
-            lines.append(f"🚪 Кабинет {nxt['room']}")
+            lines.append("💻 Онлайн" if nxt["room"].lower() == "онлайн" else f"🚪 Кабинет {nxt['room']}")
         if nxt["teacher"]:
             lines.append(f"👩‍🏫 {nxt['teacher']}")
         lines.append(f"⏰ Начало в {nxt['start']} · перемена {gap} мин")
@@ -385,6 +385,26 @@ def _tutors(data: dict) -> None:
                 item["end"] = f"{_minutes(item['start']) // 60 + 1:02d}:{item['start'][3:]}"
             item["link"] = TUTOR_LINKS[item["start"]]
             item["homework"] = True
+
+
+SEED_VERSION = 4  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
+
+
+async def reload_owner(uid: int) -> str:
+    """Новая версия расписания из файла заменяет загруженную (репетиторы — из _tutors, звонки — как были)."""
+    if not uid or not SEED_FILE.exists():
+        return "не нужно"
+    if int(await notion.get_value("seed:timetable:version") or 0) >= SEED_VERSION:
+        return "не нужно"
+    old = await load(uid) or {}
+    data = {"anchor": SEED_ANCHOR, "items": parse(SEED_FILE.read_text(encoding="utf-8")), "bells": old.get("bells", True)}
+    _tutors(data)
+    await save(uid, data)
+    slots = await sync_main_schedule(uid, data)
+    for key in ("seed:timetable:1", "seed:timetable:3"):
+        await notion.set_value(key, "заменено новой версией")
+    await notion.set_value("seed:timetable:version", str(SEED_VERSION))
+    return f"загружено: {len(data['items'])} занятий, строк в основном расписании: {slots}"
 
 
 async def upgrade_owner(uid: int) -> str:
