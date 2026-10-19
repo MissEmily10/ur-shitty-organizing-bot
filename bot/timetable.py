@@ -394,7 +394,7 @@ def _tutors(data: dict) -> None:
             item["homework"] = True
 
 
-SEED_VERSION = 4  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
+SEED_VERSION = 5  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
 
 
 async def reload_owner(uid: int) -> str:
