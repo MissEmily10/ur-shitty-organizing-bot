@@ -141,12 +141,12 @@ async def run():
     assert len(bells) == 1 and not [t for t in h.texts(chat=77) if t.startswith("🔔")]
     # 8. разовая загрузка расписания владелицы из data/owner_timetable.txt
     real = timetable.parse(timetable.SEED_FILE.read_text(encoding="utf-8"))
-    assert len(real) == 23 and timetable.alternatives({"items": real}) == []
+    assert len(real) == 24 and timetable.alternatives({"items": real}) == []
     h.service.pop("timetable:42", None)
     h.service.pop("seed:timetable:1", None)
     slots.clear()
     result = await timetable.seed_owner(42)
-    assert result.startswith("загружено: 23") and (await timetable.load(42))["anchor"] == timetable.SEED_ANCHOR
+    assert result.startswith("загружено: 24") and (await timetable.load(42))["anchor"] == timetable.SEED_ANCHOR
     assert await timetable.seed_owner(42) == "не нужно", "только один раз"
     seeded = await timetable.load(42)
     thu = [i["title"] for i in timetable.for_day(seeded, date(2026, 10, 22))]
@@ -194,7 +194,7 @@ async def run():
     old["bells"] = False
     await timetable.save(42, old)
     h.service.pop("seed:timetable:version", None)
-    assert (await timetable.reload_owner(42)).startswith("загружено: 23")
+    assert (await timetable.reload_owner(42)).startswith("загружено: 24")
     assert await timetable.reload_owner(42) == "не нужно"
     new = await timetable.load(42)
     assert new["bells"] is False
@@ -202,8 +202,16 @@ async def run():
     assert not any(i["room"] not in ("", "онлайн") for i in new["items"]), "старых кабинетов не осталось"
     assert any(s["title"] == "🎒 Химия · онлайн" for s in slots) and not any("каб." in s["title"] for s in slots)
     new["bells"] = True
-    (_, text), = timetable.due_bells(new, datetime(2026, 10, 19, 12, 55, tzinfo=timezone.utc))
-    assert "💻 Онлайн" in text and "без перемены" in text, text
+    # онлайн-урок по часу: 45 минут урок, с :45 перемена — звонки в :40 каждого часа
+    assert timetable.due_bells(new, datetime(2026, 10, 19, 12, 55, tzinfo=timezone.utc)) == []
+    (key, text), = timetable.due_bells(new, datetime(2026, 10, 19, 11, 40, tzinfo=timezone.utc))
+    assert key == "bell:2026-10-19:11:00" and "Дальше: История (2-й час)" in text and "Начало в 12:00 · перемена 15 мин" in text, text
+    (_, text), = timetable.due_bells(new, datetime(2026, 10, 19, 12, 40, tzinfo=timezone.utc))
+    assert "Дальше: Английский язык" in text and "💻 Онлайн" in text and "перемена 15 мин" in text, text
+    tue = timetable.for_day(new, date(2026, 10, 20))
+    assert ("11:00", "12:00", "Встреча с наставником") in [(i["start"], i["end"], i["title"]) for i in tue]
+    (_, text), = timetable.due_bells(new, datetime(2026, 10, 20, 13, 40, tzinfo=timezone.utc))
+    assert "Консультация по физике" in text and "перерыв 2 ч 15 мин" in text, text
     print("timetable OK")
 
 

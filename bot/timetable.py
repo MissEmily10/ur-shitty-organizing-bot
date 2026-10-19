@@ -206,17 +206,49 @@ def swap(data: dict, k: int) -> None:
 # ---------- звонок: за 5 минут до конца урока ----------
 
 
-def bell_text(current: dict, nxt: dict | None, after: dict | None) -> str:
-    """Сообщение за 5 минут до конца урока: что дальше, где, у кого, сколько перемена."""
+LESSON_MINUTES = 45  # онлайн-урок идёт по часу: 45 минут урок, с :45 — перемена до начала следующего часа
+
+
+def _online(item: dict) -> bool:
+    return (item.get("room") or "").lower() == "онлайн"
+
+
+def _hhmm_of(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def segments(item: dict) -> list[tuple[int, int]]:
+    """Части урока (начало, конец) в минутах. Онлайн-урок на 2 часа — два урока по 45 минут, каждый с начала часа."""
+    start, end = _minutes(item["start"]), _minutes(item["end"])
+    if not _online(item):
+        return [(start, end)]
+    return [(s, min(s + LESSON_MINUTES, end)) for s in range(start, end, 60)]
+
+
+def _where(item: dict) -> list[str]:
+    lines = []
+    if item.get("room"):
+        lines.append("💻 Онлайн" if _online(item) else f"🚪 Кабинет {item['room']}")
+    if item.get("teacher"):
+        lines.append(f"👩‍🏫 {item['teacher']}")
+    return lines
+
+
+def bell_text(current: dict, nxt: dict | None, after: dict | None, gap: int = 0, part: str = "") -> str:
+    """Сообщение за 5 минут до конца урока: что дальше, где, у кого, сколько перемена.
+    nxt — следующий урок (у продолжения того же урока — он сам, part — «2-й час»)."""
     head = f"🔔 Через 5 минут конец урока «{current['title']}»."
     if nxt:
-        gap = _minutes(nxt["start"]) - _minutes(current["end"])
-        lines = [head, "", f"Дальше: {(nxt['num'] + ' · ') if nxt['num'] else ''}{nxt['title']}"]
-        if nxt["room"]:
-            lines.append("💻 Онлайн" if nxt["room"].lower() == "онлайн" else f"🚪 Кабинет {nxt['room']}")
-        if nxt["teacher"]:
-            lines.append(f"👩‍🏫 {nxt['teacher']}")
-        lines.append(f"⏰ Начало в {nxt['start']} · " + (f"перемена {gap} мин" if gap > 0 else "сразу, без перемены"))
+        name = f"{(nxt['num'] + ' · ') if nxt.get('num') else ''}{nxt['title']}" + (f" ({part})" if part else "")
+        start = nxt["_start"] if "_start" in nxt else nxt["start"]
+        lines = [head, "", f"Дальше: {name}", *_where(nxt)]
+        if gap <= 0:
+            pause = "сразу, без перемены"
+        elif gap <= 30:
+            pause = f"перемена {gap} мин"
+        else:
+            pause = f"перерыв {gap // 60} ч {gap % 60} мин" if gap % 60 else f"перерыв {gap // 60} ч"
+        lines.append(f"⏰ Начало в {start} · {pause}")
         return "\n".join(lines)
     text = head + "\nЭто последний урок на сегодня 🎉"
     if after:
@@ -226,23 +258,33 @@ def bell_text(current: dict, nxt: dict | None, after: dict | None) -> str:
 
 
 def due_bells(data: dict, now: datetime) -> list[tuple[str, str]]:
-    """Звонки, которые пора отправить сейчас: [(ключ отметки, текст)]. Окно — последние 5 минут урока."""
+    """Звонки, которые пора отправить сейчас: [(ключ отметки, текст)]. Окно — последние 5 минут урока
+    (у онлайн-урока — каждого часа: звонок в :40, урок кончается в :45)."""
     today = for_day(data, now.date())
     out = []
     minute = now.hour * 60 + now.minute
     for k, item in enumerate(today):
-        if not (item["lesson"] and item["end"]):
+        if not (item["lesson"] and item["end"] and item["start"]):
             continue
-        end = _minutes(item["end"])
-        if not end - BELL_BEFORE.seconds // 60 <= minute < end:
-            continue
-        later = today[k + 1 :]
-        nxt = next((i for i in later if i["lesson"] and i["start"] and _minutes(i["start"]) >= end), None)
-        # следующий урок — только если между ними нет «внешнего» занятия (иначе уроки кончились)
-        if nxt and any(not i["lesson"] and i["start"] and _minutes(i["start"]) < _minutes(nxt["start"]) for i in later):
-            nxt = None
-        after = next((i for i in later if not i["lesson"]), None) if not nxt else None
-        out.append((f"bell:{now.date().isoformat()}:{item['start']}", bell_text(item, nxt, after)))
+        segs = segments(item)
+        for n, (seg_start, seg_end) in enumerate(segs):
+            if not seg_end - BELL_BEFORE.seconds // 60 <= minute < seg_end:
+                continue
+            key = f"bell:{now.date().isoformat()}:{_hhmm_of(seg_start)}"
+            if n + 1 < len(segs):
+                # тот же урок, следующий час
+                cont = {**item, "_start": _hhmm_of(segs[n + 1][0])}
+                out.append((key, bell_text(item, cont, None, segs[n + 1][0] - seg_end, f"{n + 2}-й час")))
+                continue
+            end = _minutes(item["end"])
+            later = today[k + 1 :]
+            nxt = next((i for i in later if i["lesson"] and i["start"] and _minutes(i["start"]) >= end), None)
+            # следующий урок — только если между ними нет «внешнего» занятия (иначе уроки кончились)
+            if nxt and any(not i["lesson"] and i["start"] and _minutes(i["start"]) < _minutes(nxt["start"]) for i in later):
+                nxt = None
+            after = next((i for i in later if not i["lesson"]), None) if not nxt else None
+            gap = _minutes(nxt["start"]) - seg_end if nxt else 0
+            out.append((key, bell_text(item, nxt, after, gap)))
     return out
 
 
@@ -394,7 +436,7 @@ def _tutors(data: dict) -> None:
             item["homework"] = True
 
 
-SEED_VERSION = 5  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
+SEED_VERSION = 6  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
 
 
 async def reload_owner(uid: int) -> str:
