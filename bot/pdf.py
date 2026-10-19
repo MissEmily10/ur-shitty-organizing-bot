@@ -189,70 +189,129 @@ def month_pdf(items: list[Occurrence], year: int, month: int, today: date | None
 # номер и предмет, преподаватель; у урока «через неделю» — что будет на другой неделе. Занятия вне школы — другим цветом.
 
 
+def _span(item: dict) -> tuple[int, int]:
+    """Начало и конец в минутах; без конца — час."""
+    start = _minutes(item["start"]) if item.get("start") else _minutes(item["end"]) - 60
+    end = _minutes(item["end"]) if item.get("end") else start + 60
+    return start, max(end, start + 15)
+
+
+def _lanes(items: list[dict]) -> list[tuple[dict, int, int]]:
+    """Пересекающиеся занятия — рядом: (занятие, номер дорожки, сколько дорожек в группе)."""
+    spans = sorted(((i, *_span(i)) for i in items), key=lambda x: (x[1], x[2]))
+    placed, group, group_end = [], [], -1
+    out = []
+
+    def flush():
+        lanes = max((lane for _, lane in group), default=-1) + 1
+        out.extend((item, lane, lanes) for item, lane in group)
+
+    for item, start, end in spans:
+        if group and start >= group_end:
+            flush()
+            group, placed = [], []
+        free = next((n for n, last in enumerate(placed) if last <= start), None)
+        if free is None:
+            placed.append(end)
+            free = len(placed) - 1
+        else:
+            placed[free] = end
+        group.append((item, free))
+        group_end = max(group_end, end)
+    if group:
+        flush()
+    return out
+
+
 def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str, other: dict | None = None) -> bytes:
-    """days — [(дата, занятия этого дня)] в порядке недели; other — {(день недели, начало): название варианта
+    """Сетка по часам: колонки дней, высота карточки — длительность занятия, окна остаются пустыми.
+    days — [(дата, занятия этого дня)] в порядке недели; other — {(день недели, начало): название варианта
     другой недели} для уроков, которые чередуются."""
     other = other or {}
     buf = io.BytesIO()
     c = Canvas(buf, pagesize=(PAGE_W, PAGE_H))
     _title(c, title, subtitle)
     days = [d for d in days if d[1]] or days[:5]
+    spans = [_span(i) for _, items in days for i in items]
+    first = min([s for s, _ in spans] + [8 * 60]) // 60
+    last = min(24, -(-max([e for _, e in spans] + [18 * 60]) // 60))
+    hours = max(1, last - first)
+
     cols = max(1, len(days))
     top, bottom = PAGE_H - MARGIN - 40, MARGIN
-    gap = 8
-    col_w = (PAGE_W - 2 * MARGIN - gap * (cols - 1)) / cols
-    rows = max([len(items) for _, items in days] + [1])
-    card_h = min(58, (top - 26 - bottom - 4 * (rows - 1)) / rows)
+    left = MARGIN + 30
+    gap = 6
+    col_w = (PAGE_W - MARGIN - left - gap * (cols - 1)) / cols
+    grid_top = top - 26
+    per_min = (grid_top - bottom) / (hours * 60)
+
+    def y_of(minutes: int) -> float:
+        return grid_top - (minutes - first * 60) * per_min
+
+    # часы: подписи слева и тонкие линии через всю сетку
+    c.setFont("Body", 8)
+    for h in range(first, last + 1):
+        y = y_of(h * 60)
+        c.setStrokeColor(COLORS["grid"])
+        c.setLineWidth(0.5)
+        c.line(left - 4, y, PAGE_W - MARGIN, y)
+        c.setFillColor(COLORS["muted"])
+        c.drawRightString(left - 7, y - 3, f"{h}:00")
+
     for n, (day, items) in enumerate(days):
-        x = MARGIN + n * (col_w + gap)
+        x = left + n * (col_w + gap)
         c.setFillColor(COLORS["header"])
         c.roundRect(x, top - 20, col_w, 20, 4, stroke=0, fill=1)
         c.setFillColor(COLORS["text"])
         c.setFont("Bold", 11)
         c.drawString(x + 6, top - 14, f"{WEEKDAYS[day.weekday()]} {day.strftime('%d.%m')}")
-        y = top - 26
-        for item in items:
-            lesson = item.get("lesson")
-            fill, border = _box_colors("regular" if lesson else "once")
+        for item, lane, lanes in _lanes(items):
+            start, end = _span(item)
+            w = (col_w - 2 * (lanes - 1)) / lanes
+            bx = x + lane * (w + 2)
+            y_top, y_bottom = y_of(start) - 1, y_of(end) + 1
+            h = y_top - y_bottom
+            fill, border = _box_colors("regular" if item.get("lesson") else "once")
             c.setFillColor(fill)
             c.setStrokeColor(border)
-            c.roundRect(x, y - card_h, col_w, card_h, 4, stroke=1, fill=1)
+            c.roundRect(bx, y_bottom, w, h, 3, stroke=1, fill=1)
             if item.get("until"):
                 time = f"до {item['end']}"
             else:
-                time = f"{item['start']}–{item['end']}" if item["start"] and item["end"] else item["start"]
+                time = f"{item['start']}–{item['end']}" if item.get("start") and item.get("end") else item.get("start") or ""
+            line = y_top - 9
             c.setFillColor(COLORS["text"])
-            c.setFont("Bold", 8)
-            c.drawString(x + 5, y - 10, time)
-            if item.get("room"):
-                c.setFont("Body", 8)
+            c.setFont("Bold", 7.5)
+            c.drawString(bx + 4, line, _fit(c, time, "Bold", 7.5, w - 8))
+            if item.get("room") and w > 70:
                 room = "онлайн" if item["room"].lower() == "онлайн" else f"каб. {item['room']}"
-                c.drawRightString(x + col_w - 5, y - 10, room)
+                c.setFont("Body", 7.5)
+                c.drawRightString(bx + w - 4, line, room)
             name = (f"{item['num']}. " if item.get("num") else "") + item["title"]
-            line = y - 21
-            bottom_y = y - card_h + 4
-            # Название: в две строки, если места хватает, иначе с «…»
-            words, first = name.split(), ""
-            while words and c.stringWidth((first + " " + words[0]).strip(), "Bold", 9) <= col_w - 10:
-                first = (first + " " + words.pop(0)).strip()
-            c.setFont("Bold", 9)
-            if words and card_h >= 56:
-                c.drawString(x + 5, line, first or _fit(c, name, "Bold", 9, col_w - 10))
-                line -= 10
-                c.drawString(x + 5, line, _fit(c, " ".join(words), "Bold", 9, col_w - 10))
+            line -= 10
+            if line < y_bottom + 2:
+                continue
+            # название — в две строки, если хватает высоты
+            words, first_line = name.split(), ""
+            while words and c.stringWidth((first_line + " " + words[0]).strip(), "Bold", 8.5) <= w - 8:
+                first_line = (first_line + " " + words.pop(0)).strip()
+            c.setFont("Bold", 8.5)
+            if words and line - 10 >= y_bottom + 2:
+                c.drawString(bx + 4, line, first_line or _fit(c, name, "Bold", 8.5, w - 8))
+                line -= 9.5
+                c.drawString(bx + 4, line, _fit(c, " ".join(words), "Bold", 8.5, w - 8))
             else:
-                c.drawString(x + 5, line, _fit(c, name, "Bold", 9, col_w - 10))
-            line -= 9.5
+                c.drawString(bx + 4, line, _fit(c, name, "Bold", 8.5, w - 8))
+            line -= 9
             c.setFont("Body", 7)
             c.setFillColor(COLORS["muted"])
-            if item.get("teacher") and line >= bottom_y:
-                c.drawString(x + 5, line, _fit(c, item["teacher"], "Body", 7, col_w - 10))
+            if item.get("teacher") and line >= y_bottom + 2:
+                c.drawString(bx + 4, line, _fit(c, item["teacher"], "Body", 7, w - 8))
                 line -= 8.5
-            alt = other.get((day.weekday(), item["start"]))
-            if alt and item.get("week") is not None and line >= bottom_y:
+            alt = other.get((day.weekday(), item.get("start")))
+            if alt and item.get("week") is not None and line >= y_bottom + 2:
                 c.setFillColor(COLORS["regular_border"])
-                c.drawString(x + 5, line, _fit(c, f"через неделю: {alt}", "Body", 7, col_w - 10))
-            y -= card_h + 4
+                c.drawString(bx + 4, line, _fit(c, f"через неделю: {alt}", "Body", 7, w - 8))
     c.showPage()
     c.save()
     return buf.getvalue()
