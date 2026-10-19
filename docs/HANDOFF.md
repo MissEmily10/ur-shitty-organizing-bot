@@ -82,10 +82,11 @@ Telegram-бот «организатор мыслей»: заметки (тек�
 - 🎒 Моё расписание (только владелица): `timetable.py` — разбор её формата без ИИ (`parse`), недели А/Б от `anchor`
   (`week_index`, `swap`), звонки `due_bells` (вызов в `scheduler._bells` на каждом тике), выгрузка в основное
   расписание с меткой «🎒 » (`sync_main_schedule`), PDF `week_pdf` → `pdf.timetable_pdf`. Данные — `timetable:<uid>` в
-  «Служебном». Figma-основа для оформления PDF: https://www.figma.com/design/V8L4ZzuhuHciTua3inpS6E (репетиторы — фиолетовые).
+  «Служебном». Figma-основа для оформления PDF: https://www.figma.com/design/V8L4ZzuhuHciTua3inpS6E — её оформление перенесено в `timetable_pdf`: карточки уроки #D5D4FF, репетиторы #FFE1FD, вне школы #F5FFCB (токены `tt_*`), шапки дней #FFF4E6 шрифтом Paytone One (OFL, в `design/fonts/`) с английскими днями «Monday 19.10  †». Coolvetica (заголовок и названия) — коммерческий шрифт, в репозиторий не кладём: бот берёт `design/fonts/Coolvetica-Regular.ttf` / `-Italic.ttf`, если они есть (и только если в шрифте есть кириллица), иначе PT Sans Bold.
   Её расписание по её просьбе лежит в `data/owner_timetable.txt` (репозиторий публичный — она
   сказала, что это не важно) и загружается при запуске (`seed_owner`; новая версия файла — поднять `timetable.SEED_VERSION`, тогда `reload_owner`
   заменит загруженное, репетиторы добавляются из `_tutors`). В `main.py` раздел «🎒 моё расписание» (`tt:`, черновик `td2:`).
+- Изменение расписания (`sc:edit`) сначала спрашивает «Что это?» (`sc:ek:tutor|me|lesson|task|other`): репетитор 🧑‍🏫, засечка под личные дела 🔖, доп. урок 📚, доп. дело 📝 — значок ставится в начало названия (`schedule.mark`), подсказка уходит ИИ; отмены сравнивают названия без значков (`schedule._key`). Эмодзи в PDF календаря вырезаются (`pdf._plain`).
 - `team.py` — 👥 сводки командных проектов (по кнопке и задача `team_summary` в понедельник).
 - `report.py` + `weekly.py` — недельный отчёт (Pillow). `documents.py` — PDF/Word/Excel/CSV/TXT.
 - Оформление картинок и PDF — `design/tokens.json` + шрифт PT Sans в `design/fonts/` (временное, под её дизайн).

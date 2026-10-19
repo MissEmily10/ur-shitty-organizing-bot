@@ -392,8 +392,8 @@ def week_pdf(data: dict, day: date) -> bytes:
     end = start + timedelta(days=6)
     return pdf.timetable_pdf(
         days, f"Моё расписание · {start:%d.%m}–{end:%d.%m}",
-        (f"неделя {'А' if week == 0 else 'Б'} · " if alternatives(data) else "") + ("синие — уроки, фиолетовые — репетиторы, зелёные — вне школы" if any(i.get("link") for i in data["items"])
-         else "синие — уроки, зелёные — вне школы"), other,
+        (f"неделя {'А' if week == 0 else 'Б'} · " if alternatives(data) else "") + ("сиреневые — уроки, розовые — репетиторы, салатовые — вне школы" if any(i.get("link") for i in data["items"])
+         else "сиреневые — уроки, салатовые — вне школы"), other,
     )  # fmt: skip
 
 

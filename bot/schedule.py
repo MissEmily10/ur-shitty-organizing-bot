@@ -17,6 +17,26 @@ class Occurrence:
     kind: str  # regular / once / note
 
 
+# Что это за изменение (бот спрашивает перед тем, как записать): ключ → (значок в названии, как называется)
+CATEGORIES = {
+    "tutor": ("🧑‍🏫", "репетитор"),
+    "me": ("🔖", "засечка под личные дела"),
+    "lesson": ("📚", "доп. урок"),
+    "task": ("📝", "доп. дело"),
+}
+
+
+def mark(title: str, category: str | None) -> str:
+    """Название со значком категории: «🧑‍🏫 Английский»."""
+    icon = CATEGORIES.get(category or "", ("", ""))[0]
+    return f"{icon} {title}" if icon and not title.startswith(icon) else title
+
+
+def _key(title: str) -> str:
+    """Название без значков в начале и регистра — чтобы «отменить английский» нашёл «🧑‍🏫 Английский»."""
+    return title.lstrip("".join(c[0] for c in CATEGORIES.values()) + "\u200d\ufe0f🎒 ").lower()
+
+
 def _norm_day(name: str) -> str | None:
     """«пн», «Пн», «понедельник» → «Пн»."""
     name = name.strip().lower()[:2]
@@ -26,13 +46,13 @@ def _norm_day(name: str) -> str | None:
 async def occurrences(uid: int, start: date, end: date) -> list[Occurrence]:
     """Все события человека с start по end включительно, по порядку."""
     slots = await notion.schedule_slots(uid)
-    cancelled = {(s["title"].lower(), s["date"][:10]) for s in slots if s["kind"] == KIND_CANCEL and s["date"]}
+    cancelled = {(_key(s["title"]), s["date"][:10]) for s in slots if s["kind"] == KIND_CANCEL and s["date"]}
     result = []
     day = start
     while day <= end:
         weekday = WEEKDAYS[day.weekday()]
         for s in slots:
-            if s["kind"] == KIND_REGULAR and weekday in s["days"] and (s["title"].lower(), day.isoformat()) not in cancelled:
+            if s["kind"] == KIND_REGULAR and weekday in s["days"] and (_key(s["title"]), day.isoformat()) not in cancelled:
                 result.append(Occurrence(day, s["start"], s["end"], s["title"], "regular"))
             elif s["kind"] == KIND_ONCE and s["date"] and s["date"][:10] == day.isoformat():
                 result.append(Occurrence(day, s["start"], s["end"], s["title"], "once"))
@@ -85,7 +105,7 @@ async def apply(uid: int, plan: dict) -> list[str]:
         slots = [s for s in slots if s["kind"] != KIND_REGULAR]
     for name in plan.get("base_remove", []):
         for s in slots:
-            if s["kind"] == KIND_REGULAR and s["title"].lower() == name.lower():
+            if s["kind"] == KIND_REGULAR and _key(s["title"]) == _key(name):
                 await notion.remove_slot(s["page"])
                 done.append(f"🗑 убрано из базового: {s['title']}")
     for b in plan.get("base_add", []):

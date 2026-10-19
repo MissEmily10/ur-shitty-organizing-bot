@@ -89,6 +89,29 @@ async def run():
     await app.process_update(h.text("врач в пн в 9", reply_to=h._message(main.CHANGE_PROMPT)))
     assert "📌 2026-10-12 09:00 — Врач" in h.texts(chat=42)[-1], h.texts(chat=42)[-1]
 
+    # «Изменить» сначала спрашивает, что это: репетитор / засечка / доп. урок / доп. дело
+    await app.process_update(h.callback("sc:edit"))
+    question = next(d for e, d in reversed(h.sent) if e == "sendMessage")
+    buttons = [b.callback_data for row in question["reply_markup"].inline_keyboard for b in row]
+    assert question["text"] == main.KIND_QUESTION and buttons == ["sc:ek:tutor", "sc:ek:me", "sc:ek:lesson", "sc:ek:task", "sc:ek:other"]
+    await app.process_update(h.callback("sc:ek:tutor"))
+    assert h.texts(chat=42)[-1] == main.CHANGE_PROMPTS["tutor"]
+    seen = []
+
+    async def parse_tutor(text, base, now, routine):
+        seen.append(text)
+        return {"replace_base": False, "base_add": [{"title": "Английский", "days": ["вт"], "start": "17:00", "end": "18:00"}],
+                "base_remove": [], "add": [], "cancel": []}
+    ai.parse_schedule = parse_tutor
+    await app.process_update(h.text("по вторникам 17-18 английский", reply_to=h._message(main.CHANGE_PROMPTS["tutor"])))
+    assert "(Это: репетитор.)" in seen[-1]
+    assert "Что это: 🧑‍🏫 репетитор" in h.texts(chat=42)[-1] and "🧑‍🏫 Английский" in h.texts(chat=42)[-1], h.texts(chat=42)[-1]
+    # отмена по названию без значка находит занятие со значком
+    await schedule.apply(42, plan={"base_add": [{"title": "🧑‍🏫 Английский", "days": ["вт"], "start": "17:00", "end": "18:00"}],
+                                   "cancel": [{"title": "английский", "date": "2026-10-13"}]})
+    tuesday = await schedule.occurrences(42, date(2026, 10, 13), date(2026, 10, 13))
+    assert not [o for o in tuesday if "Английский" in o.title], tuesday
+
     await app.process_update(h.callback("sc:week:0"))
     assert re.search(r"Пн \d\d\.\d\d", h.texts(chat=42)[-1])
     for data in ("sc:pdfw:0", "sc:pdfm:0", "sc:pdfw:1"):

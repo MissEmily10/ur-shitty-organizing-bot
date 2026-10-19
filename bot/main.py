@@ -1122,8 +1122,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(MOOD_COMMENT_MARK):
         await _mood_comment(update.message, reply.text)
         return
-    if (prompt := asked(ROUTINE_PROMPT, CHANGE_PROMPT)):
-        await _schedule_reply(update.message, routine=prompt == ROUTINE_PROMPT)
+    if (prompt := asked(ROUTINE_PROMPT, *CHANGE_PROMPTS.values())):
+        kind = next((k for k, p in CHANGE_PROMPTS.items() if p == prompt), None)
+        await _schedule_reply(update.message, routine=prompt == ROUTINE_PROMPT, category=kind)
         return
     if asked(TYPE_PROMPT):
         await update.message.reply_text(await styles.wrap(update.effective_user.id, "ok", await _add_types_text(update.message.text)))
@@ -3129,7 +3130,8 @@ async def on_batch_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- 🗓 расписание ----------
 # callback_data: sc:week:<0|1> (эта/следующая неделя текстом) | sc:pdfw:<0|1> | sc:pdfm:<0|1> (этот/следующий месяц)
-#                sc:base (задать базовое) | sc:edit (изменить словами) | sc:rev → sc:rev:<week|2weeks|month|off>
+#                sc:base (задать базовое) | sc:edit → «Что это?» → sc:ek:<tutor|me|lesson|task|other> (изменить словами)
+#                sc:rev → sc:rev:<week|2weeks|month|off>
 #                sc:keep (пересмотр: всё как есть) | sca (применить понятое) | scx (отмена)
 
 ROUTINE_PROMPT = (
@@ -3140,6 +3142,19 @@ CHANGE_PROMPT = (
     "✏️ Что изменить или добавить? Ответьте на это сообщение своими словами. Например:\n"
     "«в эту среду зала не будет», «стоматолог 15.10 в 14:00 на час», «работа теперь с 11 до 15»"
 )
+# Перед изменением бот спрашивает, что это, — и под каждый ответ свой вопрос с примерами
+KIND_QUESTION = "✏️ Что это?"
+CHANGE_PROMPTS = {
+    "tutor": "🧑‍🏫 Репетитор: какой предмет и когда? Ответьте на это сообщение. Например:\n"
+    "«по вторникам 17:00–18:00 английский», «в четверг 23.10 в 15:00 разовое занятие по химии»",
+    "me": "🔖 Засечка под личные дела: на какое время? Ответьте на это сообщение. Например:\n"
+    "«в субботу 12–14 — время для себя», «каждый день 22:00–23:00 без дел»",
+    "lesson": "📚 Доп. урок: какой и когда? Ответьте на это сообщение. Например:\n"
+    "«в пятницу 15:00–16:00 доп. по алгебре», «по средам 16:00 консультация по химии»",
+    "task": "📝 Доп. дело: что и когда? Ответьте на это сообщение. Например:\n"
+    "«в среду в 18:00 забрать посылку», «25.10 весь день съёмка»",
+    "other": CHANGE_PROMPT,
+}
 REVIEW_OPTIONS = {"week": "раз в неделю", "2weeks": "раз в две недели", "month": "раз в месяц", "off": "не напоминать"}
 # Понятые ИИ планы изменений по id сообщения с предпросмотром
 _schedule_plans: dict[int, tuple[dict, str]] = {}
@@ -3188,25 +3203,38 @@ def _plan_text(plan: dict) -> str:
     return "\n".join(lines)
 
 
-async def _schedule_reply(message: Message, routine: bool) -> None:
+def _kind_markup() -> InlineKeyboardMarkup:
+    rows = [[Btn(f"{icon} {label[0].upper()}{label[1:]}", callback_data=f"sc:ek:{key}")] for key, (icon, label) in schedule.CATEGORIES.items()]
+    rows.append([Btn("✏️ Другое (отменить, перенести)", callback_data="sc:ek:other")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _schedule_reply(message: Message, routine: bool, category: str | None = None) -> None:
     uid = message.chat_id
     if not await ai_allowed(message):
         return
     status = await message.reply_text("🗓 Разбираю…")
+    known = schedule.CATEGORIES.get(category or "")
     try:
         now = scheduler.local_now(await scheduler.get_settings(uid))
         base = schedule.base_text(await notion.schedule_slots(uid))
-        plan = await ai.parse_schedule(message.text, base, now, routine)
+        text = message.text + (f"\n(Это: {known[1]}.)" if known else "")
+        plan = await ai.parse_schedule(text, base, now, routine)
     except Exception as e:
         log.exception("schedule parse failed")
         await status.edit_text(f"❌ Не получилось разобрать: {e}"[:4000])
         return
+    # что это — видно по значку в названии: в расписании, в напоминаниях и в PDF-подписях
+    for item in plan.get("base_add", []) + plan.get("add", []):
+        if isinstance(item, dict) and item.get("title"):
+            item["title"] = schedule.mark(item["title"], category)
     text = _plan_text(plan)
     if not text:
         await status.edit_text("🤷 Не понял, что поменять. Попробуйте сформулировать иначе.")
         return
+    head = f"Что это: {known[0]} {known[1]}\n\n" if known else ""
     sent = await status.edit_text(
-        f"Вот что я понял:\n\n{text}\n\nПрименить?",
+        f"Вот что я понял:\n\n{head}{text}\n\nПрименить?",
         reply_markup=InlineKeyboardMarkup([[Btn("✅ Применить", callback_data="sca"), Btn("✖️ Отмена", callback_data="scx")]]),
     )
     _schedule_plans[getattr(sent, "message_id", status.message_id)] = (plan, text)
@@ -3263,10 +3291,17 @@ async def on_schedule_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
         elif action in ("pdfw", "pdfm"):
             await q.answer("Собираю PDF…")
             await _send_schedule_pdf(q.message, uid, action, int(parts[2]))
-        elif action in ("base", "edit"):
+        elif action == "base":
             await q.answer()
-            prompt = ROUTINE_PROMPT if action == "base" else CHANGE_PROMPT
-            await q.message.reply_text(prompt, reply_markup=ForceReply(input_field_placeholder="своими словами"))
+            await q.message.reply_text(ROUTINE_PROMPT, reply_markup=ForceReply(input_field_placeholder="своими словами"))
+        elif action == "edit":
+            await q.answer()
+            await q.message.reply_text(KIND_QUESTION, reply_markup=_kind_markup())
+        elif action == "ek" and parts[2] in CHANGE_PROMPTS:
+            await q.answer()
+            icon, label = schedule.CATEGORIES.get(parts[2], ("✏️", "другое изменение"))
+            await _edit(q, f"{KIND_QUESTION} — {icon} {label}")
+            await q.message.reply_text(CHANGE_PROMPTS[parts[2]], reply_markup=ForceReply(input_field_placeholder="своими словами"))
         elif action == "keep":
             await q.answer("Оставляем как есть ✓")
             await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("✅ Оставили как есть", callback_data="noop")]]))

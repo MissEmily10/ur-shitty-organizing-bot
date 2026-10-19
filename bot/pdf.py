@@ -4,6 +4,7 @@
 import calendar
 import io
 import json
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -20,6 +21,24 @@ TOKENS = json.loads((ROOT / "design" / "tokens.json").read_text(encoding="utf-8"
 COLORS = {name: HexColor(value) for name, value in TOKENS["colors"].items()}
 pdfmetrics.registerFont(TTFont("Body", str(ROOT / TOKENS["fonts"]["regular"])))
 pdfmetrics.registerFont(TTFont("Bold", str(ROOT / TOKENS["fonts"]["bold"])))
+
+
+def _optional_font(name: str, key: str) -> str | None:
+    """Шрифт из дизайна владелицы, если его файл лежит в design/fonts (TTF); иначе None — рисуем PT Sans."""
+    path = ROOT / TOKENS["fonts"].get(key, "")
+    if not path.is_file():
+        return None
+    try:
+        pdfmetrics.registerFont(TTFont(name, str(path)))
+    except Exception:  # например, OTF с CFF-контурами reportlab не читает
+        return None
+    return name
+
+
+DAY_FONT = _optional_font("Day", "day")  # Paytone One — заголовки дней
+DISPLAY_FONT = _optional_font("Display", "display")  # Coolvetica — названия занятий
+DISPLAY_ITALIC = _optional_font("DisplayItalic", "display_italic")  # Coolvetica Italic — заголовок
+DAYS_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 MONTHS = ["", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
@@ -41,6 +60,20 @@ def _fit(c: Canvas, text: str, font: str, size: float, width: float) -> str:
     return text + "…"
 
 
+def _can(font: str | None, text: str, fallback: str) -> str:
+    """Шрифт, если в нём есть все буквы текста (в латинских шрифтах может не быть кириллицы), иначе запасной."""
+    if not font:
+        return fallback
+    glyphs = pdfmetrics.getFont(font).face.charToGlyph
+    return font if all(ord(ch) in glyphs for ch in text if not ch.isspace()) else fallback
+
+
+def _plain(items: list[Occurrence]) -> list[Occurrence]:
+    """Без эмодзи в названиях (🎒, 🧑‍🏫…): в PT Sans их нет, в PDF вместо них были бы квадратики."""
+    glyphs = pdfmetrics.getFont("Body").face.charToGlyph
+    return [replace(o, title="".join(ch for ch in o.title if ord(ch) in glyphs).strip() or o.title) for o in items]
+
+
 def _box_colors(kind: str) -> tuple:
     return COLORS.get(kind, COLORS["regular"]), COLORS.get(f"{kind}_border", COLORS["regular_border"])
 
@@ -56,6 +89,7 @@ def _title(c: Canvas, text: str, subtitle: str) -> None:
 
 def week_pdf(items: list[Occurrence], start: date, today: date | None = None) -> bytes:
     """Неделя с понедельника start: колонки дней, строки часов; события — цветные плашки."""
+    items = _plain(items)
     buf = io.BytesIO()
     c = Canvas(buf, pagesize=(PAGE_W, PAGE_H))
     end = start + timedelta(days=6)
@@ -133,6 +167,7 @@ def week_pdf(items: list[Occurrence], start: date, today: date | None = None) ->
 
 def month_pdf(items: list[Occurrence], year: int, month: int, today: date | None = None) -> bytes:
     """Месяц клетками: в каждой клетке — события дня по времени."""
+    items = _plain(items)
     buf = io.BytesIO()
     c = Canvas(buf, pagesize=(PAGE_W, PAGE_H))
     _title(c, f"{MONTHS[month]} {year}", "")
@@ -230,7 +265,17 @@ def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str
     other = other or {}
     buf = io.BytesIO()
     c = Canvas(buf, pagesize=(PAGE_W, PAGE_H))
-    _title(c, title, subtitle)
+    # шапка по Figma владелицы: заголовок Coolvetica Italic 26 с трекингом −3 %, подпись PT Sans 10
+    head = _can(DISPLAY_ITALIC, title, "Bold")
+    text = c.beginText(MARGIN, PAGE_H - MARGIN - 19)
+    text.setFont(head, 26 if head != "Bold" else 22)
+    text.setCharSpace(-0.03 * 26)
+    text.setFillColor(COLORS["text"])
+    text.textOut(title)
+    c.drawText(text)
+    c.setFont("Body", 10)
+    c.setFillColor(COLORS["muted"])
+    c.drawRightString(PAGE_W - MARGIN, PAGE_H - MARGIN - 14, subtitle)
     days = [d for d in days if d[1]] or days[:5]
     spans = [_span(i) for _, items in days for i in items]
     first = min([s for s, _ in spans] + [8 * 60]) // 60
@@ -260,22 +305,27 @@ def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str
 
     for n, (day, items) in enumerate(days):
         x = left + n * (col_w + gap)
-        c.setFillColor(COLORS["header"])
+        c.setFillColor(COLORS["tt_day"])
         c.roundRect(x, top - 20, col_w, 20, 4, stroke=0, fill=1)
         c.setFillColor(COLORS["text"])
-        c.setFont("Bold", 11)
-        c.drawString(x + 6, top - 14, f"{WEEKDAYS[day.weekday()]} {day.strftime('%d.%m')}")
+        if DAY_FONT:  # как в Figma: «Monday 19.10  †» шрифтом Paytone One
+            c.setFont(DAY_FONT, 11)
+            c.drawString(x + 6, top - 14, _fit(c, f"{DAYS_EN[day.weekday()]} {day:%d.%m}  †", DAY_FONT, 11, col_w - 10))
+        else:
+            c.setFont("Bold", 11)
+            c.drawString(x + 6, top - 14, f"{WEEKDAYS[day.weekday()]} {day:%d.%m}")
         for item, lane, lanes in _lanes(items):
             start, end = _span(item)
             w = (col_w - 2 * (lanes - 1)) / lanes
             bx = x + lane * (w + 2)
             y_top, y_bottom = y_of(start) - 1, y_of(end) + 1
             h = y_top - y_bottom
-            # уроки — синие, репетиторы (у них ссылка на вход) — фиолетовые, вне школы — зелёные
-            kind = "note" if item.get("link") else ("regular" if item.get("lesson") else "once")
+            # цвета из Figma: уроки — сиреневые, репетиторы (у них ссылка на вход) — розовые, вне школы — салатовые
+            kind = "tt_tutor" if item.get("link") else ("tt_lesson" if item.get("lesson") else "tt_other")
             fill, border = _box_colors(kind)
             c.setFillColor(fill)
             c.setStrokeColor(border)
+            c.setLineWidth(1)
             c.roundRect(bx, y_bottom, w, h, 3, stroke=1, fill=1)
             if item.get("until"):
                 time = f"до {item['end']}"
@@ -293,17 +343,22 @@ def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str
             line -= 10
             if line < y_bottom + 2:
                 continue
-            # название — в две строки, если хватает высоты
+            # название — Coolvetica 10 (если в шрифте есть буквы), в две строки, если хватает высоты
+            font = _can(DISPLAY_FONT, name, "Bold")
+            size = 10 if font != "Bold" else 9
             words, first_line = name.split(), ""
-            while words and c.stringWidth((first_line + " " + words[0]).strip(), "Bold", 8.5) <= w - 8:
+            while words and c.stringWidth((first_line + " " + words[0]).strip(), font, size) <= w - 8:
                 first_line = (first_line + " " + words.pop(0)).strip()
-            c.setFont("Bold", 8.5)
+            c.setFont(font, size)
             if words and line - 10 >= y_bottom + 2:
-                c.drawString(bx + 4, line, first_line or _fit(c, name, "Bold", 8.5, w - 8))
-                line -= 9.5
-                c.drawString(bx + 4, line, _fit(c, " ".join(words), "Bold", 8.5, w - 8))
-            else:
-                c.drawString(bx + 4, line, _fit(c, name, "Bold", 8.5, w - 8))
+                c.drawString(bx + 4, line, first_line or _fit(c, name, font, size, w - 8))
+                line -= 10
+                c.drawString(bx + 4, line, _fit(c, " ".join(words), font, size, w - 8))
+            else:  # в одну строку: сначала чуть уменьшаем шрифт, потом уже обрезаем
+                while size > 7.5 and c.stringWidth(name, font, size) > w - 8:
+                    size -= 0.5
+                c.setFont(font, size)
+                c.drawString(bx + 4, line, _fit(c, name, font, size, w - 8))
             line -= 9
             c.setFont("Body", 7)
             c.setFillColor(COLORS["muted"])
@@ -312,7 +367,7 @@ def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str
                 line -= 8.5
             alt = other.get((day.weekday(), item.get("start")))
             if alt and item.get("week") is not None and line >= y_bottom + 2:
-                c.setFillColor(COLORS["regular_border"])
+                c.setFillColor(border)
                 c.drawString(bx + 4, line, _fit(c, f"через неделю: {alt}", "Body", 7, w - 8))
     c.showPage()
     c.save()
