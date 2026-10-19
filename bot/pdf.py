@@ -226,7 +226,8 @@ def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str
             c.drawString(x + 5, y - 10, time)
             if item.get("room"):
                 c.setFont("Body", 8)
-                c.drawRightString(x + col_w - 5, y - 10, f"каб. {item['room']}")
+                room = "онлайн" if item["room"].lower() == "онлайн" else f"каб. {item['room']}"
+                c.drawRightString(x + col_w - 5, y - 10, room)
             name = (f"{item['num']}. " if item.get("num") else "") + item["title"]
             line = y - 21
             bottom_y = y - card_h + 4

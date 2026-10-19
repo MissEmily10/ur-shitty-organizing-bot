@@ -216,7 +216,7 @@ def bell_text(current: dict, nxt: dict | None, after: dict | None) -> str:
             lines.append("💻 Онлайн" if nxt["room"].lower() == "онлайн" else f"🚪 Кабинет {nxt['room']}")
         if nxt["teacher"]:
             lines.append(f"👩‍🏫 {nxt['teacher']}")
-        lines.append(f"⏰ Начало в {nxt['start']} · перемена {gap} мин")
+        lines.append(f"⏰ Начало в {nxt['start']} · " + (f"перемена {gap} мин" if gap > 0 else "сразу, без перемены"))
         return "\n".join(lines)
     text = head + "\nЭто последний урок на сегодня 🎉"
     if after:
@@ -279,13 +279,20 @@ def due_homework(data: dict, now: datetime) -> list[tuple[str, dict]]:
 # ---------- текст и основное расписание ----------
 
 
+def _room(i: dict) -> str:
+    """«каб. 410» или «онлайн»."""
+    if not i.get("room"):
+        return ""
+    return "онлайн" if i["room"].lower() == "онлайн" else f"каб. {i['room']}"
+
+
 def lesson_line(i: dict) -> str:
     if i.get("until"):
         time = f"до {i['end']}"
     else:
         time = f"{i['start']}–{i['end']}" if i["start"] and i["end"] else i["start"]
     bits = [f"{i['num']} · " if i["num"] else "", i["title"]]
-    extra = " · ".join(x for x in (f"каб. {i['room']}" if i["room"] else "", i["teacher"]) if x)
+    extra = " · ".join(x for x in (_room(i), i["teacher"]) if x)
     return f"{time} — {''.join(bits)}" + (f" ({extra})" if extra else "")
 
 
@@ -314,7 +321,7 @@ def main_slots(data: dict) -> list[dict]:
         if id(i) in pairs:
             title = f"{i['title']} / {pairs[id(i)]['title']} (чередуются через неделю)"
         if i["room"]:
-            title += f" · каб. {i['room']}"
+            title += f" · {_room(i)}"
         slots.append({"title": SLOT_MARK + title, "days": i["days"], "start": i["start"], "end": i["end"]})
     return slots
 

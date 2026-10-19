@@ -4401,10 +4401,14 @@ async def set_commands(app: Application) -> None:
         seeded = await timetable.seed_owner(c.OWNER_ID)
         log.info("timetable: %s", seeded)
         log.info("timetable upgrade: %s", await timetable.upgrade_owner(c.OWNER_ID))
+        reloaded = await timetable.reload_owner(c.OWNER_ID)
+        log.info("timetable reload: %s", reloaded)
+        if reloaded.startswith("загружено"):
+            seeded = "загружено (новое расписание)"
         if seeded.startswith("загружено"):
             text, kb = await _tt_view(c.OWNER_ID)
             await app.bot.send_message(
-                c.OWNER_ID, "🎒 Внесла твоё расписание уроков: звонки за 5 минут до конца урока включены.\n\n" + text,
+                c.OWNER_ID, "🎒 Внесла твоё новое расписание уроков (репетиторы — как были): звонки за 5 минут до конца урока включены.\n\n" + text,
                 reply_markup=kb, parse_mode=ParseMode.HTML,
             )  # fmt: skip
     except Exception:

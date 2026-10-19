@@ -83,7 +83,8 @@ Telegram-бот «организатор мыслей»: заметки (тек�
   (`week_index`, `swap`), звонки `due_bells` (вызов в `scheduler._bells` на каждом тике), выгрузка в основное
   расписание с меткой «🎒 » (`sync_main_schedule`), PDF `week_pdf` → `pdf.timetable_pdf`. Данные — `timetable:<uid>` в
   «Служебном». Её расписание по её просьбе лежит в `data/owner_timetable.txt` (репозиторий публичный — она
-  сказала, что это не важно) и один раз загружается при запуске (`seed_owner`, флаг `seed:timetable:1`). В `main.py` раздел «🎒 моё расписание» (`tt:`, черновик `td2:`).
+  сказала, что это не важно) и загружается при запуске (`seed_owner`; новая версия файла — поднять `timetable.SEED_VERSION`, тогда `reload_owner`
+  заменит загруженное, репетиторы добавляются из `_tutors`). В `main.py` раздел «🎒 моё расписание» (`tt:`, черновик `td2:`).
 - `team.py` — 👥 сводки командных проектов (по кнопке и задача `team_summary` в понедельник).
 - `report.py` + `weekly.py` — недельный отчёт (Pillow). `documents.py` — PDF/Word/Excel/CSV/TXT.
 - Оформление картинок и PDF — `design/tokens.json` + шрифт PT Sans в `design/fonts/` (временное, под её дизайн).

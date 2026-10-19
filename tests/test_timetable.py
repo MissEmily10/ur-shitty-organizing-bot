@@ -141,16 +141,16 @@ async def run():
     assert len(bells) == 1 and not [t for t in h.texts(chat=77) if t.startswith("🔔")]
     # 8. разовая загрузка расписания владелицы из data/owner_timetable.txt
     real = timetable.parse(timetable.SEED_FILE.read_text(encoding="utf-8"))
-    assert len(real) == 30 and len(timetable.alternatives({"items": real})) == 2
+    assert len(real) == 23 and timetable.alternatives({"items": real}) == []
     h.service.pop("timetable:42", None)
     h.service.pop("seed:timetable:1", None)
     slots.clear()
     result = await timetable.seed_owner(42)
-    assert result.startswith("загружено: 30") and (await timetable.load(42))["anchor"] == timetable.SEED_ANCHOR
+    assert result.startswith("загружено: 23") and (await timetable.load(42))["anchor"] == timetable.SEED_ANCHOR
     assert await timetable.seed_owner(42) == "не нужно", "только один раз"
     seeded = await timetable.load(42)
-    tue = [i["title"] for i in timetable.for_day(seeded, date(2026, 10, 13))]
-    assert "Химия" in tue and "Биология" not in tue, tue
+    thu = [i["title"] for i in timetable.for_day(seeded, date(2026, 10, 22))]
+    assert thu == ["Физическая культура (в записи)", "Информатика", "Литература", "Химия", "Консультация по алгебре", "Танцы тодес олимпийский"], thu
     # 9. репетиторы пн/ср: по часу, ссылка за 5 минут до начала, «сделала домашку?» после
     h.service.pop("seed:timetable:3", None)
     assert (await timetable.upgrade_owner(42)).startswith("репетиторы")
@@ -189,6 +189,21 @@ async def run():
         await scheduler.tick(app.bot, [42], now=t)
     assert len([t for t in h.texts(chat=42) if t.startswith("🔗 Через 5 мин: Китайский")]) == 1
     assert len([t for t in h.texts(chat=42) if "Сделала домашку?" in t]) == 1
+    # 10. новая версия расписания заменяет загруженную: школьные уроки новые, репетиторы и звонки — как были
+    old = await timetable.load(42)
+    old["bells"] = False
+    await timetable.save(42, old)
+    h.service.pop("seed:timetable:version", None)
+    assert (await timetable.reload_owner(42)).startswith("загружено: 23")
+    assert await timetable.reload_owner(42) == "не нужно"
+    new = await timetable.load(42)
+    assert new["bells"] is False
+    assert [i["title"] for i in new["items"] if i.get("link")] == ["Китайский", "Математика", "Обществознание"]
+    assert not any(i["room"] not in ("", "онлайн") for i in new["items"]), "старых кабинетов не осталось"
+    assert any(s["title"] == "🎒 Химия · онлайн" for s in slots) and not any("каб." in s["title"] for s in slots)
+    new["bells"] = True
+    (_, text), = timetable.due_bells(new, datetime(2026, 10, 19, 12, 55, tzinfo=timezone.utc))
+    assert "💻 Онлайн" in text and "без перемены" in text, text
     print("timetable OK")
 
 
