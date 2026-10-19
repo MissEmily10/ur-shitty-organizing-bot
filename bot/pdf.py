@@ -271,7 +271,9 @@ def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str
             bx = x + lane * (w + 2)
             y_top, y_bottom = y_of(start) - 1, y_of(end) + 1
             h = y_top - y_bottom
-            fill, border = _box_colors("regular" if item.get("lesson") else "once")
+            # уроки — синие, репетиторы (у них ссылка на вход) — фиолетовые, вне школы — зелёные
+            kind = "note" if item.get("link") else ("regular" if item.get("lesson") else "once")
+            fill, border = _box_colors(kind)
             c.setFillColor(fill)
             c.setStrokeColor(border)
             c.roundRect(bx, y_bottom, w, h, 3, stroke=1, fill=1)
