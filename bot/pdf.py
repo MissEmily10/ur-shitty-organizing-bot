@@ -383,6 +383,7 @@ NOTE_KINDS = (  # цвет карточки по типу — палитра «�
     ("tt_tutor", ("иде", "референс")),
     ("tt_other", ("событ", "обсуд", "встреч")),
 )
+RULE_GAP = 17  # расстояние между линейками для пометок, pt (~6 мм — удобно писать ручкой)
 NOTES_LEGEND = "сиреневые — задачи и напоминания · розовые — идеи и референсы · салатовые — события и «обсудить»"
 
 
@@ -433,9 +434,10 @@ def notes_pdf(groups: list[tuple[str, list[tuple[str, list[dict]]]]], title: str
         name = _clean(note["title"]) or "Без названия"
         font = _can(DISPLAY_FONT, name, "Bold")
         title_lines = _wrap(c, name, font, 10.5, text_w, 2)
-        summary = _wrap(c, _clean(note.get("summary") or ""), "Body", 8.5, text_w + 110, 3 if not indent else 2)
-        return {"note": note, "indent": indent, "font": font, "title": title_lines, "summary": summary,
-                "h": 8 + 12.5 * len(title_lines) + 10.5 * len(summary) + 4}  # fmt: skip
+        summary = _wrap(c, _clean(note.get("summary") or ""), "Body", 9, text_w + 110, 3 if not indent else 2)
+        rules = 1 if indent else 2  # линейки для пометок от руки: у заметки две, у подзадачи одна
+        return {"note": note, "indent": indent, "font": font, "title": title_lines, "summary": summary, "rules": rules,
+                "h": 8 + 12.5 * len(title_lines) + 11 * len(summary) + 4 + RULE_GAP * rules}  # fmt: skip
 
     # 1. раскладка: элементы (заголовок сферы, проекта, карточка с подзадачами) по страницам
     blocks: list[tuple[str, object, float]] = []
@@ -474,7 +476,7 @@ def notes_pdf(groups: list[tuple[str, list[tuple[str, list[dict]]]]], title: str
         c.drawRightString(PORTRAIT_W - m, PORTRAIT_H - m - 24, _clean(subtitle))
         c.setFont("Body", 7.5)
         c.drawString(m, PORTRAIT_H - m - 40, NOTES_LEGEND)
-        c.drawString(m, m, "Вычеркни ненужное ручкой и пришли фото боту: /crossed")
+        c.drawString(m, m, "Вычеркни ненужное, допиши пометки на линейках и пришли фото боту: /crossed")
         c.drawRightString(PORTRAIT_W - m, m, f"стр. {n} из {len(pages)}")
         for kind, data, y in page:
             if kind == "sphere":
@@ -533,9 +535,18 @@ def _note_row(c: Canvas, card: dict, x0: float, width: float, y: float) -> None:
         c.setFont("Body", 7.5)
         c.setFillColor(COLORS["muted"])
         c.drawRightString(x0 + width - 8, y - 15.5, _fit(c, meta, "Body", 7.5, 104))
-    c.setFont("Body", 8.5)
+    c.setFont("Body", 9)
     c.setFillColor(COLORS["muted"])
     line += 1.5
     for t in card["summary"]:
         c.drawString(tx, line, t)
-        line -= 10.5
+        line -= 11
+    # линейки для пометок: пунктир по всей ширине карточки, номер заметки рядом — ИИ поймёт, к чему пометка
+    c.setStrokeColor(COLORS["muted"])
+    c.setLineWidth(0.4)
+    c.setDash(1, 2.5)
+    bottom = y - card["h"] + 5
+    for i in range(card["rules"]):
+        ry = bottom + i * RULE_GAP
+        c.line(tx, ry, x0 + width - 10, ry)
+    c.setDash()

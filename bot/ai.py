@@ -772,19 +772,25 @@ async def split_tasks(text: str, now: datetime, types: list[str]) -> list[dict]:
     return parts[:SPLIT_MAX] if len(parts) >= 2 else []
 
 
-# ---------- ✏️ зачёркнутое на распечатке ----------
+# ---------- ✏️ зачёркнутое и ✍️ пометки на распечатке ----------
 
-CROSSED_PROMPT = """На фото — распечатанный список заметок. У каждой заметки слева квадратик и номер вида «#12».
-Человек ручкой вычеркнул ненужные: зачеркнул строку или название, поставил крестик или галочку в квадратике, обвёл и перечеркнул.
-Перечисли номера ВСЕХ таких отмеченных заметок со всех фото. Не отмеченные не включай; если сомневаешься — не включай.
-Ответь только JSON: {"crossed": [номера]}"""
+PRINTOUT_PROMPT = """На фото — распечатанный список заметок. У каждой заметки слева квадратик и номер вида «#12», под ней линейки для пометок.
+Человек ручкой:
+1) вычеркнул ненужные — зачеркнул строку или название, поставил крестик или галочку в квадратике;
+2) дописал к некоторым заметкам пометки от руки — рядом, на линейках, на полях со стрелкой.
+Найди и то, и другое на всех фото. Пометку относи к заметке, рядом с которой она написана (по номеру и названию).
+Перепиши пометку дословно, как написано; неразборчивое слово — [неразборчиво]. Если сомневаешься, вычеркнута ли заметка, — не включай.
+{titles}Ответь только JSON: {{"crossed": [номера], "comments": [{{"num": номер, "text": "пометка"}}]}}"""
 
 
-async def crossed_numbers(images: list[bytes]) -> list[int]:
-    content = _with_images(images, CROSSED_PROMPT)
+async def read_printout(images: list[bytes], titles: dict[int, str] | None = None) -> tuple[list[int], list[dict]]:
+    """Вычеркнутые номера и рукописные пометки [{"num", "text"}] с фото распечатки."""
+    known = "".join(f"#{n} {t}\n" for n, t in sorted((titles or {}).items()))
+    hint = f"Заметки на распечатке:\n{known[:8000]}\n" if known else ""
     response = await _client().chat_completion(
-        model=c.VISION_MODEL, messages=[{"role": "user", "content": content}], max_tokens=800, temperature=0
-    )
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": _with_images(images, PRINTOUT_PROMPT.format(titles=hint))}],
+        max_tokens=2000, temperature=0,
+    )  # fmt: skip
     raw = _json_object(response.choices[0].message.content or "")
     numbers = []
     for x in raw.get("crossed") or []:
@@ -792,4 +798,46 @@ async def crossed_numbers(images: list[bytes]) -> list[int]:
             numbers.append(int(str(x).lstrip("#")))
         except ValueError:
             continue
-    return sorted(set(n for n in numbers if n > 0))
+    comments = []
+    for item in raw.get("comments") or []:
+        try:
+            num, text = int(str(item.get("num")).lstrip("#")), str(item.get("text") or "").strip()
+        except (AttributeError, ValueError):
+            continue
+        if text and num > 0:
+            comments.append({"num": num, "text": text[:1000]})
+    return sorted(set(n for n in numbers if n > 0)), comments
+
+
+REVISE_PROMPT = """Ниже заметка пользователя и его пометка к ней от руки (сделана сегодня, {today}).
+Перепиши заметку так, чтобы она осталась актуальной в нынешнем контексте: убери то, что по пометке уже сделано или неактуально,
+добавь то новое, что сказано в пометке. Ничего не выдумывай, пиши на языке оригинала, коротко.
+{kids_rule}Ответь только JSON: {{"title": "новое название, до 8 слов", "text": "новая суть в Markdown: 1–5 пунктов «- », задачи как «- [ ] »"{kids_json}}}
+
+Название: {title}
+Текст:
+{body}
+{kids}
+Пометка: «{comment}»"""
+
+
+async def revise_note(title: str, body: str, comment: str, today: str, kids: list[str] | None = None) -> dict:
+    """{"title", "text", "close": [номера подзадач с 1, которые по пометке готовы]}."""
+    kids = kids or []
+    listing = "Подзадачи:\n" + "\n".join(f"{i}. {k}" for i, k in enumerate(kids, 1)) + "\n" if kids else ""
+    raw = _json_object(await _complete(REVISE_PROMPT.format(
+        today=today, title=title, body=body[:6000], comment=comment, kids=listing,
+        kids_rule="Если по пометке какие-то подзадачи готовы — перечисли их номера в close.\n" if kids else "",
+        kids_json=', "close": [номера готовых подзадач]' if kids else "",
+    ), 1500))  # fmt: skip
+    new_title = str(raw.get("title") or "").strip()[:120]
+    if not new_title:
+        raise RuntimeError("ИИ не смог переписать заметку, попробуйте ещё раз.")
+    close = []
+    for x in raw.get("close") or []:
+        try:
+            if 1 <= int(x) <= len(kids):
+                close.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    return {"title": new_title, "text": str(raw.get("text") or "").strip()[:3000], "close": sorted(set(close))}

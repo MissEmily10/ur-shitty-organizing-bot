@@ -1210,6 +1210,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id and (reply.text or "").startswith(MOOD_COMMENT_MARK):
         await _mood_comment(update.message, reply.text)
         return
+    if asked(COMMENT_EDIT_PROMPT):
+        await _comment_reply(update.message)
+        return
     if (prompt := asked(ROUTINE_PROMPT, *CHANGE_PROMPTS.values())):
         kind = next((k for k, p in CHANGE_PROMPTS.items() if p == prompt), None)
         await _schedule_reply(update.message, routine=prompt == ROUTINE_PROMPT, category=kind)
@@ -2695,7 +2698,14 @@ async def _send_print(message: Message, uid: int) -> None:
             return
         today = scheduler.local_now(await scheduler.get_settings(uid)).date()
         data = pdf.notes_pdf(groups, f"Все мои заметки · {today:%d.%m.%Y}", f"открытых: {total}")
-        await notion.set_value(f"print:{uid}", json.dumps({"date": f"{today:%d.%m}", "map": numbers}))
+        titles = {}  # названия — подсказка ИИ, к какой заметке относится пометка от руки
+        for _, block in groups:
+            for _, notes in block:
+                for e in notes:
+                    for x in [e] + e["children"]:
+                        titles[x["num"]] = x["title"][:50]
+        stored = {"date": f"{today:%d.%m}", "map": numbers, "titles": dict(list(titles.items())[:300])}
+        await notion.set_value(f"print:{uid}", json.dumps(stored, ensure_ascii=False))
     except Exception as e:
         log.exception("print failed")
         await status.edit_text(f"❌ Не получилось собрать PDF: {e}"[:4000])
@@ -2737,7 +2747,7 @@ async def crossed_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await _start_crossing(update.message, update.effective_user.id)
 
 
-async def _crossed_found(message: Message, uid: int, numbers: list[int]) -> None:
+async def _crossed_found(message: Message, uid: int, numbers: list[int], comments: list[dict] | None = None) -> None:
     stored = await notion.get_value(f"print:{uid}")
     if not stored:
         await message.reply_text("Не нашла распечатку: /printnotes")
@@ -2745,19 +2755,24 @@ async def _crossed_found(message: Message, uid: int, numbers: list[int]) -> None
     mapping = {int(k): v for k, v in json.loads(stored)["map"].items()}
     found = [n for n in numbers if n in mapping]
     missing = [n for n in numbers if n not in mapping]
-    if not found:
+    # пометка к вычеркнутой заметке не нужна: её всё равно удаляют или закрывают
+    notes = [x for x in comments or [] if x["num"] not in found]
+    if not found and not notes:
         extra = f" (номеров {', '.join(map(str, missing))} в распечатке нет)" if missing else ""
-        await message.reply_text(f"🤷 Не нашла вычеркнутых{extra}. Пришли фото поближе и при хорошем свете или напиши номера: «3 7 12».")
+        await message.reply_text(f"🤷 Не нашла ни вычеркнутых, ни пометок{extra}. Пришли фото поближе и при хорошем свете или напиши номера: «3 7 12».")
         return
-    titles = {}
-    for n in found:
-        try:
-            titles[n] = (await notion.page_info(mapping[n]))["title"]
-        except Exception:
-            titles[n] = "(уже удалена)"
-    _crossed[uid] = {"map": {n: mapping[n] for n in found}, "titles": titles, "sel": set(found), "missing": missing}
-    text, kb = _crossed_view(uid)
-    await message.reply_text(text, reply_markup=kb)
+    if found:
+        titles = {}
+        for n in found:
+            try:
+                titles[n] = (await notion.page_info(mapping[n]))["title"]
+            except Exception:
+                titles[n] = "(уже удалена)"
+        _crossed[uid] = {"map": {n: mapping[n] for n in found}, "titles": titles, "sel": set(found), "missing": missing}
+        text, kb = _crossed_view(uid)
+        await message.reply_text(text, reply_markup=kb)
+    if notes:
+        await _comments_start(message, uid, mapping, notes)
 
 
 def _crossed_view(uid: int, pick: bool = False) -> tuple[str, InlineKeyboardMarkup]:
@@ -2780,15 +2795,134 @@ def _crossed_view(uid: int, pick: bool = False) -> tuple[str, InlineKeyboardMark
 
 
 async def _crossed_photos(message: Message, uid: int, images: list[bytes]) -> None:
-    status = await message.reply_text("🔎 Ищу вычеркнутые номера…")
+    status = await message.reply_text("🔎 Ищу вычеркнутое и пометки…")
     try:
-        numbers = await ai.crossed_numbers(images)
+        printed = json.loads(await notion.get_value(f"print:{uid}") or "{}")
+        titles = {int(k): v for k, v in (printed.get("titles") or {}).items()}
+        numbers, comments = await ai.read_printout(images, titles)
     except Exception as e:
         log.exception("crossed failed")
         await status.edit_text(f"❌ Не получилось прочитать фото: {e}"[:4000])
         return
     await status.delete()
-    await _crossed_found(message, uid, numbers)
+    await _crossed_found(message, uid, numbers, comments)
+
+
+# ---------- ✍️ пометки от руки: заметка переписывается под нынешний контекст ----------
+# По одной пометке: превью «было → станет», ✅ применить / ✏️ поправить словами / ⏭ пропустить.
+# Старая суть остаётся в заметке свёрнутым блоком «🕘 Было до правки» (notion.rewrite).
+# callback_data: cm:<ok|ed|sk>
+
+COMMENT_EDIT_PROMPT = "✏️ Как поправить заметку"
+_comments: dict[int, dict] = {}  # {"items": [{"num", "id", "text", "proposal"}], "i": номер текущей, "done": сколько применено}
+
+
+async def _comments_start(message: Message, uid: int, mapping: dict[int, str], notes: list[dict]) -> None:
+    items = [{"num": x["num"], "id": mapping.get(x["num"]), "text": x["text"]} for x in notes]
+    _comments[uid] = {"items": items, "i": 0, "done": 0}
+    word = _plural(len(items), "пометку", "пометки", "пометок")
+    await message.reply_text(f"✍️ Нашла {len(items)} {word} от руки. Покажу по одной, что поменяю в заметке, — без тебя ничего не трогаю.")
+    await _comment_show(message, uid)
+
+
+async def _comment_propose(uid: int, item: dict, extra: str = "") -> None:
+    note = await own_page(uid, item["id"])
+    kids = [k for k in await notion.children(item["id"]) if not k["done"]]
+    today = scheduler.local_now(await scheduler.get_settings(uid)).strftime("%d.%m")
+    comment = item["text"] + (f". Уточнение: {extra}" if extra else "")
+    proposal = await ai.revise_note(note["title"], await notion.preview(item["id"], 3000), comment, today, [k["title"] for k in kids])
+    item.update(title=note["title"], proposal=proposal, kids=[(k["id"], k["title"]) for k in kids], today=today)
+
+
+async def _comment_show(message: Message, uid: int, edit_q=None) -> None:
+    st = _comments.get(uid)
+    while st and st["i"] < len(st["items"]):
+        item = st["items"][st["i"]]
+        head = f"✍️ <b>Пометка {st['i'] + 1} из {len(st['items'])}</b> · #{item['num']}\n«{escape(item['text'])}»\n\n"
+        if not item["id"]:
+            text = head + "Такого номера в распечатке нет — пропускаю. Если пометка важная, напиши её в заметку сама."
+            await message.reply_text(text, parse_mode=ParseMode.HTML)
+            st["i"] += 1
+            continue
+        try:
+            if "proposal" not in item:
+                await _comment_propose(uid, item)
+        except Exception as e:
+            log.exception("revise failed")
+            await message.reply_text(head + f"❌ Не получилось переписать: {escape(str(e)[:300])}", parse_mode=ParseMode.HTML)
+            st["i"] += 1
+            continue
+        p = item["proposal"]
+        close = [item["kids"][n - 1][1] for n in p["close"]]
+        text = (
+            head + f"<b>Было:</b> {escape(item['title'])}\n<b>Станет:</b> {escape(p['title'])}\n{escape(p['text'])}"
+            + ("\n\n✅ Закрою подзадачи: " + ", ".join(f"«{escape(t)}»" for t in close) if close else "")
+            + "\n\nСтарый текст останется в заметке свёрнутым блоком «🕘 Было до правки»."
+        )
+        kb = InlineKeyboardMarkup([
+            [Btn("✅ Применить", callback_data="cm:ok"), Btn("✏️ Поправить словами", callback_data="cm:ed")],
+            [Btn("⏭ Пропустить", callback_data="cm:sk")],
+        ])  # fmt: skip
+        if edit_q:
+            await _edit(edit_q, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+    if st:
+        _comments.pop(uid, None)
+        if uid not in _crossed:
+            _crossing.pop(uid, None)
+        done = f"Поправила {st['done']} {_plural(st['done'], 'заметку', 'заметки', 'заметок')}." if st["done"] else "Ничего не меняла."
+        if edit_q:
+            await _edit(edit_q, f"✍️ Пометки разобраны. {done}")
+        else:
+            await message.reply_text(f"✍️ Пометки разобраны. {done}")
+
+
+async def on_comment_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    st = _comments.get(uid)
+    if not is_member(uid) or not st or st["i"] >= len(st["items"]):
+        await q.answer("Устарело — пришли фото ещё раз: /crossed" if is_member(uid) else None)
+        return
+    action = q.data.split(":")[1]
+    item = st["items"][st["i"]]
+    try:
+        if action == "ed":
+            await q.answer()
+            await _ask(q.message, f"{COMMENT_EDIT_PROMPT} #{item['num']}? Напиши ответом, что учесть.", input_field_placeholder="оставь ещё про PDF")
+            return
+        if action == "ok":
+            p = item["proposal"]
+            await notion.rewrite(item["id"], p["title"], to_blocks(p["text"]), item["today"])
+            for n in p["close"]:
+                await notion.set_done(item["kids"][n - 1][0], True)
+            st["done"] += 1
+            await _ack(q, "Поправила ✓")
+        else:
+            await q.answer("Пропустила")
+        st["i"] += 1
+        await _comment_show(q.message, uid, edit_q=q)
+    except Exception as e:
+        log.exception("comment button failed")
+        await _fail(q, e)
+
+
+async def _comment_reply(message: Message) -> None:
+    """Ответ на «✏️ Как поправить заметку #N?»: ИИ переписывает ещё раз с уточнением."""
+    uid = message.chat_id
+    st = _comments.get(uid)
+    if not st or st["i"] >= len(st["items"]):
+        await message.reply_text("Устарело — пришли фото ещё раз: /crossed")
+        return
+    try:
+        await _comment_propose(uid, st["items"][st["i"]], message.text)
+    except Exception as e:
+        log.exception("revise again failed")
+        await message.reply_text(f"❌ Не получилось переписать: {e}"[:4000])
+        return
+    await _comment_show(message, uid)
 
 
 async def on_print_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5076,6 +5210,7 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CallbackQueryHandler(on_sweep_button, pattern=r"^sw:"))
     app.add_handler(CallbackQueryHandler(on_split_button, pattern=r"^sp:"))
     app.add_handler(CallbackQueryHandler(on_print_button, pattern=r"^(pf|cr):"))
+    app.add_handler(CallbackQueryHandler(on_comment_button, pattern=r"^cm:"))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))
     app.add_handler(CommandHandler("schedule", schedule_cmd, filters=member))
     app.add_handler(CommandHandler("report", report_cmd, filters=member))

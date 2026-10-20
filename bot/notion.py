@@ -579,6 +579,26 @@ async def project_titles(project: str, exclude: str, user_id: int, limit: int = 
     return [_title(p) for p in data["results"] if p["id"].replace("-", "") != exclude][:limit]
 
 
+async def rewrite(page_id: str, title: str, blocks: list[dict], stamp: str) -> None:
+    """Заметку переписали по пометке: новое название, новая суть наверху; старая суть — в свёрнутом блоке «🕘 Было до правки»."""
+    top = await _children(page_id)
+    old = []
+    for b in top:  # суть — текстовые блоки в начале заметки, до картинок, файлов и свёрнутых блоков
+        if b["type"] == "toggle" or _block_text(b) is None:
+            break
+        old.append(b)
+    keep = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": t[:1900]}}]}}
+            for t in (_block_text(b).strip() for b in old) if t]  # fmt: skip
+    new = blocks[:90] + ([toggle(f"🕘 Было до правки {stamp}", keep)] if keep else [])
+    await _call("PATCH", f"/pages/{page_id}", {"properties": {c.P_TITLE: {"title": [{"text": {"content": title[:200]}}]}}})
+    if old:
+        await _call("PATCH", f"/blocks/{page_id}/children", {"children": new, "after": old[-1]["id"]})
+        for b in old:
+            await _call("DELETE", f"/blocks/{b['id']}")
+    else:
+        await _append(page_id, new)
+
+
 async def add_section(page_id: str, title: str, blocks: list[dict]) -> None:
     """Дописывает в заметку раздел с заголовком (например, разбор Арт-директора)."""
     heading = {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": title}}]}}

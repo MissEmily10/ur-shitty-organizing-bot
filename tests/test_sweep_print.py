@@ -8,6 +8,7 @@ import harness as h
 
 from bot import ai, main, notion, pdf
 
+REAL_REWRITE = notion.rewrite
 AREA = "a" * 32
 projects = [{"id": "1" * 32, "name": "Домашка", "sphere_id": AREA, "kind": notion.KIND_SHARED, "creator": 42, "members": [],
              "status": notion.STATUS_ACTIVE, "description": "", "url": ""}]  # fmt: skip
@@ -173,13 +174,37 @@ async def run():
     async def download(msg):
         return b"jpg"
 
-    async def crossed(images):
-        assert images == [b"jpg"]
-        return [2, 77]
-    main._download_image, ai.crossed_numbers = download, crossed
+    async def read_printout(images, titles):
+        assert images == [b"jpg"] and titles[2] == "Планы на неделю", titles
+        comments = [{"num": 1, "text": "разобрано всё, кроме бота"}, {"num": 2, "text": "к вычеркнутой — не нужна"},
+                    {"num": 99, "text": "неизвестно к чему"}]  # fmt: skip
+        return [2, 77], comments
+
+    revised, rewritten = [], []
+
+    async def revise_note(title, body, comment, today, kids=None):
+        revised.append(comment)
+        return {"title": "Разобрать: бот", "text": "- [ ] бот", "close": []}
+
+    async def rewrite(pid, title, blocks, stamp):
+        rewritten.append((pid, title))
+    main._download_image, ai.read_printout, ai.revise_note, notion.rewrite = download, read_printout, revise_note, rewrite
     await app.process_update(photo_update())
-    shown = last()
+    shown = next(d for e, d in reversed(h.sent) if e == "sendMessage" and "Вычеркнуто" in d.get("text", ""))
     assert "#2 Планы на неделю" in shown["text"] and "77" in shown["text"] and ("🗑 Удалить (1)", "cr:del") in kb(shown), shown["text"]
+
+    # ✍️ пометки от руки: к вычеркнутой — не нужна; по одной: «было → станет», поправить словами, применить
+    proposal = last()
+    assert "Пометка 1 из 2" in proposal["text"] and "Станет:</b> Разобрать: бот" in proposal["text"], proposal["text"]
+    assert revised == ["разобрано всё, кроме бота"]
+    await app.process_update(h.callback("cm:ed"))
+    asked = h.texts(chat=42)[-1]
+    assert asked.startswith(main.COMMENT_EDIT_PROMPT)
+    await app.process_update(h.text("оставь ещё сайт", reply_to=h._message(asked)))
+    assert revised[-1].endswith("Уточнение: оставь ещё сайт")
+    await app.process_update(h.callback("cm:ok"))
+    assert rewritten == [(mid, "Разобрать: бот")]
+    assert "нет — пропускаю" in h.texts(chat=42)[-2] and "Поправила 1 заметку" in h.texts(chat=42)[-1], h.texts(chat=42)[-3:]
     await app.process_update(h.callback("cr:pick"))
     await app.process_update(h.callback("cr:t:2"))
     assert "⬜ #2" in last("editMessageText")["text"]
@@ -199,6 +224,25 @@ async def run():
     for label in ("🧽 Перебрать все", "🖨 Печать", "✏️ Зачёркнутое"):
         assert label in text and any(b[0] == label for row in rows for b in row), label
     assert pdf.notes_pdf([], "x", "y")[:4] == b"%PDF"
+
+    # 6. notion.rewrite: новое название, новая суть на месте старой, старая — в «🕘 Было до правки»
+    calls = []
+
+    def para(i, text):
+        return {"id": f"b{i}", "type": "paragraph", "paragraph": {"rich_text": [{"plain_text": text}]}}
+
+    async def fake_children(pid):
+        return [para(1, "Сайт, бот, PDF"), para(2, "разобрать всё"), {"id": "t", "type": "toggle", "toggle": {"rich_text": []}}]
+
+    async def fake_call(method, path, json=None):
+        calls.append((method, path, json))
+        return {}
+    notion._children, notion._call = fake_children, fake_call
+    await REAL_REWRITE("p1", "Разобрать: бот", [para(9, "бот")], "20.10")
+    assert calls[0][2]["properties"][notion.c.P_TITLE]["title"][0]["text"]["content"] == "Разобрать: бот"
+    method, path, body = calls[1]
+    assert path == "/blocks/p1/children" and body["after"] == "b2" and body["children"][-1]["toggle"]["rich_text"][0]["text"]["content"] == "🕘 Было до правки 20.10"
+    assert [c[:2] for c in calls[2:]] == [("DELETE", "/blocks/b1"), ("DELETE", "/blocks/b2")]
     print("sweep print OK")
 
 
