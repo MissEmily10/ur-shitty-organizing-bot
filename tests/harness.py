@@ -118,6 +118,16 @@ _scheduler.JOBS.remove(TIDY_JOB)
 OVERLAPS_JOB = next(j for j in _scheduler.JOBS if j.name == "overlaps")
 _scheduler.JOBS.remove(OVERLAPS_JOB)
 
+# Деление длинных заметок на подзадачи идёт в ИИ по сети: по умолчанию «делить нечего» (проверяется в test_sweep_print)
+from bot import ai as _ai  # noqa: E402
+
+
+async def _no_split(text, now, types):
+    return []
+
+
+_ai.split_tasks = _no_split
+
 REAL = {"_load_projects": _notion._load_projects, "spheres": _notion.spheres}
 _notion._load_projects, _notion.spheres = _no_projects, _no_spheres
 

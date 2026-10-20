@@ -4,6 +4,7 @@
 import calendar
 import io
 import json
+import re
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -372,3 +373,168 @@ def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str
     c.showPage()
     c.save()
     return buf.getvalue()
+
+
+# ---------- 🖨 все заметки для печати: A4 книжная, несколько листов ----------
+
+PORTRAIT_W, PORTRAIT_H = A4
+NOTE_KINDS = (  # цвет карточки по типу — палитра «Моего расписания» из Figma владелицы
+    ("tt_lesson", ("задач", "напомин", "план")),
+    ("tt_tutor", ("иде", "референс")),
+    ("tt_other", ("событ", "обсуд", "встреч")),
+)
+NOTES_LEGEND = "сиреневые — задачи и напоминания · розовые — идеи и референсы · салатовые — события и «обсудить»"
+
+
+def _clean(text: str, font: str = "Body") -> str:
+    """Без символов, которых нет в шрифте (эмодзи и т. п.): иначе в PDF были бы квадратики."""
+    glyphs = pdfmetrics.getFont(font).face.charToGlyph
+    return re.sub(r"\s{2,}", " ", "".join(ch for ch in text if ord(ch) in glyphs or ch in "\n")).strip()
+
+
+def _wrap(c: Canvas, text: str, font: str, size: float, width: float, max_lines: int) -> list[str]:
+    """Перенос по словам; что не влезло в max_lines — многоточие в последней строке."""
+    lines: list[str] = []
+    for para in text.splitlines() or [""]:
+        words, line = para.split(), ""
+        for word in words:
+            probe = f"{line} {word}".strip()
+            if c.stringWidth(probe, font, size) <= width:
+                line = probe
+                continue
+            if line:
+                lines.append(line)
+            line = word if c.stringWidth(word, font, size) <= width else _fit(c, word, font, size, width)
+        if line:
+            lines.append(line)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = _fit(c, lines[-1] + " …", font, size, width) if not lines[-1].endswith("…") else lines[-1]
+    return lines
+
+
+def _note_kind(note: dict) -> str:
+    kind = (note.get("type") or note.get("ai_type") or "").lower()
+    return next((name for name, keys in NOTE_KINDS if any(k in kind for k in keys)), "")
+
+
+def notes_pdf(groups: list[tuple[str, list[tuple[str, list[dict]]]]], title: str, subtitle: str) -> bytes:
+    """groups — [(сфера, [(проект, [заметка])])]; заметка — {"num", "title", "type", "when", "summary", "children": [заметка]}.
+    Каждая заметка — карточка с квадратиком и номером «#12», чтобы вычеркнуть ручкой и прислать фото боту."""
+    buf = io.BytesIO()
+    c = Canvas(buf, pagesize=(PORTRAIT_W, PORTRAIT_H))
+    m = 36
+    width = PORTRAIT_W - 2 * m
+    head_font = _can(DISPLAY_FONT, "", "Bold")
+
+    def card_lines(note: dict, indent: float) -> dict:
+        """Строки карточки и её высота (без отрисовки) — чтобы заранее разложить по страницам."""
+        text_w = width - indent - 34 - 70
+        name = _clean(note["title"]) or "Без названия"
+        font = _can(DISPLAY_FONT, name, "Bold")
+        title_lines = _wrap(c, name, font, 10.5, text_w, 2)
+        summary = _wrap(c, _clean(note.get("summary") or ""), "Body", 8.5, text_w + 70, 3 if not indent else 2)
+        return {"note": note, "indent": indent, "font": font, "title": title_lines, "summary": summary,
+                "h": 8 + 12.5 * len(title_lines) + 10.5 * len(summary) + 4}  # fmt: skip
+
+    # 1. раскладка: элементы (заголовок сферы, проекта, карточка с подзадачами) по страницам
+    blocks: list[tuple[str, object, float]] = []
+    for sphere, projects in groups:
+        blocks.append(("sphere", sphere, 30))
+        for project, notes in projects:
+            blocks.append(("project", project, 18))
+            for note in notes:
+                main = card_lines(note, 0)
+                kids = [card_lines(k, 22) for k in note.get("children") or []]
+                blocks.append(("card", (main, kids), main["h"] + sum(k["h"] for k in kids) + 6))
+    top, bottom = PORTRAIT_H - m - 58, m + 22
+    pages: list[list[tuple[str, object, float]]] = [[]]
+    y = top
+    for i, (kind, data, h) in enumerate(blocks):
+        # заголовок не оставляем внизу листа без карточки под ним
+        need = h + (sum(b[2] for b in blocks[i + 1 : i + 3] if b[0] != "sphere") if kind != "card" else 0)
+        if y - min(need, top - bottom) < bottom and pages[-1]:
+            pages.append([])
+            y = top
+        pages[-1].append((kind, data, y))
+        y -= h
+
+    # 2. отрисовка
+    for n, page in enumerate(pages, 1):
+        c.setFillColor(COLORS["text"])
+        text = c.beginText(m, PORTRAIT_H - m - 22)
+        text.setFont(DAY_FONT or "Bold", 24)
+        text.setCharSpace(-0.03 * 24)
+        text.textOut("My notes" if DAY_FONT else _clean(title, "Bold"))
+        c.drawText(text)
+        c.setFont("Body", 9.5)
+        c.setFillColor(COLORS["muted"])
+        c.drawRightString(PORTRAIT_W - m, PORTRAIT_H - m - 12, _clean(title))
+        c.drawRightString(PORTRAIT_W - m, PORTRAIT_H - m - 24, _clean(subtitle))
+        c.setFont("Body", 7.5)
+        c.drawString(m, PORTRAIT_H - m - 40, NOTES_LEGEND)
+        c.drawString(m, m, "Вычеркни ненужное ручкой и пришли фото боту: /crossed")
+        c.drawRightString(PORTRAIT_W - m, m, f"стр. {n} из {len(pages)}")
+        for kind, data, y in page:
+            if kind == "sphere":
+                c.setFillColor(COLORS["tt_day"])
+                c.roundRect(m, y - 22, width, 22, 4, stroke=0, fill=1)
+                c.setFillColor(COLORS["text"])
+                c.setFont(head_font, 12.5)
+                c.drawString(m + 8, y - 15.5, _fit(c, _clean(data, head_font) or "Без сферы", head_font, 12.5, width - 16))
+            elif kind == "project":
+                c.setFillColor(COLORS["muted"])
+                c.setFont("Bold", 9.5)
+                c.drawString(m + 2, y - 11, _fit(c, _clean(data, "Bold"), "Bold", 9.5, width))
+            else:
+                main, kids = data
+                total = main["h"] + sum(k["h"] for k in kids)
+                kind_color = _note_kind(main["note"])
+                fill, border = _box_colors(kind_color) if kind_color else (COLORS["background"], COLORS["grid"])
+                if kids:  # большая заметка с подзадачами — тёплая, как шапки дней в расписании
+                    fill, border = COLORS["tt_day"], COLORS["tt_other_border"]
+                c.setFillColor(fill)
+                c.setStrokeColor(border)
+                c.setLineWidth(0.9)
+                c.roundRect(m, y - total, width, total, 4, stroke=1, fill=1)
+                line_y = y
+                for card in [main] + kids:
+                    _note_row(c, card, m, width, line_y)
+                    line_y -= card["h"]
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _note_row(c: Canvas, card: dict, x0: float, width: float, y: float) -> None:
+    note, indent = card["note"], card["indent"]
+    x = x0 + 8 + indent
+    if indent:  # подзадача: тонкая линия-отступ слева
+        c.setStrokeColor(COLORS["muted"])
+        c.setLineWidth(0.5)
+        c.line(x - 8, y - 2, x - 8, y - card["h"] + 4)
+    # квадратик для галочки и номер
+    c.setFillColor(COLORS["background"])
+    c.setStrokeColor(COLORS["text"])
+    c.setLineWidth(0.8)
+    c.rect(x, y - 17, 9, 9, stroke=1, fill=1)
+    c.setFillColor(COLORS["text"])
+    c.setFont("Bold", 8)
+    c.drawString(x + 13, y - 15.5, f"#{note['num']}")
+    tx = x + 34
+    line = y - 16
+    c.setFont(card["font"], 10.5)
+    for t in card["title"]:
+        c.drawString(tx, line, t)
+        line -= 12.5
+    meta = " · ".join(b for b in (_clean(note.get("type") or "", "Body"), note.get("when_label") or "") if b)
+    if meta:
+        c.setFont("Body", 7.5)
+        c.setFillColor(COLORS["muted"])
+        c.drawRightString(x0 + width - 8, y - 15.5, _fit(c, meta, "Body", 7.5, 66))
+    c.setFont("Body", 8.5)
+    c.setFillColor(COLORS["muted"])
+    line += 1.5
+    for t in card["summary"]:
+        c.drawString(tx, line, t)
+        line -= 10.5

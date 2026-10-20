@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -130,6 +131,7 @@ async def db_id() -> str:
             }
             if missing:
                 await _call("PATCH", f"/databases/{found['id']}", {"properties": missing})
+            await _ensure_parent(found)
             _db_id = found["id"]
             return _db_id
         pages = [p for p in await _search("page") if p["parent"]["type"] in ("workspace", "page_id")]
@@ -147,8 +149,19 @@ async def db_id() -> str:
                 "properties": SCHEMA,
             },
         )
+        await _ensure_parent(db)
         _db_id = db["id"]
         return _db_id
+
+
+async def _ensure_parent(db: dict) -> None:
+    """Колонка «Главная» — связь таблицы с самой собой, поэтому её нельзя описать в SCHEMA заранее (нужен id таблицы)."""
+    if c.P_PARENT not in db.get("properties", {}):
+        relation = {"relation": {"database_id": db["id"], "single_property": {}}}
+        try:
+            await _call("PATCH", f"/databases/{db['id']}", {"properties": {c.P_PARENT: relation}})
+        except NotionError:
+            logging.getLogger(__name__).exception("could not add the parent column")  # без неё работает всё, кроме подзадач
 
 
 def _title(page: dict) -> str:
@@ -209,6 +222,7 @@ async def create_idea(
     author: str = "",
     when: str | None = None,
     ai_type: str | None = None,
+    parent: str | None = None,
 ) -> tuple[str, str]:
     """blocks видны сразу (сюда же идут картинки-оригиналы), details прячутся в свёрнутый блок «Полный текст и детали»."""
     props = {
@@ -221,6 +235,8 @@ async def create_idea(
         props[c.P_WHEN] = {"date": {"start": when}}
     if ai_type:
         props[c.P_AI_TYPE] = {"select": {"name": ai_type}}
+    if parent:
+        props[c.P_PARENT] = {"relation": [{"id": parent}]}
     if author_id:
         props[c.P_AUTHOR_ID] = {"number": author_id}
         props[c.P_AUTHOR] = {"select": {"name": (author or str(author_id)).replace(",", " ")[:100]}}
@@ -257,6 +273,8 @@ def _item(p: dict) -> dict:
         "done": bool((p["properties"].get(c.P_DONE) or {}).get("checkbox")),
         "ai_type": _select(p, c.P_AI_TYPE),
         "author": _select(p, c.P_AUTHOR) or "",
+        "parent_id": next((r["id"].replace("-", "") for r in (p["properties"].get(c.P_PARENT) or {}).get("relation") or []), None),
+        "created_at": p.get("created_time", ""),
     }
 
 
@@ -440,6 +458,60 @@ async def set_when(page_id: str, when: str | None) -> None:
 
 async def set_done(page_id: str, done: bool = True) -> None:
     await _call("PATCH", f"/pages/{page_id}", {"properties": {c.P_DONE: {"checkbox": done}}})
+    if done:
+        await close_parent_if_done(page_id)
+
+
+async def children(parent_id: str) -> list[dict]:
+    """Подзадачи большой заметки (удалённые в корзину Notion сюда не попадают), по порядку создания."""
+    await _load_projects()
+    data = await _call(
+        "POST", f"/databases/{await db_id()}/query",
+        {"filter": {"property": c.P_PARENT, "relation": {"contains": parent_id}},
+         "sorts": [{"timestamp": "created_time", "direction": "ascending"}], "page_size": 100},
+    )  # fmt: skip
+    return [_item(p) for p in data["results"]]
+
+
+async def close_parent_if_done(child_id: str) -> bool:
+    """Подзадачу закрыли или удалили: если у главной заметки не осталось открытых подзадач, она закрывается сама."""
+    try:
+        parent = _item(await _call("GET", f"/pages/{child_id}")).get("parent_id")
+        if not parent:
+            return False
+        if any(not k["done"] for k in await children(parent)):
+            return False
+        await _call("PATCH", f"/pages/{parent}", {"properties": {c.P_DONE: {"checkbox": True}}})
+        return True
+    except NotionError:
+        return False
+
+
+async def mark_reviewed(page_id: str) -> None:
+    """Главная заметка с подзадачами в разбор не идёт: разбираются её подзадачи."""
+    await _call("PATCH", f"/pages/{page_id}", {"properties": {c.P_STATUS: {"select": {"name": c.STATUS_DONE}}}})
+
+
+async def open_notes(user_id: int, limit: int = 500) -> list[dict]:
+    """Все открытые свои заметки (не выполненные и не объединённые), самые старые первыми — для «🧽 Перебрать» и PDF."""
+    await _load_projects()
+    body = {
+        "filter": {"and": [
+            {"property": c.P_DONE, "checkbox": {"equals": False}},
+            {"property": c.P_MERGED, "checkbox": {"equals": False}},
+            _by_author(user_id),
+        ]},
+        "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
+        "page_size": 100,
+    }  # fmt: skip
+    out: list[dict] = []
+    while len(out) < limit:
+        data = await _call("POST", f"/databases/{await db_id()}/query", body)
+        out += [{**_item(p), "created": p["created_time"][:10]} for p in data["results"]]
+        if not data.get("has_more"):
+            break
+        body["start_cursor"] = data["next_cursor"]
+    return out[:limit]
 
 
 async def dated_items(user_id: int, before: str, after: str | None = None) -> list[dict]:
@@ -472,6 +544,7 @@ async def set_type(page_id: str, type_name: str) -> None:
 async def trash(page_id: str) -> None:
     """В корзину Notion: оттуда можно восстановить в течение 30 дней."""
     await _call("PATCH", f"/pages/{page_id}", {"archived": True})
+    await close_parent_if_done(page_id)
 
 
 async def add_answer(page_id: str, question: str, blocks: list[dict]) -> None:

@@ -738,3 +738,58 @@ async def merge_notes(notes: list[str]) -> tuple[str, str]:
     if not m:
         raise RuntimeError("ИИ не собрал объединённую запись, попробуйте ещё раз.")
     return m.group(1).strip().splitlines()[0][:120], m.group(2).strip()
+
+
+# ---------- 🧩 большая заметка → подзадачи ----------
+
+SPLIT_PROMPT = """Ниже заметка пользователя (часто расшифровка длинного голосового). Сейчас у пользователя {now}.
+Если в ней несколько РАЗНЫХ дел, задач или мыслей (например, про учёбу и про работу), раздели её на отдельные пункты.
+Если заметка про одно дело (даже длинная и с шагами одного дела) — пунктов нет.
+Ничего не выдумывай, пиши на языке оригинала. Ответь только JSON:
+{{"parts": [{{"title": "короткое название, до 8 слов", "text": "понятное объяснение этой задачи 1–3 предложения: что сделать, \
+детали и условия из заметки", "type": "ровно одно из: {types}", "when": "ГГГГ-ММ-ДД ЧЧ:ММ, ГГГГ-ММ-ДД или пусто"}}]}}
+
+Заметка:
+{text}"""
+SPLIT_MAX = 12
+
+
+async def split_tasks(text: str, now: datetime, types: list[str]) -> list[dict]:
+    """Разные задачи из одной заметки: [{"title", "text", "type", "when"}]. Меньше двух — пустой список (делить нечего)."""
+    raw = _json_object(await _complete(SPLIT_PROMPT.format(now=_now_text(now), types=", ".join(types) or "—", text=text[:12000]), 3000))
+    plain = lambda t: re.sub(r"[^\w\s]", "", t or "").strip().lower()  # noqa: E731
+    parts = []
+    for p in raw.get("parts") or []:
+        if not isinstance(p, dict) or not str(p.get("title") or "").strip():
+            continue
+        guess = str(p.get("type") or "")
+        parts.append({
+            "title": str(p["title"]).strip()[:120],
+            "text": str(p.get("text") or "").strip()[:1500],
+            "type": next((t for t in types if plain(t) == plain(guess)), None),
+            "when": _when_from(str(p.get("when") or ""), now),
+        })  # fmt: skip
+    return parts[:SPLIT_MAX] if len(parts) >= 2 else []
+
+
+# ---------- ✏️ зачёркнутое на распечатке ----------
+
+CROSSED_PROMPT = """На фото — распечатанный список заметок. У каждой заметки слева квадратик и номер вида «#12».
+Человек ручкой вычеркнул ненужные: зачеркнул строку или название, поставил крестик или галочку в квадратике, обвёл и перечеркнул.
+Перечисли номера ВСЕХ таких отмеченных заметок со всех фото. Не отмеченные не включай; если сомневаешься — не включай.
+Ответь только JSON: {"crossed": [номера]}"""
+
+
+async def crossed_numbers(images: list[bytes]) -> list[int]:
+    content = _with_images(images, CROSSED_PROMPT)
+    response = await _client().chat_completion(
+        model=c.VISION_MODEL, messages=[{"role": "user", "content": content}], max_tokens=800, temperature=0
+    )
+    raw = _json_object(response.choices[0].message.content or "")
+    numbers = []
+    for x in raw.get("crossed") or []:
+        try:
+            numbers.append(int(str(x).lstrip("#")))
+        except ValueError:
+            continue
+    return sorted(set(n for n in numbers if n > 0))

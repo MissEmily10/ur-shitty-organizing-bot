@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 
@@ -264,10 +265,15 @@ async def _section(uid: int, name: str) -> tuple[str, list[list[tuple[str, str]]
             "🔥 <b>Горящие дедлайны</b> — просроченное, сегодня и завтра\n"
             "🔗 <b>Похожие цели</b> — найти повторы и объединить\n"
             "🧹 <b>Навести порядок</b> — разложить по сферам и проектам\n"
+            "🧽 <b>Перебрать все</b> — по одной, от старых к новым: закрыть, удалить или оставить\n"
+            "🖨 <b>Печать</b> — все заметки в PDF A4, вычеркнуть ручкой\n"
+            "✏️ <b>Зачёркнутое</b> — фото распечатки → удалить вычеркнутое\n"
             "📌 <b>Куда писать</b> — новые заметки сразу в проект",
             [[("📒 Список", "nb:a"), ("🗂 Разобрать", "m:razbor")],
-             [("🔥 Горящие дедлайны", "hd:show"), ("🔗 Похожие цели", "og:find")],
-             [("🧹 Навести порядок", "td:plan"), ("📌 Куда писать", "st:ap")]],
+             [("🧽 Перебрать все", "sw:st"), ("🔥 Горящие дедлайны", "hd:show")],
+             [("🖨 Печать", "pf:make"), ("✏️ Зачёркнутое", "cr:go")],
+             [("🔗 Похожие цели", "og:find"), ("🧹 Навести порядок", "td:plan")],
+             [("📌 Куда писать", "st:ap")]],
         )  # fmt: skip
     if name == "projects":
         rows = [[("📁 Все проекты", "pl"), ("➕ Новый", "m:add")]]
@@ -1016,6 +1022,82 @@ async def _save(
         disable_web_page_preview=True,
         reply_markup=_panel(page_id, pinned["name"] if pinned else None, when=idea.when),
     )
+    if not images and len(text) >= (SPLIT_MIN_VOICE if source == "Голос" else SPLIT_MIN_TEXT):
+        await _offer_split(status, user.id, page_id, text)
+
+
+# ---------- 🧩 большая заметка → подзадачи ----------
+# Длинное голосовое (или длинный текст) с разными задачами: ИИ предлагает разделить. Главная заметка остаётся
+# с полной расшифровкой, каждая задача — отдельная заметка со ссылкой «Главная». Подзадачи разбираются, закрываются
+# и удаляются по отдельности; главная закрывается сама, когда открытых подзадач не осталось (notion.close_parent_if_done).
+# callback_data: sp:y:<page> (разделить) | sp:n:<page> (оставить одной)
+
+SPLIT_MIN_VOICE = 150  # символов расшифровки: короче — точно одно дело
+SPLIT_MIN_TEXT = 400
+
+
+async def _offer_split(message: Message, uid: int, page_id: str, text: str) -> None:
+    try:
+        now = scheduler.local_now(await scheduler.get_settings(uid))
+        parts = await ai.split_tasks(text, now, await notion.types())
+    except Exception:
+        log.exception("split failed")  # не получилось — заметка уже сохранена целиком, этого достаточно
+        return
+    if not parts:
+        return
+    await notion.set_value(f"split:{page_id}", json.dumps(parts, ensure_ascii=False))
+    lines = "\n".join(f"{i}. <b>{escape(p['title'])}</b>" + (f" — {escape(p['text'][:120])}" if p["text"] else "") for i, p in enumerate(parts, 1))
+    await message.reply_text(
+        f"🧩 Здесь {len(parts)} {_plural(len(parts), 'разная задача', 'разные задачи', 'разных задач')}:\n\n{lines}\n\nРазделить на отдельные заметки? Главная останется с полным текстом "
+        "и закроется сама, когда все задачи будут готовы.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[Btn("✂️ Разделить", callback_data=f"sp:y:{page_id}"), Btn("Оставить одной", callback_data=f"sp:n:{page_id}")]]),
+    )
+
+
+async def split_note(uid: int, author: str, page_id: str, parts: list[dict]) -> list[tuple[str, str, str]]:
+    """Создаёт подзадачи большой заметки: [(id, url, название)]. Главная больше не ждёт разбора — разбираются подзадачи."""
+    main_item = await notion.page_info(page_id)
+    made = []
+    for p in parts:
+        child, url = await notion.create_idea(
+            p["title"], "Голос", [], to_blocks(p.get("text") or ""), [], uid, author,
+            when=p.get("when"), ai_type=p.get("type"), parent=page_id,
+        )  # fmt: skip
+        if main_item.get("project"):
+            await notion.file_to_project(child, main_item["project"])
+        made.append((child, url, p["title"]))
+    await notion.mark_reviewed(page_id)
+    await notion.add_section(page_id, "🧩 Подзадачи", to_blocks("\n".join(f"- [{t}]({u})" for _, u, t in made)))
+    return made
+
+
+async def on_split_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    _, action, page_id = q.data.split(":")
+    try:
+        await own_page(uid, page_id)
+        stored = await notion.get_value(f"split:{page_id}")
+        if action == "n" or not stored:
+            await q.answer("Оставила одной заметкой" if action == "n" else "Устарело")
+            await notion.set_value(f"split:{page_id}", "")
+            await _edit(q, "🧩 Оставила одной заметкой.")
+            return
+        await q.answer("Делю…")
+        made = await split_note(uid, q.from_user.full_name, page_id, json.loads(stored))
+        await notion.set_value(f"split:{page_id}", "")
+        links = "\n".join(f'{i}. <a href="{u}">{escape(t)}</a>' for i, (_, u, t) in enumerate(made, 1))
+        await _edit(
+            q, f"✂️ Разделила на {len(made)} {_plural(len(made), 'заметку', 'заметки', 'заметок')}:\n\n{links}\n\nКаждую разберём отдельно (/razbor). Главная закроется сама, "
+            "когда все будут готовы.", parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )  # fmt: skip
+    except Exception as e:
+        log.exception("split button failed")
+        await _fail(q, e)
 
 
 # ---------- кнопка «В проект» под заметкой ----------
@@ -1088,6 +1170,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     def asked(*prompts: str) -> str | None:
         """На какой из вопросов бота это ответ (вопрос мог закончиться репликой стиля)."""
         return next((p for p in prompts if bot_text.startswith(p)), None)
+
+    uid = update.effective_user.id
+    if _crossing_on(uid) and not bot_text and NUMBERS_RE.fullmatch(update.message.text) and re.search(r"\d", update.message.text):
+        # после /crossed номера текстом: «3 7 12»
+        await _crossed_found(update.message, uid, sorted({int(n) for n in re.findall(r"\d+", update.message.text)}))
+        return
 
     if asked(INVITE_PROMPT):
         if is_owner(update.effective_user.id):
@@ -1165,6 +1253,9 @@ async def _flush_album(group_id: str) -> None:
         await asyncio.sleep(ALBUM_WAIT)
     updates = sorted(_albums.pop(group_id), key=lambda u: u.message.message_id)
     images = [await _download_image(u.message) for u in updates]
+    if _crossing_on(updates[0].effective_user.id):
+        await _crossed_photos(updates[0].message, updates[0].effective_user.id, images)
+        return
     caption = "\n".join(u.message.caption for u in updates if u.message.caption)
     await _save(updates[0], "Фото", text=caption, images=images)
 
@@ -1176,6 +1267,9 @@ async def on_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         _albums.setdefault(msg.media_group_id, []).append(update)
         if first:
             await _flush_album(msg.media_group_id)
+        return
+    if _crossing_on(update.effective_user.id):
+        await _crossed_photos(msg, update.effective_user.id, [await _download_image(msg)])
         return
     reply = msg.reply_to_message
     if (reply and (reply.text or "").startswith(AD_PROMPT)) or AD_CAPTION.match(msg.caption or ""):
@@ -1860,8 +1954,8 @@ def _quick_when(code: str, now: datetime, settings: dict, current: str | None = 
 
 async def _after_when(q, page_id: str, where: str, uid: int) -> None:
     """Вернуть экран, откуда пришли: карточку разбора, карточку заметки (c) или сообщение о сохранённой заметке."""
-    if where == "c":
-        text, kb = await _note_card(uid, page_id)
+    if where in ("c", "sw"):
+        text, kb = await (_note_card(uid, page_id) if where == "c" else _sweep_view(uid))
         await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         return
     if where != "-":
@@ -1895,7 +1989,7 @@ async def on_when_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 [Btn("Сегодня вечером", callback_data=f"wv:{page_id}:{where}:t"), Btn("Завтра", callback_data=f"wv:{page_id}:{where}:d1")],
                 [Btn("Через неделю", callback_data=f"wv:{page_id}:{where}:w1"), Btn("✍️ Своя дата", callback_data=f"wc:{page_id}:{where}")],
             ]
-            back = {"-": f"nx:{page_id}", "c": f"nc:{page_id}"}.get(where, f"r:{where}")
+            back = {"-": f"nx:{page_id}", "c": f"nc:{page_id}", "sw": "sw:go"}.get(where, f"r:{where}")
             tail = [Btn("↩️ Назад", callback_data=back)]
             if item["when"]:
                 tail.insert(0, Btn("✖️ Без срока", callback_data=f"wx:{page_id}:{where}"))
@@ -2410,6 +2504,349 @@ async def on_card_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await _fail(q, e)
         return
     await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+# ---------- 🧽 перебрать все заметки: по одной, от самых старых, закрыть или удалить ----------
+# Как вечерний разбор, но по всем открытым заметкам. Место, где остановились, хранится в «Служебном» (sweep:<uid>):
+# это время создания последней просмотренной заметки, следующий раз продолжаем с более новых.
+# callback_data: sw:go (показать текущую) | sw:re (с самой старой) | sw:x (хватит) | sw:<dn|del|k>:<page>
+
+_sweep: dict[int, list[dict]] = {}  # открытые заметки человека, загруженные на этот проход
+
+
+async def _sweep_cursor(uid: int) -> str:
+    return await notion.get_value(f"sweep:{uid}") or ""
+
+
+async def _sweep_view(uid: int, reload: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
+    if reload or uid not in _sweep:
+        _sweep[uid] = await notion.open_notes(uid)
+    items, cursor = _sweep[uid], await _sweep_cursor(uid)
+    rest = [i for i in items if i.get("created_at", "") > cursor]
+    if not rest:
+        _sweep.pop(uid, None)
+        if not items:
+            return await styles.wrap(uid, "all_done", "🎉 Открытых заметок нет — всё закрыто!", html=True, replace=True), None
+        return (
+            f"🧽 Дошли до самой новой заметки 🎉\nОткрытыми остались {len(items)} — это те, что ты решила оставить.",
+            InlineKeyboardMarkup([[Btn("🔁 Пройти снова с самой старой", callback_data="sw:re")]]),
+        )
+    item = rest[0]
+    k = len(items) - len(rest) + 1
+    body = await notion.preview(item["id"], 400)
+    kids = await notion.children(item["id"])
+    bits = [f"📁 {escape(item['project'])}" if item.get("project") else "📭 без проекта", f"🏷 {escape(item.get('type') or 'без типа')}"]
+    if item.get("when"):
+        bits.append(f"⏰ {escape(await _when_label(uid, item['when']))}")
+    created = ".".join(reversed(item.get("created", "").split("-")))
+    text = (
+        f"🧽 <b>Перебираем заметки</b> · {k} из {len(items)} · от {created}\n\n"
+        f'<a href="{item["url"]}">{escape(item["title"])}</a>\n{" · ".join(bits)}'
+        + ("\n🧩 часть большой заметки" if item.get("parent_id") else "")
+    )
+    if kids:
+        ready = sum(1 for x in kids if x["done"])
+        text += f"\n🧩 Подзадачи: {ready} из {len(kids)} готово\n" + "\n".join(f"{'✅' if x['done'] else '▫️'} {escape(x['title'])}" for x in kids)
+    text += f"\n\n{escape(body)}"
+    pid = item["id"]
+    rows = [
+        [Btn("✅ Сделано, закрыть", callback_data=f"sw:dn:{pid}"), Btn("🗑 Удалить" + (" всё" if kids else ""), callback_data=f"sw:del:{pid}")],
+        [Btn("👍 Оставить", callback_data=f"sw:k:{pid}"), Btn("⏰ Срок", callback_data=f"w:{pid}:sw")],
+        [Btn("👁 Целиком", callback_data=f"v:{pid}"), Btn("✖️ Хватит", callback_data="sw:x")],
+    ]
+    if k > 1:  # до этой заметки остались те, что решили оставить: можно пройти их ещё раз
+        rows.append([Btn("🔁 Начать с самой старой", callback_data="sw:re")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _sweep_done(uid: int, page_id: str, ids: set[str]) -> None:
+    """Заметку (и её подзадачи) закрыли, удалили или оставили: убираем из прохода и двигаем место, где остановились."""
+    item = next((i for i in _sweep.get(uid, []) if i["id"] == page_id), None) or await notion.page_info(page_id)
+    if item.get("created_at", "") > await _sweep_cursor(uid):
+        await notion.set_value(f"sweep:{uid}", item["created_at"])
+    if uid in _sweep:
+        _sweep[uid] = [i for i in _sweep[uid] if i["id"] not in ids]
+
+
+async def sweep_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    text, kb = await _sweep_view(uid, reload=True)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def on_sweep_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    action, *rest = q.data.split(":")[1:]
+    try:
+        if action == "x":
+            await q.answer()
+            left = len([i for i in _sweep.pop(uid, []) if i.get("created_at", "") > await _sweep_cursor(uid)])
+            await _edit(q, f"🧽 Остановились. Осталось посмотреть: {left}. Продолжу с этого места — /sweep или меню → «📒 Все заметки» → «🧽 Перебрать все».")
+            return
+        if action == "re":
+            await notion.set_value(f"sweep:{uid}", "")
+            await q.answer()
+            text, kb = await _sweep_view(uid, reload=True)
+        elif action in ("dn", "del", "k"):
+            page_id = rest[0]
+            await own_page(uid, page_id)
+            ids = {page_id}
+            if action != "k":
+                kids = [x["id"] for x in await notion.children(page_id)]
+                for kid in kids:  # большая заметка закрывается или удаляется вместе со своими подзадачами
+                    await (notion.set_done(kid, True) if action == "dn" else notion.trash(kid))
+                await (notion.set_done(page_id, True) if action == "dn" else notion.trash(page_id))
+                ids.update(kids)
+            await _sweep_done(uid, page_id, ids)
+            if action == "dn":
+                await q.answer((await styles.line(uid, "praise")) or "Закрыта ✓")
+            elif action == "del":
+                await q.answer("🗑 Удалено (можно восстановить из корзины Notion)")
+            else:
+                await q.answer("Оставили 👍")
+            text, kb = await _sweep_view(uid)
+        else:
+            await q.answer()
+            text, kb = await _sweep_view(uid, reload=action == "st")
+    except Exception as e:
+        log.exception("sweep failed")
+        await _fail(q, e)
+        return
+    await _edit(q, text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+# ---------- 🖨 все заметки в PDF для печати и ✏️ зачёркнутое по фото ----------
+# Печать: открытые заметки по сферам и проектам, большие заметки — с подзадачами, у каждой номер «#12». Какой номер какой
+# заметке соответствует, хранится в «Служебном» (print:<uid>), пока не распечатаешь заново.
+# Зачёркнутое: /crossed → фото листов (или номера текстом) → ИИ находит вычеркнутые → подтвердить: удалить или закрыть.
+# callback_data: pf:make | cr:go | cr:<del|dn|pick|show|x> | cr:t:<номер>
+
+CROSSED_WAIT = 30 * 60  # сколько минут после /crossed фото считаются распечаткой, а не новой заметкой
+NUMBERS_RE = re.compile(r"[#№\d\s,;.и]+")
+_crossing: dict[int, float] = {}  # кто сейчас присылает фото распечатки: время /crossed
+_crossed: dict[int, dict] = {}  # найденные номера: {"map": {номер: id}, "titles": {номер: название}, "sel": {номера}}
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    return few if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else many
+
+
+async def _print_groups(uid: int) -> tuple[list, dict[int, str], int]:
+    """Открытые заметки для печати: [(сфера, [(проект, [заметка с подзадачами])])], номер → id, сколько всего."""
+    items = await notion.open_notes(uid)
+    open_ids = {i["id"] for i in items}
+    sem = asyncio.Semaphore(6)
+
+    async def summary(item: dict) -> None:
+        async with sem:
+            item["summary"] = await notion.preview(item["id"], 300)
+        item["when_label"] = (await _when_label(uid, item["when"])) if item.get("when") else ""
+
+    await asyncio.gather(*(summary(i) for i in items))
+    kids: dict[str, list[dict]] = {}
+    for i in items:
+        if i.get("parent_id") in open_ids:
+            kids.setdefault(i["parent_id"], []).append(i)
+    projects = {p["id"]: p for p in await notion.project_list(uid, include_closed=True)}
+    areas = await notion.spheres()
+    area_names = {a["id"]: a["name"] for a in areas}
+    tree: dict[str, dict[str, list[dict]]] = {}
+    for i in items:
+        if i.get("parent_id") in open_ids:
+            continue
+        project = projects.get(i.get("project_id") or "")
+        sphere = area_names.get((project or {}).get("sphere_id") or "") or ("📁 Без сферы" if project else "📭 Без проекта")
+        tree.setdefault(sphere, {}).setdefault(project["name"] if project else "без проекта", []).append(i)
+    order = [a["name"] for a in areas if a["name"] in tree] + [s for s in ("📁 Без сферы", "📭 Без проекта") if s in tree]
+    numbers: dict[int, str] = {}
+    groups = []
+    for sphere in order:
+        block = []
+        for project in sorted(tree[sphere], key=lambda p: (p == "без проекта", p.lower())):
+            notes = []
+            for i in tree[sphere][project]:
+                numbers[len(numbers) + 1] = i["id"]
+                entry = {**i, "num": len(numbers), "children": []}
+                for k in kids.get(i["id"], []):
+                    numbers[len(numbers) + 1] = k["id"]
+                    entry["children"].append({**k, "num": len(numbers), "children": []})
+                if entry["children"]:
+                    ready = len([x for x in await notion.children(i["id"]) if x["done"]])
+                    total = ready + len(entry["children"])
+                    entry["type"] = f"большая · {ready} из {total} готово"
+                notes.append(entry)
+            block.append((project, notes))
+        groups.append((sphere, block))
+    return groups, numbers, len(items)
+
+
+async def _send_print(message: Message, uid: int) -> None:
+    status = await message.reply_text("🖨 Собираю все заметки в PDF…")
+    try:
+        groups, numbers, total = await _print_groups(uid)
+        if not total:
+            await status.edit_text(await styles.wrap(uid, "empty", "Открытых заметок нет — печатать нечего 🎉", replace=True))
+            return
+        today = scheduler.local_now(await scheduler.get_settings(uid)).date()
+        data = pdf.notes_pdf(groups, f"Все мои заметки · {today:%d.%m.%Y}", f"открытых: {total}")
+        await notion.set_value(f"print:{uid}", json.dumps({"date": f"{today:%d.%m}", "map": numbers}))
+    except Exception as e:
+        log.exception("print failed")
+        await status.edit_text(f"❌ Не получилось собрать PDF: {e}"[:4000])
+        return
+    await status.delete()
+    await message.reply_document(
+        io.BytesIO(data), filename=f"заметки-{today:%d.%m}.pdf",
+        caption=f"🖨 {total} {_plural(total, 'заметка', 'заметки', 'заметок')} на A4. Вычеркни ненужное ручкой и пришли фото: /crossed "
+        "(или меню → «📒 Все заметки» → «✏️ Зачёркнутое»).",
+    )  # fmt: skip
+
+
+async def print_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_print(update.message, update.effective_user.id)
+
+
+CROSSED_PROMPT = "✏️ Отлично, фиксирую твои зачёркнутые!"
+
+
+async def _start_crossing(message: Message, uid: int) -> None:
+    stored = await notion.get_value(f"print:{uid}")
+    if not stored:
+        await message.reply_text("Сначала распечатай заметки: /printnotes — у каждой будет номер, по нему я пойму, что вычеркнуто.")
+        return
+    _crossing[uid] = time.monotonic()
+    printed = json.loads(stored)
+    await message.reply_text(
+        f"{CROSSED_PROMPT} Пришли фото листов распечатки от {printed['date']} — можно несколько сразу.\n"
+        "Или просто напиши номера: «3 7 12». Ничего не удалю, пока не подтвердишь."
+    )
+
+
+def _crossing_on(uid: int) -> bool:
+    started = _crossing.get(uid)
+    return bool(started and time.monotonic() - started < CROSSED_WAIT)
+
+
+async def crossed_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    await _start_crossing(update.message, update.effective_user.id)
+
+
+async def _crossed_found(message: Message, uid: int, numbers: list[int]) -> None:
+    stored = await notion.get_value(f"print:{uid}")
+    if not stored:
+        await message.reply_text("Не нашла распечатку: /printnotes")
+        return
+    mapping = {int(k): v for k, v in json.loads(stored)["map"].items()}
+    found = [n for n in numbers if n in mapping]
+    missing = [n for n in numbers if n not in mapping]
+    if not found:
+        extra = f" (номеров {', '.join(map(str, missing))} в распечатке нет)" if missing else ""
+        await message.reply_text(f"🤷 Не нашла вычеркнутых{extra}. Пришли фото поближе и при хорошем свете или напиши номера: «3 7 12».")
+        return
+    titles = {}
+    for n in found:
+        try:
+            titles[n] = (await notion.page_info(mapping[n]))["title"]
+        except Exception:
+            titles[n] = "(уже удалена)"
+    _crossed[uid] = {"map": {n: mapping[n] for n in found}, "titles": titles, "sel": set(found), "missing": missing}
+    text, kb = _crossed_view(uid)
+    await message.reply_text(text, reply_markup=kb)
+
+
+def _crossed_view(uid: int, pick: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    st = _crossed[uid]
+    sel = sorted(st["sel"])
+    lines = [f"{'☑️' if n in st['sel'] else '⬜'} #{n} {st['titles'][n][:60]}" for n in sorted(st["titles"])][:60]
+    more = len(st["titles"]) - len(lines)
+    text = f"✏️ Вычеркнуто: {len(sel)}\n\n" + "\n".join(lines) + (f"\n… и ещё {more}" if more > 0 else "")
+    if st["missing"]:
+        text += f"\n\nНомеров {', '.join(map(str, st['missing']))} в распечатке нет — их пропускаю."
+    if pick:
+        buttons = [Btn(f"{'☑️' if n in st['sel'] else '⬜'} {n}", callback_data=f"cr:t:{n}") for n in sorted(st["titles"])][:90]
+        rows = [buttons[i : i + 5] for i in range(0, len(buttons), 5)] + [[Btn("✔️ Готово", callback_data="cr:show")]]
+        return text + "\n\nСними галочки с того, что я приняла за вычеркнутое по ошибке.", InlineKeyboardMarkup(rows)
+    rows = [
+        [Btn(f"🗑 Удалить ({len(sel)})", callback_data="cr:del"), Btn(f"✅ Закрыть ({len(sel)})", callback_data="cr:dn")],
+        [Btn("✋ Выбрать", callback_data="cr:pick"), Btn("✖️ Отмена", callback_data="cr:x")],
+    ]
+    return text + "\n\n🗑 Удалить — запись не нужна совсем (в корзину Notion), ✅ Закрыть — дело сделано.", InlineKeyboardMarkup(rows)
+
+
+async def _crossed_photos(message: Message, uid: int, images: list[bytes]) -> None:
+    status = await message.reply_text("🔎 Ищу вычеркнутые номера…")
+    try:
+        numbers = await ai.crossed_numbers(images)
+    except Exception as e:
+        log.exception("crossed failed")
+        await status.edit_text(f"❌ Не получилось прочитать фото: {e}"[:4000])
+        return
+    await status.delete()
+    await _crossed_found(message, uid, numbers)
+
+
+async def on_print_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_member(uid):
+        await q.answer()
+        return
+    head, action, *rest = q.data.split(":")
+    try:
+        if head == "pf":
+            await q.answer("Собираю PDF…")
+            await _send_print(q.message, uid)
+            return
+        if action == "go":
+            await q.answer()
+            await _start_crossing(q.message, uid)
+            return
+        if uid not in _crossed:
+            await q.answer("Устарело — пришли фото ещё раз: /crossed", show_alert=True)
+            return
+        st = _crossed[uid]
+        if action == "x":
+            _crossed.pop(uid, None)
+            _crossing.pop(uid, None)
+            await q.answer()
+            await _edit(q, "✏️ Ничего не трогала.")
+            return
+        if action in ("pick", "show", "t"):
+            if action == "t":
+                st["sel"] ^= {int(rest[0])}
+            await q.answer()
+            text, kb = _crossed_view(uid, pick=action != "show")
+            await _edit(q, text, reply_markup=kb)
+            return
+        if not st["sel"]:
+            await q.answer("Ничего не отмечено", show_alert=True)
+            return
+        await q.answer("Удаляю…" if action == "del" else "Закрываю…")
+        count = 0
+        for n in sorted(st["sel"]):
+            page_id = st["map"][n]
+            try:
+                await own_page(uid, page_id)
+                # вычеркнута большая заметка — вместе с её подзадачами
+                for kid in [x["id"] for x in await notion.children(page_id)] + [page_id]:
+                    await (notion.trash(kid) if action == "del" else notion.set_done(kid, True))
+                count += 1
+            except Exception:
+                log.exception("crossed item failed")
+        _crossed.pop(uid, None)
+        _crossing.pop(uid, None)
+        word = _plural(count, "заметку", "заметки", "заметок")
+        await _edit(q, f"🗑 Удалила {count} {word}. Вернуть можно из корзины Notion (30 дней)." if action == "del"
+                    else f"✅ Закрыла {count} {word}.")  # fmt: skip
+    except Exception as e:
+        log.exception("print button failed")
+        await _fail(q, e)
 
 
 # ---------- 📰 лента по сферам ----------
@@ -4398,6 +4835,9 @@ async def on_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 COMMANDS = [
     ("menu", "Меню: все разделы"),
     ("notes", "Все заметки"),
+    ("sweep", "Перебрать все: закрыть или удалить"),
+    ("printnotes", "Все заметки в PDF для печати"),
+    ("crossed", "Зачёркнутое на распечатке → удалить"),
     ("feed", "Лента по сферам"),
     ("start", "Знакомство с ботом"),
     ("help", "Помощь: /help и вопрос"),
@@ -4625,11 +5065,17 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("overlaps", overlaps_cmd, filters=member))
     app.add_handler(CallbackQueryHandler(on_overlap_button, pattern=r"^og:"))
     app.add_handler(CommandHandler("notes", notes_cmd, filters=member))
+    app.add_handler(CommandHandler("sweep", sweep_cmd, filters=member))
+    app.add_handler(CommandHandler("printnotes", print_cmd, filters=member))
+    app.add_handler(CommandHandler("crossed", crossed_cmd, filters=member))
     app.add_handler(CommandHandler("timetable", timetable_cmd, filters=owner))
     app.add_handler(CallbackQueryHandler(on_timetable_button, pattern=r"^(tt|td2):"))
     app.add_handler(CallbackQueryHandler(on_homework_button, pattern=r"^hw:"))
     app.add_handler(CallbackQueryHandler(on_browse_button, pattern=r"^nb:"))
     app.add_handler(CallbackQueryHandler(on_card_button, pattern=r"^nc:"))
+    app.add_handler(CallbackQueryHandler(on_sweep_button, pattern=r"^sw:"))
+    app.add_handler(CallbackQueryHandler(on_split_button, pattern=r"^sp:"))
+    app.add_handler(CallbackQueryHandler(on_print_button, pattern=r"^(pf|cr):"))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern=r"^ci:"))
     app.add_handler(CommandHandler("schedule", schedule_cmd, filters=member))
     app.add_handler(CommandHandler("report", report_cmd, filters=member))
