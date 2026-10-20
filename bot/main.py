@@ -2662,13 +2662,13 @@ async def _print_groups(uid: int) -> tuple[list, dict[int, str], int]:
             continue
         project = projects.get(i.get("project_id") or "")
         sphere = area_names.get((project or {}).get("sphere_id") or "") or ("📁 Без сферы" if project else "📭 Без проекта")
-        tree.setdefault(sphere, {}).setdefault(project["name"] if project else "без проекта", []).append(i)
+        tree.setdefault(sphere, {}).setdefault(project["name"] if project else "", []).append(i)
     order = [a["name"] for a in areas if a["name"] in tree] + [s for s in ("📁 Без сферы", "📭 Без проекта") if s in tree]
     numbers: dict[int, str] = {}
     groups = []
     for sphere in order:
         block = []
-        for project in sorted(tree[sphere], key=lambda p: (p == "без проекта", p.lower())):
+        for project in sorted(tree[sphere], key=lambda p: (not p, p.lower())):
             notes = []
             for i in tree[sphere][project]:
                 numbers[len(numbers) + 1] = i["id"]
@@ -2679,7 +2679,7 @@ async def _print_groups(uid: int) -> tuple[list, dict[int, str], int]:
                 if entry["children"]:
                     ready = len([x for x in await notion.children(i["id"]) if x["done"]])
                     total = ready + len(entry["children"])
-                    entry["type"] = f"большая · {ready} из {total} готово"
+                    entry["type"] = f"{ready} из {total} готово"
                 notes.append(entry)
             block.append((project, notes))
         groups.append((sphere, block))

@@ -429,11 +429,11 @@ def notes_pdf(groups: list[tuple[str, list[tuple[str, list[dict]]]]], title: str
 
     def card_lines(note: dict, indent: float) -> dict:
         """Строки карточки и её высота (без отрисовки) — чтобы заранее разложить по страницам."""
-        text_w = width - indent - 34 - 70
+        text_w = width - indent - 34 - 110
         name = _clean(note["title"]) or "Без названия"
         font = _can(DISPLAY_FONT, name, "Bold")
         title_lines = _wrap(c, name, font, 10.5, text_w, 2)
-        summary = _wrap(c, _clean(note.get("summary") or ""), "Body", 8.5, text_w + 70, 3 if not indent else 2)
+        summary = _wrap(c, _clean(note.get("summary") or ""), "Body", 8.5, text_w + 110, 3 if not indent else 2)
         return {"note": note, "indent": indent, "font": font, "title": title_lines, "summary": summary,
                 "h": 8 + 12.5 * len(title_lines) + 10.5 * len(summary) + 4}  # fmt: skip
 
@@ -442,7 +442,8 @@ def notes_pdf(groups: list[tuple[str, list[tuple[str, list[dict]]]]], title: str
     for sphere, projects in groups:
         blocks.append(("sphere", sphere, 30))
         for project, notes in projects:
-            blocks.append(("project", project, 18))
+            if project:  # у заметок без проекта подзаголовка нет
+                blocks.append(("project", project, 18))
             for note in notes:
                 main = card_lines(note, 0)
                 kids = [card_lines(k, 22) for k in note.get("children") or []]
@@ -531,7 +532,7 @@ def _note_row(c: Canvas, card: dict, x0: float, width: float, y: float) -> None:
     if meta:
         c.setFont("Body", 7.5)
         c.setFillColor(COLORS["muted"])
-        c.drawRightString(x0 + width - 8, y - 15.5, _fit(c, meta, "Body", 7.5, 66))
+        c.drawRightString(x0 + width - 8, y - 15.5, _fit(c, meta, "Body", 7.5, 104))
     c.setFont("Body", 8.5)
     c.setFillColor(COLORS["muted"])
     line += 1.5
