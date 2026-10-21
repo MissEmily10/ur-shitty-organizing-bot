@@ -8,3 +8,4 @@ openpyxl>=3.1
 pillow>=10
 tzdata>=2024.1
 reportlab>=4
+opencv-python-headless>=4.8,<6  # ✏️ зачёркнутое на распечатке: метки по углам листа (bot/paper.py)

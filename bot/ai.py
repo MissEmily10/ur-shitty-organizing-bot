@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import difflib
 import io
 import json
 import re
@@ -776,11 +777,26 @@ async def split_tasks(text: str, now: datetime, types: list[str]) -> list[dict]:
 
 PRINTOUT_PROMPT = """На фото — распечатанный список заметок. У каждой заметки слева квадратик и номер вида «#12», под ней линейки для пометок.
 Человек ручкой:
-1) вычеркнул ненужные — зачеркнул строку или название, поставил крестик или галочку в квадратике;
+1) вычеркнул ненужные — зачеркнул заметку целиком (часто вместе с номером, крест-накрест или зигзагом), зачеркнул строку
+или название, поставил крестик или галочку в квадратике. Если номер под зачёркиванием не читается — определи заметку по названию
+(сверь со списком ниже) и напиши название в crossed_titles;
 2) дописал к некоторым заметкам пометки от руки — рядом, на линейках, на полях со стрелкой.
 Найди и то, и другое на всех фото. Пометку относи к заметке, рядом с которой она написана (по номеру и названию).
 Перепиши пометку дословно, как написано; неразборчивое слово — [неразборчиво]. Если сомневаешься, вычеркнута ли заметка, — не включай.
-{titles}Ответь только JSON: {{"crossed": [номера], "comments": [{{"num": номер, "text": "пометка"}}]}}"""
+{titles}Ответь только JSON: {{"crossed": [номера], "crossed_titles": ["названия зачёркнутых без читаемого номера"],
+"comments": [{{"num": номер, "text": "пометка"}}]}}"""
+
+
+def match_titles(found: list[str], titles: dict[int, str], cutoff: float = 0.6) -> set[int]:
+    """Названия, которые ИИ прочитал на фото, → номера заметок распечатки (похожесть строк, без регистра и знаков)."""
+    plain = lambda t: re.sub(r"[^\w\s]", "", t or "").strip().lower()  # noqa: E731
+    by_title = {plain(t): n for n, t in titles.items()}
+    numbers = set()
+    for title in found:
+        best = difflib.get_close_matches(plain(str(title)), list(by_title), n=1, cutoff=cutoff)
+        if best:
+            numbers.add(by_title[best[0]])
+    return numbers
 
 
 async def read_printout(images: list[bytes], titles: dict[int, str] | None = None) -> tuple[list[int], list[dict]]:
@@ -798,6 +814,7 @@ async def read_printout(images: list[bytes], titles: dict[int, str] | None = Non
             numbers.append(int(str(x).lstrip("#")))
         except ValueError:
             continue
+    numbers += match_titles([t for t in raw.get("crossed_titles") or [] if isinstance(t, str)], titles or {})
     comments = []
     for item in raw.get("comments") or []:
         try:

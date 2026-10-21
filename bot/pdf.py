@@ -419,12 +419,42 @@ def _note_kind(note: dict) -> str:
     return next((name for name, keys in NOTE_KINDS if any(k in kind for k in keys)), "")
 
 
-def notes_pdf(groups: list[tuple[str, list[tuple[str, list[dict]]]]], title: str, subtitle: str) -> bytes:
+MARKER = 28  # метки по углам листа: по ним бот находит лист на фото и место каждой заметки (paper.py)
+MARKER_INSET = 14  # от края листа: у большинства принтеров поля 4–5 мм
+
+
+def marker_corners(page_w: float = PORTRAIT_W, page_h: float = PORTRAIT_H) -> list[tuple[float, float]]:
+    """Левые нижние углы меток: левый верхний, правый верхний, правый нижний, левый нижний."""
+    far_x, far_y = page_w - MARKER_INSET - MARKER, page_h - MARKER_INSET - MARKER
+    return [(MARKER_INSET, far_y), (far_x, far_y), (far_x, MARKER_INSET), (MARKER_INSET, MARKER_INSET)]
+
+
+def _markers(c: Canvas, page: int) -> None:
+    """ArUco-метки (номер листа × 4 + угол) — как QR-код, только проще: их надёжно находит OpenCV даже на косом фото."""
+    try:
+        import cv2
+    except ImportError:
+        return
+    if page * 4 + 3 >= 250:
+        return
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+    c.setFillColor(HexColor("#000000"))
+    for corner, (x, y) in enumerate(marker_corners()):
+        bits = cv2.aruco.generateImageMarker(dictionary, page * 4 + corner, 6)  # 4×4 клетки + чёрная рамка
+        cell = MARKER / 6
+        for row in range(6):
+            for col in range(6):
+                if bits[row][col] < 128:
+                    c.rect(x + col * cell, y + MARKER - (row + 1) * cell, cell + 0.05, cell + 0.05, stroke=0, fill=1)
+
+
+def notes_pdf(groups: list[tuple[str, list[tuple[str, list[dict]]]]], title: str, subtitle: str, layout: list | None = None) -> bytes:
     """groups — [(сфера, [(проект, [заметка])])]; заметка — {"num", "title", "type", "when", "summary", "children": [заметка]}.
-    Каждая заметка — карточка с квадратиком и номером «#12», чтобы вычеркнуть ручкой и прислать фото боту."""
+    Каждая заметка — карточка с квадратиком и номером «#12», чтобы вычеркнуть ручкой и прислать фото боту.
+    layout — сюда записывается, где на каком листе какая заметка (для поиска зачёркнутого по фото, paper.py)."""
     buf = io.BytesIO()
     c = Canvas(buf, pagesize=(PORTRAIT_W, PORTRAIT_H))
-    m = 36
+    m = 48
     width = PORTRAIT_W - 2 * m
     head_font = _can(DISPLAY_FONT, "", "Bold")
 
@@ -477,7 +507,8 @@ def notes_pdf(groups: list[tuple[str, list[tuple[str, list[dict]]]]], title: str
         c.setFont("Body", 7.5)
         c.drawString(m, PORTRAIT_H - m - 40, NOTES_LEGEND)
         c.drawString(m, m, "Вычеркни ненужное, допиши пометки на линейках и пришли фото боту: /crossed")
-        c.drawRightString(PORTRAIT_W - m, m, f"стр. {n} из {len(pages)}")
+        c.drawRightString(PORTRAIT_W - m, m, f"лист {n} из {len(pages)}")
+        _markers(c, n - 1)
         for kind, data, y in page:
             if kind == "sphere":
                 c.setFillColor(COLORS["tt_day"])
@@ -502,20 +533,32 @@ def notes_pdf(groups: list[tuple[str, list[tuple[str, list[dict]]]]], title: str
                 c.roundRect(m, y - total, width, total, 4, stroke=1, fill=1)
                 line_y = y
                 for card in [main] + kids:
-                    _note_row(c, card, m, width, line_y)
+                    place = _note_row(c, card, m, width, line_y)
+                    if layout is not None:
+                        layout.append({"num": card["note"]["num"], "page": n - 1, **place})
                     line_y -= card["h"]
         c.showPage()
     c.save()
     return buf.getvalue()
 
 
-def _note_row(c: Canvas, card: dict, x0: float, width: float, y: float) -> None:
+def _note_row(c: Canvas, card: dict, x0: float, width: float, y: float) -> dict:
+    """Рисует строку заметки и возвращает, где она на листе (pt): band — область без линеек для пометок,
+    ink — где напечатан текст (его не считаем следами ручки), check — внутренность квадратика."""
     note, indent = card["note"], card["indent"]
     x = x0 + 8 + indent
+    ink = [[x - 1.5, y - 18.5, x + 10.5, y - 6.5]]
+
+    def text_box(left: float, base: float, text: str, font: str, size: float, right: bool = False) -> None:
+        w = c.stringWidth(text, font, size)
+        x1, x2 = (left - w, left) if right else (left, left + w)
+        ink.append([x1 - 1, base - 0.3 * size, x2 + 1, base + 0.85 * size])
+
     if indent:  # подзадача: тонкая линия-отступ слева
         c.setStrokeColor(COLORS["muted"])
         c.setLineWidth(0.5)
         c.line(x - 8, y - 2, x - 8, y - card["h"] + 4)
+        ink.append([x - 9.5, y - card["h"] + 3, x - 6.5, y - 1])
     # квадратик для галочки и номер
     c.setFillColor(COLORS["background"])
     c.setStrokeColor(COLORS["text"])
@@ -524,22 +567,27 @@ def _note_row(c: Canvas, card: dict, x0: float, width: float, y: float) -> None:
     c.setFillColor(COLORS["text"])
     c.setFont("Bold", 8)
     c.drawString(x + 13, y - 15.5, f"#{note['num']}")
+    text_box(x + 13, y - 15.5, f"#{note['num']}", "Bold", 8)
     tx = x + 34
     line = y - 16
     c.setFont(card["font"], 10.5)
     for t in card["title"]:
         c.drawString(tx, line, t)
+        text_box(tx, line, t, card["font"], 10.5)
         line -= 12.5
     meta = " · ".join(b for b in (_clean(note.get("type") or "", "Body"), note.get("when_label") or "") if b)
     if meta:
+        meta = _fit(c, meta, "Body", 7.5, 104)
         c.setFont("Body", 7.5)
         c.setFillColor(COLORS["muted"])
-        c.drawRightString(x0 + width - 8, y - 15.5, _fit(c, meta, "Body", 7.5, 104))
+        c.drawRightString(x0 + width - 8, y - 15.5, meta)
+        text_box(x0 + width - 8, y - 15.5, meta, "Body", 7.5, right=True)
     c.setFont("Body", 9)
     c.setFillColor(COLORS["muted"])
     line += 1.5
     for t in card["summary"]:
         c.drawString(tx, line, t)
+        text_box(tx, line, t, "Body", 9)
         line -= 11
     # линейки для пометок: пунктир по всей ширине карточки, номер заметки рядом — ИИ поймёт, к чему пометка
     c.setStrokeColor(COLORS["muted"])
@@ -550,3 +598,6 @@ def _note_row(c: Canvas, card: dict, x0: float, width: float, y: float) -> None:
         ry = bottom + i * RULE_GAP
         c.line(tx, ry, x0 + width - 10, ry)
     c.setDash()
+    band = [x0 + 4, y - card["h"] + card["rules"] * RULE_GAP + 3, x0 + width - 4, y - 3]
+    return {"band": [round(v, 1) for v in band], "ink": [[round(v, 1) for v in b] for b in ink],
+            "check": [round(x + 2.4, 1), round(y - 14.6, 1), round(x + 6.6, 1), round(y - 10.4, 1)]}  # fmt: skip

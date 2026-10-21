@@ -513,6 +513,31 @@ async def _tidy_run(bot: Bot, uid: int, now: datetime) -> str:
     return "предложен порядок"
 
 
+PRINTOUT_ASK_AT = time(9, 0)
+PRINTOUT_PROMPT = (
+    "☀️ Доброе утро! Давай синхронизируемся: пришли фото листков «Все мои заметки», которые ты печатала "
+    "(можно все сразу, можно по одному). Я найду зачёркнутое — даже если зачёркнуто целиком вместе с номером — "
+    "и твои пометки, а ты подтвердишь: без тебя ничего не удалю."
+)
+
+
+def _printout_due(now: datetime, settings: dict) -> str | None:
+    """Попросить фото распечатки утром в назначенный день (settings["printout_ask"] — дата ГГГГ-ММ-ДД)."""
+    day = settings.get("printout_ask") or ""
+    return day if day and now.date().isoformat() >= day and now.time() >= PRINTOUT_ASK_AT else None
+
+
+async def _printout_run(bot: Bot, uid: int, now: datetime) -> str:
+    await update_settings(uid, printout_ask="")
+    if not await notion.get_value(f"print:{uid}"):
+        return "распечатки нет"
+    # весь день фото считаются листками распечатки, а не новыми заметками (main._crossing_on читает это значение)
+    until = now.replace(hour=23, minute=0, second=0, microsecond=0)
+    await notion.set_value(f"crossing:{uid}", str(int(until.timestamp())))
+    await bot.send_message(uid, await styles.wrap(uid, "greeting", replace=True, text=PRINTOUT_PROMPT))
+    return "попросила фото распечатки"
+
+
 JOBS = [
     Job("evening", _evening_due, _evening_run),
     Job("mood", _mood_due, _mood_run),
@@ -523,6 +548,7 @@ JOBS = [
     Job("deadlines", _hot_due, _hot_run),
     Job("tidy_offer", _tidy_due, _tidy_run),
     Job("overlaps", _overlaps_due, _overlaps_run),
+    Job("printout_ask", _printout_due, _printout_run),
 ]
 
 

@@ -25,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, banners, documents, notion, pdf, schedule, scheduler, studio, styles, team, timetable, weekly, whenparse
+from . import ai, banners, documents, notion, paper, pdf, schedule, scheduler, studio, styles, team, timetable, weekly, whenparse
 from . import config as c
 from .markdown import chunks as _chunks, tg_html, to_blocks
 
@@ -1172,7 +1172,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return next((p for p in prompts if bot_text.startswith(p)), None)
 
     uid = update.effective_user.id
-    if _crossing_on(uid) and not bot_text and NUMBERS_RE.fullmatch(update.message.text) and re.search(r"\d", update.message.text):
+    if not bot_text and NUMBERS_RE.fullmatch(update.message.text) and re.search(r"\d", update.message.text) and await _crossing_on(uid):
         # после /crossed номера текстом: «3 7 12»
         await _crossed_found(update.message, uid, sorted({int(n) for n in re.findall(r"\d+", update.message.text)}))
         return
@@ -1256,7 +1256,7 @@ async def _flush_album(group_id: str) -> None:
         await asyncio.sleep(ALBUM_WAIT)
     updates = sorted(_albums.pop(group_id), key=lambda u: u.message.message_id)
     images = [await _download_image(u.message) for u in updates]
-    if _crossing_on(updates[0].effective_user.id):
+    if await _crossing_on(updates[0].effective_user.id):
         await _crossed_photos(updates[0].message, updates[0].effective_user.id, images)
         return
     caption = "\n".join(u.message.caption for u in updates if u.message.caption)
@@ -1271,7 +1271,7 @@ async def on_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if first:
             await _flush_album(msg.media_group_id)
         return
-    if _crossing_on(update.effective_user.id):
+    if await _crossing_on(update.effective_user.id):
         await _crossed_photos(msg, update.effective_user.id, [await _download_image(msg)])
         return
     reply = msg.reply_to_message
@@ -2630,7 +2630,7 @@ async def on_sweep_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 CROSSED_WAIT = 30 * 60  # сколько минут после /crossed фото считаются распечаткой, а не новой заметкой
 NUMBERS_RE = re.compile(r"[#№\d\s,;.и]+")
-_crossing: dict[int, float] = {}  # кто сейчас присылает фото распечатки: время /crossed
+_crossing: dict[int, float] = {}  # кто сейчас присылает фото распечатки: до какого времени (unix), копия — crossing:<uid>
 _crossed: dict[int, dict] = {}  # найденные номера: {"map": {номер: id}, "titles": {номер: название}, "sel": {номера}}
 
 
@@ -2697,7 +2697,9 @@ async def _send_print(message: Message, uid: int) -> None:
             await status.edit_text(await styles.wrap(uid, "empty", "Открытых заметок нет — печатать нечего 🎉", replace=True))
             return
         today = scheduler.local_now(await scheduler.get_settings(uid)).date()
-        data = pdf.notes_pdf(groups, f"Все мои заметки · {today:%d.%m.%Y}", f"открытых: {total}")
+        layout: list[dict] = []
+        data = pdf.notes_pdf(groups, f"Все мои заметки · {today:%d.%m.%Y}", f"открытых: {total}", layout)
+        await notion.set_value(f"printlayout:{uid}", paper.pack(layout))
         titles = {}  # названия — подсказка ИИ, к какой заметке относится пометка от руки
         for _, block in groups:
             for _, notes in block:
@@ -2730,7 +2732,7 @@ async def _start_crossing(message: Message, uid: int) -> None:
     if not stored:
         await message.reply_text("Сначала распечатай заметки: /printnotes — у каждой будет номер, по нему я пойму, что вычеркнуто.")
         return
-    _crossing[uid] = time.monotonic()
+    await _set_crossing(uid, time.time() + CROSSED_WAIT)
     printed = json.loads(stored)
     await message.reply_text(
         f"{CROSSED_PROMPT} Пришли фото листов распечатки от {printed['date']} — можно несколько сразу.\n"
@@ -2738,9 +2740,25 @@ async def _start_crossing(message: Message, uid: int) -> None:
     )
 
 
-def _crossing_on(uid: int) -> bool:
-    started = _crossing.get(uid)
-    return bool(started and time.monotonic() - started < CROSSED_WAIT)
+async def _set_crossing(uid: int, until: float) -> None:
+    """Режим «присылаю фото распечатки» до until. Хранится и в Notion: Render засыпает и забывает память."""
+    _crossing[uid] = until
+    await notion.set_value(f"crossing:{uid}", str(int(until)))
+
+
+_crossing_checked: dict[int, float] = {}
+
+
+async def _crossing_on(uid: int) -> bool:
+    """Режим фото распечатки включают /crossed, кнопка и утренняя просьба планировщика (пишет прямо в Notion),
+    поэтому выключенный режим перечитываем из Notion, но не чаще раза в минуту."""
+    if time.time() >= _crossing.get(uid, 0) and time.time() - _crossing_checked.get(uid, 0) > 60:
+        _crossing_checked[uid] = time.time()
+        try:
+            _crossing[uid] = float(await notion.get_value(f"crossing:{uid}") or 0)
+        except Exception:
+            _crossing[uid] = 0
+    return time.time() < _crossing.get(uid, 0)
 
 
 async def crossed_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2796,10 +2814,25 @@ def _crossed_view(uid: int, pick: bool = False) -> tuple[str, InlineKeyboardMark
 
 async def _crossed_photos(message: Message, uid: int, images: list[bytes]) -> None:
     status = await message.reply_text("🔎 Ищу вычеркнутое и пометки…")
+    await _set_crossing(uid, max(_crossing.get(uid, 0), time.time() + CROSSED_WAIT))  # листки можно присылать по одному
     try:
         printed = json.loads(await notion.get_value(f"print:{uid}") or "{}")
         titles = {int(k): v for k, v in (printed.get("titles") or {}).items()}
+        if not titles and printed.get("map"):  # распечатка старой версии: названия берём из Notion
+            sem = asyncio.Semaphore(6)
+
+            async def title(n: int, page_id: str) -> None:
+                async with sem:
+                    try:
+                        titles[n] = (await notion.page_info(page_id))["title"][:50]
+                    except Exception:
+                        pass
+            await asyncio.gather(*(title(int(n), pid) for n, pid in printed["map"].items()))
         numbers, comments = await ai.read_printout(images, titles)
+        # новые распечатки с метками по углам: зачёркнутое ищется по месту заметки на листе, даже без читаемого номера
+        layout = await notion.get_value(f"printlayout:{uid}")
+        if layout:
+            numbers = sorted(set(numbers) | await asyncio.to_thread(paper.find_crossed, images, paper.unpack(layout)))
     except Exception as e:
         log.exception("crossed failed")
         await status.edit_text(f"❌ Не получилось прочитать фото: {e}"[:4000])
@@ -2870,8 +2903,6 @@ async def _comment_show(message: Message, uid: int, edit_q=None) -> None:
         return
     if st:
         _comments.pop(uid, None)
-        if uid not in _crossed:
-            _crossing.pop(uid, None)
         done = f"Поправила {st['done']} {_plural(st['done'], 'заметку', 'заметки', 'заметок')}." if st["done"] else "Ничего не меняла."
         if edit_q:
             await _edit(edit_q, f"✍️ Пометки разобраны. {done}")
@@ -2947,7 +2978,6 @@ async def on_print_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         st = _crossed[uid]
         if action == "x":
             _crossed.pop(uid, None)
-            _crossing.pop(uid, None)
             await q.answer()
             await _edit(q, "✏️ Ничего не трогала.")
             return
@@ -2974,10 +3004,10 @@ async def on_print_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("crossed item failed")
         _crossed.pop(uid, None)
-        _crossing.pop(uid, None)
         word = _plural(count, "заметку", "заметки", "заметок")
-        await _edit(q, f"🗑 Удалила {count} {word}. Вернуть можно из корзины Notion (30 дней)." if action == "del"
-                    else f"✅ Закрыла {count} {word}.")  # fmt: skip
+        more = "\n\nЕсть ещё листки — присылай фото."
+        await _edit(q, (f"🗑 Удалила {count} {word}. Вернуть можно из корзины Notion (30 дней)." if action == "del"
+                        else f"✅ Закрыла {count} {word}.") + more)  # fmt: skip
     except Exception as e:
         log.exception("print button failed")
         await _fail(q, e)
@@ -5007,6 +5037,12 @@ async def set_commands(app: Application) -> None:
     try:
         log.info("projects: %s", await notion.ensure_projects())
         log.info("spheres: %s", await notion.seed_spheres())
+        if c.OWNER_ID and not await notion.get_value("seed:printout_ask:1"):
+            # владелица попросила: утром спросить фото последних распечатанных листков, чтобы синхронизироваться
+            now = scheduler.local_now(await scheduler.get_settings(c.OWNER_ID))
+            day = now.date() if now.time() < scheduler.PRINTOUT_ASK_AT else now.date() + timedelta(days=1)
+            await scheduler.update_settings(c.OWNER_ID, printout_ask=day.isoformat())
+            await notion.set_value("seed:printout_ask:1", day.isoformat())
         seeded = await timetable.seed_owner(c.OWNER_ID)
         log.info("timetable: %s", seeded)
         log.info("timetable upgrade: %s", await timetable.upgrade_owner(c.OWNER_ID))
