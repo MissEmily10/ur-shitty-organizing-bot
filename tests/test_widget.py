@@ -73,6 +73,7 @@ async def run():
     assert f"/w/{token}" in jsx and "__BOT_URL__" not in jsx and "organizer.widget/README.txt" in archive.namelist()
     hotkey = archive.read("Горячая клавиша для заметки.txt").decode()
     iphone = archive.read("iPhone — Мой день.js").decode()
+    assert json.loads(archive.read("Karabiner — T+G+Enter.json"))["manipulators"][0]["to"][0]["shell_command"] == "shortcuts run 'Заметка в бот'"
     assert f"/w/{token}/add" in hotkey and f'"{widget.url(token)}"' in iphone and "__BOT" not in iphone + hotkey
     await app.process_update(h.text("/widget"))
     doc = next(d for e, d in reversed(h.sent) if e == "sendDocument")
