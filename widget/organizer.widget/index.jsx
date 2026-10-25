@@ -6,7 +6,7 @@ import { css, run } from "uebersicht";
 
 const BOT = "__BOT_URL__";
 export const refreshFrequency = 5 * 60 * 1000; // каждые 5 минут
-export const initialState = { data: null, error: "", busy: "", allPlans: false };
+export const initialState = { data: null, error: "", busy: "", allPlans: false, tint: null };
 
 let shownDate = ""; // какой день открыт стрелками; пусто — бот сам решает (сегодня, а вечером — завтра)
 
@@ -16,7 +16,52 @@ const load = (dispatch) =>
     .then((data) => dispatch(data.error ? { type: "ERROR", error: data.error } : { type: "DATA", data }))
     .catch(() => dispatch({ type: "ERROR", error: "Нет связи с ботом — проверю через 5 минут" }));
 
-export const command = load;
+// ---------- стекло под цвет обоев: средний цвет картинки рабочего стола (раз в 30 минут) ----------
+
+const WALLPAPER = [
+  `f=$(osascript -e 'tell application "System Events" to get picture of current desktop' 2>/dev/null)`,
+  `[ -f "$f" ] && sips -s format bmp -z 1 1 "$f" --out /tmp/organizer-wallpaper.bmp >/dev/null 2>&1`,
+  `&& xxd -p /tmp/organizer-wallpaper.bmp | tr -d '\\n'`,
+].join(" ");
+let tintAt = 0;
+
+const byte = (hex, at) => parseInt(hex.substr(at * 2, 2), 16);
+const word = (hex, at) => byte(hex, at) + byte(hex, at + 1) * 256 + byte(hex, at + 2) * 65536;
+
+const loadTint = (dispatch) => {
+  if (Date.now() - tintAt < 30 * 60 * 1000) return;
+  tintAt = Date.now();
+  run(WALLPAPER)
+    .then((hex) => {
+      hex = hex.trim();
+      if (hex.length < 60) return; // обои — видео или их не видно: остаётся нейтральное стекло
+      const at = word(hex, 10); // в BMP пиксели начинаются по адресу из заголовка, цвет записан как B, G, R
+      dispatch({ type: "TINT", tint: [byte(hex, at + 2), byte(hex, at + 1), byte(hex, at)] });
+    })
+    .catch(() => {});
+};
+
+export const command = (dispatch) => {
+  loadTint(dispatch);
+  return load(dispatch);
+};
+
+const theme = (tint) => {
+  const [r, g, b] = tint || [255, 255, 255];
+  const dark = (0.299 * r + 0.587 * g + 0.114 * b) / 255 < 0.42;
+  const mix = (c, to, k) => Math.round(c + (to - c) * k);
+  const glass = dark
+    ? `rgba(${mix(r, 0, 0.45)}, ${mix(g, 0, 0.45)}, ${mix(b, 0, 0.45)}, 0.42)`
+    : `rgba(${mix(r, 255, 0.55)}, ${mix(g, 255, 0.55)}, ${mix(b, 255, 0.55)}, 0.42)`;
+  return {
+    "--glass": glass,
+    "--text": dark ? "#F7F5F2" : "#1F1F24",
+    "--muted": dark ? "rgba(255, 255, 255, 0.66)" : "rgba(31, 31, 36, 0.58)",
+    "--pill": dark ? "rgba(255, 255, 255, 0.14)" : "rgba(255, 255, 255, 0.5)",
+    "--line": dark ? "rgba(255, 255, 255, 0.14)" : "rgba(31, 31, 36, 0.09)",
+    "--accent": `rgb(${mix(r, dark ? 255 : 0, 0.25)}, ${mix(g, dark ? 255 : 0, 0.25)}, ${mix(b, dark ? 255 : 0, 0.25)})`,
+  };
+};
 
 export const updateState = (event, state) => {
   switch (event.type) {
@@ -24,6 +69,8 @@ export const updateState = (event, state) => {
       return { ...state, data: event.data, error: "", busy: "" };
     case "ERROR":
       return { ...state, error: event.error, busy: "" };
+    case "TINT":
+      return { ...state, tint: event.tint };
     case "BUSY":
       return { ...state, busy: event.text };
     case "TOGGLE_PLANS":
@@ -105,21 +152,24 @@ const COLORS = {
   routine: ["#F2F2F6", "#8A8A95"],
   note: ["#F2F2F6", "#8A8A95"],
 };
-const URGENCY = { fire: ["горит", "#E5534B"], soon: ["скоро", "#1F1F24"], later: ["потом", "#8A8A95"] };
+const URGENCY = { fire: ["горит", "#E5534B"], soon: ["скоро", "var(--text)"], later: ["потом", "var(--muted)"] };
 
 export const className = css`
   top: 24px;
   right: 24px;
   width: 760px;
   font-family: "PT Sans", -apple-system, sans-serif;
-  color: #1f1f24;
+  color: var(--text);
   -webkit-font-smoothing: antialiased;
 `;
 
 const card = css`
-  background: #ffffff;
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  backdrop-filter: blur(28px) saturate(160%);
+  border: 1px solid var(--line);
   border-radius: 18px;
-  box-shadow: 0 8px 30px rgba(31, 31, 36, 0.14);
+  box-shadow: 0 8px 30px rgba(31, 31, 36, 0.12);
   padding: 16px 16px 12px;
   display: flex;
   gap: 18px;
@@ -129,14 +179,14 @@ const card = css`
     min-width: 0;
   }
   & > section + section {
-    border-left: 1px solid #f2f2f6;
+    border-left: 1px solid var(--line);
     padding-left: 18px;
   }
 `;
 const head = css`
   display: flex;
   align-items: center;
-  background: #fff4e6;
+  background: var(--pill);
   border-radius: 8px;
   padding: 6px 10px;
   margin-bottom: 10px;
@@ -150,7 +200,7 @@ const head = css`
   }
   small {
     font-size: 11px;
-    color: #8a8a95;
+    color: var(--muted);
     margin-right: 8px;
   }
 `;
@@ -159,10 +209,10 @@ const btn = css`
   background: transparent;
   font-size: 16px;
   cursor: pointer;
-  color: #1f1f24;
+  color: var(--text);
   padding: 0 4px;
   &:hover {
-    color: #9b4ddb;
+    color: var(--accent);
   }
 `;
 const row = css`
@@ -175,7 +225,7 @@ const row = css`
     font-weight: 700;
     padding-top: 6px;
     text-align: right;
-    color: #1f1f24;
+    color: var(--text);
   }
   .box {
     flex: 1;
@@ -211,19 +261,19 @@ const row = css`
 const gap = css`
   margin: 2px 0 8px 52px;
   font-size: 11px;
-  color: #8a8a95;
-  border-left: 2px dashed #e6e6eb;
+  color: var(--muted);
+  border-left: 2px dashed var(--line);
   padding-left: 8px;
 `;
 const plan = css`
   display: flex;
   gap: 8px;
   padding: 5px 0;
-  border-top: 1px solid #f2f2f6;
+  border-top: 1px solid var(--line);
   .check {
     width: 14px;
     height: 14px;
-    border: 1.5px solid #1f1f24;
+    border: 1.5px solid var(--text);
     border-radius: 3px;
     margin-top: 2px;
     cursor: pointer;
@@ -238,7 +288,7 @@ const plan = css`
   }
   .w {
     font-size: 11px;
-    color: #8a8a95;
+    color: var(--muted);
   }
   .step {
     display: flex;
@@ -253,7 +303,7 @@ const plan = css`
 `;
 const note = css`
   font-size: 11px;
-  color: #8a8a95;
+  color: var(--muted);
   margin-top: 6px;
 `;
 
@@ -275,7 +325,7 @@ const Day = ({ data, dispatch }) => {
     out.push(
       <div className={row} key={k}>
         <div className="time">{item.start || "весь день"}</div>
-        <div className="box" style={{ background: fill, borderColor: border, borderWidth: current ? 2 : 1 }}>
+        <div className="box" style={{ background: `${fill}E6`, borderColor: border, borderWidth: current ? 2 : 1, color: "#1F1F24" }}>
           {current && <span className="badge" style={{ color: "#9B4DDB" }}>сейчас</span>}
           {k === nextIndex && !current && <span className="badge" style={{ color: "#8A8A95" }}>дальше</span>}
           {item.link && <span className="join" onClick={() => openLink(item.link)}>войти</span>}
@@ -322,8 +372,8 @@ const Plans = ({ plans, all, dispatch }) => {
 };
 
 // один большой виджет: слева — день, справа — планы
-export const render = ({ data, error, busy, allPlans }, dispatch) => (
-  <div>
+export const render = ({ data, error, busy, allPlans, tint }, dispatch) => (
+  <div style={{ ...theme(tint), color: "var(--text)" }}>
     <style>{"@import url('https://fonts.googleapis.com/css2?family=Paytone+One&family=PT+Sans:wght@400;700&display=swap');"}</style>
     <div className={card}>
       <section>
