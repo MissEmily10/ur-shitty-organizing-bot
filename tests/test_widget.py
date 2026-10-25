@@ -132,6 +132,8 @@ async def run():
         r = await client.post(f"/w/{token}/add", data=json.dumps({"text": "ммм", "kind": "task", "once": False}))
         assert r.status == 400 and "Не поняла" in (await r.json())["error"]
         assert (await client.post(f"/w/{token}/add", data=json.dumps({"text": "x", "kind": "hack"}))).status == 400
+        r = await client.post(f"/w/{token}/add", data=json.dumps({"text": "Введенный текст", "kind": "note"}))
+        assert r.status == 400 and "переменн" in h.texts(chat=42)[-1], "подсказка, если в быстрой команде слова вместо переменной"
 
         # 6. ⏰ на завтра (время срока сохраняется), перетащенный порядок, настроение
         moved = []

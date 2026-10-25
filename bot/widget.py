@@ -36,6 +36,13 @@ DAYS_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "
 PLANS_TTL = 60  # секунд: виджет спрашивает каждые несколько минут, Notion лишний раз не трогаем
 CORS = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type"}
 
+PLACEHOLDERS = {"введенный текст", "provided input", "ask for input", "запросить ввод", "ask for text"}
+PLACEHOLDER_HINT = (
+    "⌨️ Быстрая команда прислала слова «Введённый текст», а не то, что ты написала: в «Получить содержимое URL» "
+    "у поля text стоит текст вместо переменной. Сотри его и выбери синюю плашку «Запросить ввод» (Ask for Input) — "
+    "правый клик в поле → «Вставить переменную»."
+)
+
 _secret: list[str] = []
 _plans_cache: dict[int, tuple[float, list[dict]]] = {}
 
@@ -242,6 +249,10 @@ def routes(bot: Bot) -> list:
         text, kind = str(data.get("text") or "").strip()[:2000], str(data.get("kind") or "note")
         if not text or kind not in (*schedule.CATEGORIES, "note"):
             return reply({"error": "Пусто или непонятный тип"}, 400)
+        if text.lower().replace("ё", "е") in PLACEHOLDERS:
+            # в быстрой команде в поле text написано название переменной словами, а не сама переменная
+            await bot.send_message(uid, PLACEHOLDER_HINT)
+            return reply({"error": PLACEHOLDER_HINT}, 400)
         try:
             return reply({"ok": True, "message": await add(bot, uid, text, kind, bool(data.get("once", True)))})
         except ValueError as e:
