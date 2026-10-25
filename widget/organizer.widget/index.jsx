@@ -46,6 +46,35 @@ export const command = (dispatch) => {
   return load(dispatch);
 };
 
+// Палитра карточек под обои: оттенок «уроков» = оттенок обоев, остальные типы повернуты на те же углы, что в палитре
+// из Figma (репетиторы +62°, вне школы −171°, события +180°). Светлота подобрана под контраст: на светлом стекле —
+// светлые пастельные карточки с тёмным текстом, на тёмном — тёмные карточки со светлым текстом.
+const FIGMA = { lesson: 0, tutor: 62, other: -171, event: 180 };
+
+const hsl = (r, g, b) => {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min, s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  const h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [h * 60, s, l];
+};
+
+const palette = (tint, dark) => {
+  let [h, s] = tint ? hsl(...tint) : [242, 1];
+  if (s < 0.12) h = 242; // серые обои — оттенки из Figma как есть
+  const box = (shift, sat = 1) => {
+    const hue = (((h + shift) % 360) + 360) % 360;
+    return dark
+      ? [`hsl(${hue}, ${Math.round(38 * sat)}%, 27%)`, `hsl(${hue}, ${Math.round(70 * sat)}%, 72%)`, "#F7F5F2", "rgba(247, 245, 242, 0.72)"]
+      : [`hsl(${hue}, ${Math.round(90 * sat)}%, 90%)`, `hsl(${hue}, ${Math.round(55 * sat)}%, 42%)`, "#1F1F24", "rgba(31, 31, 36, 0.66)"];
+  };
+  return {
+    lesson: box(FIGMA.lesson), tutor: box(FIGMA.tutor), other: box(FIGMA.other), event: box(FIGMA.event, 0.6),
+    routine: box(0, 0.12), note: box(0, 0.12),
+  };
+};
+
 const theme = (tint) => {
   const [r, g, b] = tint || [255, 255, 255];
   const dark = (0.299 * r + 0.587 * g + 0.114 * b) / 255 < 0.42;
@@ -60,6 +89,7 @@ const theme = (tint) => {
     "--pill": dark ? "rgba(255, 255, 255, 0.14)" : "rgba(255, 255, 255, 0.5)",
     "--line": dark ? "rgba(255, 255, 255, 0.14)" : "rgba(31, 31, 36, 0.09)",
     "--accent": `rgb(${mix(r, dark ? 255 : 0, 0.25)}, ${mix(g, dark ? 255 : 0, 0.25)}, ${mix(b, dark ? 255 : 0, 0.25)})`,
+    dark,
   };
 };
 
@@ -144,14 +174,6 @@ const openLink = (link) => {
 
 // ---------- оформление: палитра «Моего расписания» из Figma ----------
 
-const COLORS = {
-  lesson: ["#D5D4FF", "#9B4DDB"],
-  tutor: ["#FFE1FD", "#9B4DDB"],
-  other: ["#F5FFCB", "#A37E2F"],
-  event: ["#FFF4E6", "#A37E2F"],
-  routine: ["#F2F2F6", "#8A8A95"],
-  note: ["#F2F2F6", "#8A8A95"],
-};
 const URGENCY = { fire: ["горит", "#E5534B"], soon: ["скоро", "var(--text)"], later: ["потом", "var(--muted)"] };
 
 export const className = css`
@@ -239,7 +261,7 @@ const row = css`
   }
   .meta {
     font-size: 11px;
-    color: #5a5a66;
+    color: var(--box-muted);
   }
   .badge {
     float: right;
@@ -251,11 +273,12 @@ const row = css`
   .join {
     float: right;
     font-size: 11px;
-    border: 1px solid #9b4ddb;
+    border: 1px solid var(--box-border);
     border-radius: 10px;
     padding: 0 8px;
     cursor: pointer;
-    background: #fff;
+    background: transparent;
+    color: inherit;
   }
 `;
 const gap = css`
@@ -310,7 +333,7 @@ const note = css`
 const minutes = (hhmm) => (hhmm ? Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5)) : 0);
 const pause = (m) => (m >= 60 ? `${Math.floor(m / 60)} ч${m % 60 ? ` ${m % 60} мин` : ""}` : `${m} мин`);
 
-const Day = ({ data, dispatch }) => {
+const Day = ({ data, dispatch, colors }) => {
   const now = minutes(data.now);
   const nextIndex = data.today ? data.items.findIndex((i) => minutes(i.start) > now) : -1;
   const out = [];
@@ -319,15 +342,16 @@ const Day = ({ data, dispatch }) => {
     if (prev && prev.end && item.start && minutes(item.start) - minutes(prev.end) >= 30) {
       out.push(<div className={gap} key={`gap${k}`}>окно {pause(minutes(item.start) - minutes(prev.end))}</div>);
     }
-    const [fill, border] = COLORS[item.kind] || COLORS.note;
+    const [fill, border, text, muted] = colors[item.kind] || colors.note;
     const current = data.today && item.start && item.end && minutes(item.start) <= now && now < minutes(item.end);
     const meta = [item.end ? `до ${item.end}` : "", item.online ? "онлайн" : "", item.teacher, item.once ? "разово" : ""].filter(Boolean).join(" · ");
     out.push(
       <div className={row} key={k}>
         <div className="time">{item.start || "весь день"}</div>
-        <div className="box" style={{ background: `${fill}E6`, borderColor: border, borderWidth: current ? 2 : 1, color: "#1F1F24" }}>
-          {current && <span className="badge" style={{ color: "#9B4DDB" }}>сейчас</span>}
-          {k === nextIndex && !current && <span className="badge" style={{ color: "#8A8A95" }}>дальше</span>}
+        <div className="box" style={{ background: fill, borderColor: border, borderWidth: current ? 2 : 1, color: text,
+                                      "--box-muted": muted, "--box-border": border }}>
+          {current && <span className="badge" style={{ color: border }}>сейчас</span>}
+          {k === nextIndex && !current && <span className="badge" style={{ color: muted }}>дальше</span>}
           {item.link && <span className="join" onClick={() => openLink(item.link)}>войти</span>}
           <div className="title">{item.title}</div>
           {meta && <div className="meta">{meta}</div>}
@@ -372,8 +396,11 @@ const Plans = ({ plans, all, dispatch }) => {
 };
 
 // один большой виджет: слева — день, справа — планы
-export const render = ({ data, error, busy, allPlans, tint }, dispatch) => (
-  <div style={{ ...theme(tint), color: "var(--text)" }}>
+export const render = ({ data, error, busy, allPlans, tint }, dispatch) => {
+  const { dark, ...vars } = theme(tint);
+  const colors = palette(tint, dark);
+  return (
+  <div style={{ ...vars, color: "var(--text)" }}>
     <style>{"@import url('https://fonts.googleapis.com/css2?family=Paytone+One&family=PT+Sans:wght@400;700&display=swap');"}</style>
     <div className={card}>
       <section>
@@ -384,7 +411,7 @@ export const render = ({ data, error, busy, allPlans, tint }, dispatch) => (
           <button className={btn} onClick={() => data && shift(dispatch, data, 1)}>›</button>
           <button className={btn} title="Добавить в расписание" onClick={() => addEvent(dispatch)}>＋</button>
         </div>
-        {data ? <Day data={data} dispatch={dispatch} /> : <div className={note}>Загружаю…</div>}
+        {data ? <Day data={data} dispatch={dispatch} colors={colors} /> : <div className={note}>Загружаю…</div>}
         {data && !data.today && (
           <div className={note} style={{ cursor: "pointer" }} onClick={() => { shownDate = ""; load(dispatch); }}>
             ↩︎ к сегодня
@@ -403,3 +430,4 @@ export const render = ({ data, error, busy, allPlans, tint }, dispatch) => (
     </div>
   </div>
 );
+};
