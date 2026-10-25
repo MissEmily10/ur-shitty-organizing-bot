@@ -6,7 +6,16 @@ import { css, run } from "uebersicht";
 
 const BOT = "__BOT_URL__";
 export const refreshFrequency = 5 * 60 * 1000; // каждые 5 минут
-export const initialState = { data: null, error: "", busy: "", allPlans: false, tint: null };
+// куда передвинут виджет (сдвиг от правого верхнего угла) — запоминается на этом Mac
+const savedOffset = () => {
+  try {
+    return JSON.parse(localStorage.getItem("organizer.offset")) || { x: 0, y: 0 };
+  } catch (e) {
+    return { x: 0, y: 0 };
+  }
+};
+
+export const initialState = { data: null, error: "", busy: "", allPlans: false, tint: null, offset: savedOffset() };
 
 let shownDate = ""; // какой день открыт стрелками; пусто — бот сам решает (сегодня, а вечером — завтра)
 
@@ -18,27 +27,27 @@ const load = (dispatch) =>
 
 // ---------- стекло под цвет обоев: средний цвет картинки рабочего стола (раз в 30 минут) ----------
 
-const WALLPAPER = [
-  `f=$(osascript -e 'tell application "System Events" to get picture of current desktop' 2>/dev/null)`,
-  `[ -f "$f" ] && sips -s format bmp -z 1 1 "$f" --out /tmp/organizer-wallpaper.bmp >/dev/null 2>&1`,
-  `&& xxd -p /tmp/organizer-wallpaper.bmp | tr -d '\\n'`,
-].join(" ");
+// wallpaper.sh лежит рядом с этим файлом: средний цвет обоев или ERR:причина
+const WALLPAPER = "if [ -f organizer.widget/wallpaper.sh ]; then bash organizer.widget/wallpaper.sh; else bash wallpaper.sh; fi";
 let tintAt = 0;
 
 const byte = (hex, at) => parseInt(hex.substr(at * 2, 2), 16);
 const word = (hex, at) => byte(hex, at) + byte(hex, at + 1) * 256 + byte(hex, at + 2) * 65536;
 
 const loadTint = (dispatch) => {
-  if (Date.now() - tintAt < 30 * 60 * 1000) return;
+  if (Date.now() - tintAt < 10 * 60 * 1000) return; // поменяла обои — виджет подстроится за 10 минут
   tintAt = Date.now();
   run(WALLPAPER)
     .then((hex) => {
       hex = hex.trim();
-      if (hex.length < 60) return; // обои — видео или их не видно: остаётся нейтральное стекло
+      if (hex.startsWith("ERR:") || hex.length < 60) {
+        // обои не нашлись (живые обои, смена фото…) — нейтральное стекло, а причину видно внизу виджета
+        return dispatch({ type: "TINT_ERROR", error: hex.startsWith("ERR:") ? hex.slice(4) : "не получила цвет обоев" });
+      }
       const at = word(hex, 10); // в BMP пиксели начинаются по адресу из заголовка, цвет записан как B, G, R
       dispatch({ type: "TINT", tint: [byte(hex, at + 2), byte(hex, at + 1), byte(hex, at)] });
     })
-    .catch(() => {});
+    .catch((e) => dispatch({ type: "TINT_ERROR", error: `не запустилась проверка обоев (${String(e).slice(0, 80)})` }));
 };
 
 export const command = (dispatch) => {
@@ -100,9 +109,13 @@ export const updateState = (event, state) => {
     case "ERROR":
       return { ...state, error: event.error, busy: "" };
     case "TINT":
-      return { ...state, tint: event.tint };
+      return { ...state, tint: event.tint, tintError: "" };
+    case "TINT_ERROR":
+      return { ...state, tintError: event.error };
     case "BUSY":
       return { ...state, busy: event.text };
+    case "MOVE":
+      return { ...state, offset: event.offset };
     case "PLANS":
       return { ...state, data: { ...state.data, plans: event.plans } };
     case "TOGGLE_PLANS":
@@ -484,13 +497,49 @@ const Plans = ({ plans, all, dispatch }) => {
 };
 
 // один большой виджет: слева — день, справа — планы
-export const render = ({ data, error, busy, allPlans, tint }, dispatch) => {
+// перетаскивание за ⠿ в левом верхнем углу: двигаем, отпустили — место запомнилось
+const startMove = (event, offset, dispatch) => {
+  event.preventDefault();
+  const start = { x: event.clientX - offset.x, y: event.clientY - offset.y };
+  let last = offset;
+  const move = (e) => {
+    last = { x: e.clientX - start.x, y: e.clientY - start.y };
+    dispatch({ type: "MOVE", offset: last });
+  };
+  const stop = () => {
+    window.removeEventListener("mousemove", move);
+    window.removeEventListener("mouseup", stop);
+    try {
+      localStorage.setItem("organizer.offset", JSON.stringify(last));
+    } catch (e) {}
+  };
+  window.addEventListener("mousemove", move);
+  window.addEventListener("mouseup", stop);
+};
+
+const handle = css`
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 46px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line);
+  cursor: grab;
+  &:hover {
+    background: var(--muted);
+  }
+`;
+
+export const render = ({ data, error, busy, allPlans, tint, tintError, offset }, dispatch) => {
   const { dark, ...vars } = theme(tint);
   const colors = palette(tint, dark);
   return (
-  <div style={{ ...vars, color: "var(--text)" }}>
+  <div style={{ ...vars, color: "var(--text)", position: "relative", transform: `translate(${offset.x}px, ${offset.y}px)` }}>
     <style>{"@import url('https://fonts.googleapis.com/css2?family=Paytone+One&family=PT+Sans:wght@400;700&display=swap');"}</style>
-    <div className={card}>
+    <div className={card} style={{ position: "relative" }}>
+      <div className={handle} title="Потяни, чтобы передвинуть виджет" onMouseDown={(e) => startMove(e, offset, dispatch)} />
       <section>
         <div className={head}>
           <button className={btn} onClick={() => data && shift(dispatch, data, -1)}>‹</button>
@@ -524,6 +573,7 @@ export const render = ({ data, error, busy, allPlans, tint }, dispatch) => {
         </div>
         {data ? <Plans plans={data.plans} all={allPlans} dispatch={dispatch} /> : null}
         {(busy || error) && <div className={note}>{busy || error}</div>}
+        {tintError && <div className={note}>🎨 Цвет под обои: {tintError}</div>}
       </section>
     </div>
   </div>
