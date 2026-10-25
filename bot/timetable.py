@@ -444,7 +444,7 @@ def is_tutor(item: dict) -> bool:
     return bool(item.get("tutor") or item.get("link"))
 
 
-SEED_VERSION = 8  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
+SEED_VERSION = 9  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
 
 
 async def reload_owner(uid: int) -> str:
