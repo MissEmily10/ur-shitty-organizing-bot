@@ -25,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import ai, banners, documents, notion, paper, pdf, schedule, scheduler, studio, styles, team, timetable, weekly, whenparse
+from . import ai, banners, changes, documents, notion, paper, pdf, schedule, scheduler, studio, styles, team, timetable, weekly, whenparse, widget
 from . import config as c
 from .markdown import chunks as _chunks, tg_html, to_blocks
 
@@ -1216,8 +1216,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _comment_reply(update.message)
         return
     if (prompt := asked(ROUTINE_PROMPT, *CHANGE_PROMPTS.values())):
-        kind = next((k for k, p in CHANGE_PROMPTS.items() if p == prompt), None)
-        await _schedule_reply(update.message, routine=prompt == ROUTINE_PROMPT, category=kind)
+        key = next((k for k, p in CHANGE_PROMPTS.items() if p == prompt), None)
+        kind, once = key if isinstance(key, tuple) else (key, None)
+        await _schedule_reply(update.message, routine=prompt == ROUTINE_PROMPT, category=kind, once=once)
+        return
+    if bot_text.startswith(TUTOR_LINK_PROMPT):
+        await _tutor_link_reply(update.message, bot_text)
         return
     if asked(TYPE_PROMPT):
         await update.message.reply_text(await styles.wrap(update.effective_user.id, "ok", await _add_types_text(update.message.text)))
@@ -2725,20 +2729,6 @@ async def _send_print(message: Message, uid: int) -> None:
 # ✂️ Карточки для вырезания: одна открытая заметка — одна карточка, по порядку важности. Большая заметка — одной
 # карточкой с подзадачами чек-листом (отдельных карточек у подзадач нет). Без распознавания по фото.
 
-WEEKDAY_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
-
-
-def _short_when(iso: str, today) -> tuple[str, str]:
-    """Срок для карточки: («пн 26.10 08:00», насколько горит: fire — просрочено или сегодня, soon — неделя, later)."""
-    at = datetime.fromisoformat(iso) if "T" in iso else None
-    day = at.date() if at else date.fromisoformat(iso[:10])
-    label = {0: "сегодня", 1: "завтра", -1: "вчера"}.get((day - today).days, f"{WEEKDAY_SHORT[day.weekday()]} {day:%d.%m}")
-    if at:
-        label += f" {at:%H:%M}"
-    urgency = "fire" if day <= today else "soon" if (day - today).days <= 7 else "later"
-    return label, urgency
-
-
 async def _cards(uid: int) -> list[dict]:
     items = await notion.open_notes(uid)
     open_ids = {i["id"] for i in items}
@@ -2753,7 +2743,7 @@ async def _cards(uid: int) -> list[dict]:
             kids = await notion.children(i["id"])
         project = projects.get(i.get("project_id") or "")
         sphere = areas.get((project or {}).get("sphere_id") or "")
-        when, urgency = _short_when(i["when"], today) if i.get("when") else ("", "later")
+        when, urgency = whenparse.urgency(i["when"], today) if i.get("when") else ("", "later")
         return {
             "title": i["title"], "type": i.get("type") or i.get("ai_type") or "", "summary": summary,
             "where": " › ".join(x for x in (sphere, project["name"] if project else "") if x),
@@ -2789,6 +2779,22 @@ async def _send_cards(message: Message, uid: int) -> None:
         io.BytesIO(data), filename=f"карточки-{today:%d.%m}.pdf",
         caption=f"✂️ {len(cards)} {_plural(len(cards), 'карточка', 'карточки', 'карточек')} на {sheets} "
         f"{_plural(sheets, 'листе', 'листах', 'листах')} A4 — режь по пунктиру. Номер на карточке — порядок важности: сначала то, что горит.",
+    )  # fmt: skip
+
+
+async def widget_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """🖥 Папка виджета для Übersicht с секретным адресом внутри (только владелице). /widget new — новый адрес."""
+    if not is_owner(update.effective_user.id):
+        return
+    new = bool(ctx.args) and ctx.args[0].lower() in ("new", "новый")
+    token = await widget.secret(new=new)
+    await update.message.reply_document(
+        io.BytesIO(widget.package(token)), filename="organizer.widget.zip",
+        caption=("🔄 Новый адрес: старый виджет перестал работать, поставь этот. " if new else "")
+        + "🖥 Виджет «Мой день» для рабочего стола Mac: расписание на день и планы, «＋» и «☐».\n\n"
+        "1. Поставь Übersicht (бесплатно): tracesof.net/uebersicht\n"
+        "2. Распакуй архив, значок Übersicht в строке меню → «Open Widgets Folder» → перетащи туда папку organizer.widget.\n\n"
+        "Подробности — в README.txt внутри. Адрес бота в файле секретный: не пересылай архив.",
     )  # fmt: skip
 
 
@@ -3821,20 +3827,30 @@ CHANGE_PROMPT = (
 )
 # Перед изменением бот спрашивает, что это, — и под каждый ответ свой вопрос с примерами
 KIND_QUESTION = "✏️ Что это?"
-CHANGE_PROMPTS = {
-    "tutor": "🧑‍🏫 Репетитор: какой предмет и когда? Ответьте на это сообщение. Например:\n"
-    "«по вторникам 17:00–18:00 английский», «в четверг 23.10 в 15:00 разовое занятие по химии»",
-    "me": "🔖 Засечка под личные дела: на какое время? Ответьте на это сообщение. Например:\n"
-    "«в субботу 12–14 — время для себя», «каждый день 22:00–23:00 без дел»",
-    "lesson": "📚 Доп. урок: какой и когда? Ответьте на это сообщение. Например:\n"
-    "«в пятницу 15:00–16:00 доп. по алгебре», «по средам 16:00 консультация по химии»",
-    "task": "📝 Доп. дело: что и когда? Ответьте на это сообщение. Например:\n"
-    "«в среду в 18:00 забрать посылку», «25.10 весь день съёмка»",
-    "other": CHANGE_PROMPT,
+KIND_HEADS = {"tutor": "🧑‍🏫 Репетитор", "me": "🔖 Засечка под личные дела", "lesson": "📚 Доп. урок", "task": "📝 Доп. дело"}
+KIND_ASKS = {"tutor": "какой предмет и когда?", "me": "на какое время?", "lesson": "какой и когда?", "task": "что и когда?"}
+KIND_EXAMPLES = {
+    ("tutor", True): "«в пятницу 19:00–20:00 китайский», «завтра в 10 математика»",
+    ("tutor", False): "«по вторникам 17:00–18:00 английский»",
+    ("me", True): "«в субботу 12–14 — время для себя»",
+    ("me", False): "«каждый день 22:00–23:00 без дел»",
+    ("lesson", True): "«в четверг 16:00–17:00 консультация по химии»",
+    ("lesson", False): "«по средам 16:00 консультация по химии»",
+    ("task", True): "«в среду в 18:00 забрать посылку», «25.10 весь день съёмка»",
+    ("task", False): "«по субботам в 10:00 уборка»",
 }
+# (что это, разово ли) → вопрос; ответ на него бот узнаёт по началу текста. «other» — отменить или перенести
+CHANGE_PROMPTS: dict = {
+    (kind, once): f"{KIND_HEADS[kind]}, {'разово' if once else 'каждую неделю'}: {KIND_ASKS[kind]} "
+    f"Ответьте на это сообщение. Например:\n{KIND_EXAMPLES[(kind, once)]}"
+    for kind in KIND_HEADS for once in (True, False)
+}
+CHANGE_PROMPTS["other"] = CHANGE_PROMPT
+ONCE_QUESTION = "Это разово или каждую неделю?"
+TUTOR_LINK_PROMPT = changes.TUTOR_LINK_PROMPT
 REVIEW_OPTIONS = {"week": "раз в неделю", "2weeks": "раз в две недели", "month": "раз в месяц", "off": "не напоминать"}
 # Понятые ИИ планы изменений по id сообщения с предпросмотром
-_schedule_plans: dict[int, tuple[dict, str]] = {}
+_schedule_plans: dict[int, tuple[dict, str]] = {}  # id сообщения → (понятое изменение из changes.prepare, текст)
 
 
 def _monday(day, weeks: int = 0):
@@ -3863,30 +3879,13 @@ async def schedule_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
-def _plan_text(plan: dict) -> str:
-    lines = []
-    if plan.get("replace_base"):
-        lines.append("Новое базовое расписание (старое заменится):")
-    for b in plan.get("base_add", []):
-        time_ = f"{b.get('start', '')}–{b['end']}" if b.get("end") else b.get("start", "") or "весь день"
-        lines.append(f"🔁 {', '.join(b.get('days', []))} {time_} — {b.get('title')}")
-    for name in plan.get("base_remove", []):
-        lines.append(f"🗑 убрать из базового: {name}")
-    for e in plan.get("add", []):
-        time_ = f"{e.get('start', '')}–{e['end']}" if e.get("end") else e.get("start", "")
-        lines.append(f"📌 {e['date']} {time_} — {e.get('title')}".replace("  ", " "))
-    for x in plan.get("cancel", []):
-        lines.append(f"🚫 {x['date']}: без «{x.get('title')}»")
-    return "\n".join(lines)
-
-
 def _kind_markup() -> InlineKeyboardMarkup:
     rows = [[Btn(f"{icon} {label[0].upper()}{label[1:]}", callback_data=f"sc:ek:{key}")] for key, (icon, label) in schedule.CATEGORIES.items()]
     rows.append([Btn("✏️ Другое (отменить, перенести)", callback_data="sc:ek:other")])
     return InlineKeyboardMarkup(rows)
 
 
-async def _schedule_reply(message: Message, routine: bool, category: str | None = None) -> None:
+async def _schedule_reply(message: Message, routine: bool, category: str | None = None, once: bool | None = None) -> None:
     uid = message.chat_id
     if not await ai_allowed(message):
         return
@@ -3894,27 +3893,40 @@ async def _schedule_reply(message: Message, routine: bool, category: str | None 
     known = schedule.CATEGORIES.get(category or "")
     try:
         now = scheduler.local_now(await scheduler.get_settings(uid))
-        base = schedule.base_text(await notion.schedule_slots(uid))
-        text = message.text + (f"\n(Это: {known[1]}.)" if known else "")
-        plan = await ai.parse_schedule(text, base, now, routine)
+        if routine:
+            base = schedule.base_text(await notion.schedule_slots(uid))
+            plan = await ai.parse_schedule(message.text, base, now, True)
+            change = {"route": "schedule", "plan": plan, "text": changes.plan_text(plan), "no_link": []}
+        else:
+            # что это — видно по значку в названии; репетиторы и доп. уроки владелицы — в «🎒 Моё расписание»
+            change = await changes.prepare(uid, message.text, category, once, now, is_owner(uid))
     except Exception as e:
         log.exception("schedule parse failed")
         await status.edit_text(f"❌ Не получилось разобрать: {e}"[:4000])
         return
-    # что это — видно по значку в названии: в расписании, в напоминаниях и в PDF-подписях
-    for item in plan.get("base_add", []) + plan.get("add", []):
-        if isinstance(item, dict) and item.get("title"):
-            item["title"] = schedule.mark(item["title"], category)
-    text = _plan_text(plan)
+    text = change["text"]
     if not text:
         await status.edit_text("🤷 Не понял, что поменять. Попробуйте сформулировать иначе.")
         return
-    head = f"Что это: {known[0]} {known[1]}\n\n" if known else ""
+    when = {True: " · разово", False: " · каждую неделю", None: ""}[once]
+    head = f"Что это: {known[0]} {known[1]}{when}\n\n" if known else ""
     sent = await status.edit_text(
         f"Вот что я понял:\n\n{head}{text}\n\nПрименить?",
         reply_markup=InlineKeyboardMarkup([[Btn("✅ Применить", callback_data="sca"), Btn("✖️ Отмена", callback_data="scx")]]),
     )
-    _schedule_plans[getattr(sent, "message_id", status.message_id)] = (plan, text)
+    _schedule_plans[getattr(sent, "message_id", status.message_id)] = (change, text)
+
+
+async def _tutor_link_reply(message: Message, prompt: str) -> None:
+    """Ответ на «🔗 Ссылка на занятия «…»»: запоминаем постоянную ссылку репетитора."""
+    title = prompt[len(TUTOR_LINK_PROMPT):].split("»")[0]
+    link = re.search(r"https?://\S+", message.text or "")
+    if not link:
+        await message.reply_text("Ссылки не нашла — без неё тоже работает, просто не будет напоминания со входом.")
+        return
+    count = await timetable.remember_link(message.chat_id, title, link.group(0))
+    await message.reply_text(f"🔗 Запомнила ссылку для «{title}»: пришлю её за 5 минут до каждого занятия ({count} в расписании).",
+                             disable_web_page_preview=True)  # fmt: skip
 
 
 async def _send_schedule_pdf(message: Message, uid: int, kind: str, offset: int) -> None:
@@ -3950,8 +3962,11 @@ async def on_schedule_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
                 await q.answer("Устарело — опишите изменение ещё раз", show_alert=True)
                 return
             await q.answer("Применяю…")
-            done = await schedule.apply(uid, stored[0])
+            today = scheduler.local_now(await scheduler.get_settings(uid)).date()
+            done = await changes.apply(uid, stored[0], today)
             await _edit(q, "✅ Расписание обновлено:\n\n" + (stored[1] if done else "ничего не поменялось"))
+            for title in stored[0].get("no_link", []):
+                await _ask(q.message, changes.link_question(title), input_field_placeholder="https://…")
             return
         action = parts[1]
         if action == "week":
@@ -3974,11 +3989,22 @@ async def on_schedule_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
         elif action == "edit":
             await q.answer()
             await q.message.reply_text(KIND_QUESTION, reply_markup=_kind_markup())
-        elif action == "ek" and parts[2] in CHANGE_PROMPTS:
+        elif action == "ek" and parts[2] == "other":
             await q.answer()
-            icon, label = schedule.CATEGORIES.get(parts[2], ("✏️", "другое изменение"))
-            await _edit(q, f"{KIND_QUESTION} — {icon} {label}")
-            await q.message.reply_text(CHANGE_PROMPTS[parts[2]], reply_markup=ForceReply(input_field_placeholder="своими словами"))
+            await _edit(q, f"{KIND_QUESTION} — ✏️ другое изменение")
+            await q.message.reply_text(CHANGE_PROMPTS["other"], reply_markup=ForceReply(input_field_placeholder="своими словами"))
+        elif action == "ek" and parts[2] in KIND_HEADS:
+            # следом — разово или каждую неделю (у репетитора с плавающим графиком — разово, ссылка всё равно постоянная)
+            await q.answer()
+            icon, label = schedule.CATEGORIES[parts[2]]
+            await _edit(q, f"{KIND_QUESTION} — {icon} {label}\n\n{ONCE_QUESTION}", reply_markup=InlineKeyboardMarkup([[
+                Btn("1️⃣ Разово", callback_data=f"sc:eo:{parts[2]}:1"), Btn("🔁 Каждую неделю", callback_data=f"sc:eo:{parts[2]}:w")]]))  # fmt: skip
+        elif action == "eo" and parts[2] in KIND_HEADS:
+            await q.answer()
+            once = parts[3] == "1"
+            icon, label = schedule.CATEGORIES[parts[2]]
+            await _edit(q, f"{KIND_QUESTION} — {icon} {label} · {'разово' if once else 'каждую неделю'}")
+            await q.message.reply_text(CHANGE_PROMPTS[(parts[2], once)], reply_markup=ForceReply(input_field_placeholder="своими словами"))
         elif action == "keep":
             await q.answer("Оставляем как есть ✓")
             await q.edit_message_reply_markup(InlineKeyboardMarkup([[Btn("✅ Оставили как есть", callback_data="noop")]]))
@@ -5102,6 +5128,7 @@ OWNER_EXTRA = [
     ("members", "Участники и приглашения"),
     ("teamproject", "Командный проект"),
     ("timetable", "Моё расписание уроков"),
+    ("widget", "Виджет на рабочий стол Mac"),
     ("banners", "Картинки разделов"),
 ]
 
@@ -5206,6 +5233,7 @@ async def serve(app: Application) -> None:
             web.get("/remind/{secret}", tick_hook),
             web.post("/remind/{secret}", tick_hook),
             web.get("/", health),
+            *widget.routes(app.bot),  # 🖥 виджет на рабочем столе Mac (bot/widget.py)
         ]
     )
     runner = web.AppRunner(server)
@@ -5315,6 +5343,7 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("sweep", sweep_cmd, filters=member))
     app.add_handler(CommandHandler("printnotes", print_cmd, filters=member))
     app.add_handler(CommandHandler("cards", cards_cmd, filters=member))
+    app.add_handler(CommandHandler("widget", widget_cmd, filters=member))
     app.add_handler(CommandHandler("crossed", crossed_cmd, filters=member))
     app.add_handler(CommandHandler("timetable", timetable_cmd, filters=owner))
     app.add_handler(CallbackQueryHandler(on_timetable_button, pattern=r"^(tt|td2):"))

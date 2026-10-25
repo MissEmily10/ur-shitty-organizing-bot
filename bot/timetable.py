@@ -22,7 +22,7 @@ from pathlib import Path
 from datetime import date, datetime, timedelta
 
 from . import notion, pdf
-from .notion import KIND_REGULAR, WEEKDAYS
+from .notion import KIND_ONCE, KIND_REGULAR, WEEKDAYS
 
 DAY_NAMES = {
     "понедельник": "Пн", "вторник": "Вт", "среда": "Ср", "среду": "Ср", "четверг": "Чт",
@@ -180,10 +180,65 @@ def week_index(data: dict, day: date) -> int:
 
 
 def for_day(data: dict, day: date) -> list[dict]:
-    """Занятия этого дня с учётом чередования, по времени."""
+    """Занятия этого дня с учётом чередования и разовых занятий (у них "date"), по времени."""
     weekday, week = WEEKDAYS[day.weekday()], week_index(data, day)
-    items = [i for i in data["items"] if weekday in i["days"] and i["week"] in (None, week)]
+    items = [
+        i for i in data["items"]
+        if (i.get("date") == day.isoformat()) or (not i.get("date") and weekday in i["days"] and i["week"] in (None, week))
+    ]  # fmt: skip
     return sorted(items, key=lambda i: i["start"] or "00:00")
+
+
+# ---------- добавленное владелицей: из «✏️ Изменить» в /schedule и из виджета на рабочем столе ----------
+
+
+def tutor_link(data: dict, title: str) -> str:
+    """Постоянная ссылка на занятия с репетитором: сохранённая владелицей или из TUTORS."""
+    key = title.lower().strip()
+    return (data.get("tutor_links") or {}).get(key) or TUTORS.get(key, "")
+
+
+def make_item(data: dict, title: str, start: str, end: str, *, tutor: bool, days: list[str] | None = None,
+              day: str | None = None) -> dict:
+    """Новое занятие: каждую неделю (days) или разово (day — дата ГГГГ-ММ-ДД). Репетитор — по часу, со ссылкой
+    (если она известна, даже когда время каждый раз разное) и с вопросом про домашку."""
+    if tutor and start and not end:
+        end = f"{_minutes(start) // 60 + 1:02d}:{start[3:]}"
+    item = {"days": days or [WEEKDAYS[date.fromisoformat(day).weekday()]], "start": start, "end": end,
+            "title": title[:1].upper() + title[1:], "room": "", "num": "", "teacher": "", "lesson": True, "week": None,
+            "added": True}  # fmt: skip
+    if day:
+        item["date"] = day
+    if tutor:
+        item.update(tutor=True, homework=True, teacher=TUTOR_TEACHERS.get(title.lower(), ""))
+        if link := tutor_link(data, title):
+            item["link"] = link
+    return item
+
+
+async def add_items(uid: int, items: list[dict], today: date) -> dict:
+    """Дописывает занятия в «Моё расписание» (разовые, которые давно прошли, заодно убирает) и обновляет основное."""
+    data = await load(uid) or {"anchor": monday(today).isoformat(), "items": [], "bells": True}
+    keep_from = (today - timedelta(days=14)).isoformat()
+    data["items"] = [i for i in data["items"] if not i.get("date") or i["date"] >= keep_from] + items
+    await save(uid, data)
+    await sync_main_schedule(uid, data)
+    return data
+
+
+async def remember_link(uid: int, title: str, link: str) -> int:
+    """Постоянная ссылка репетитора: запоминаем и ставим всем его занятиям. Возвращает, скольким занятиям поставили."""
+    data = await load(uid)
+    if not data:
+        return 0
+    data.setdefault("tutor_links", {})[title.lower().strip()] = link
+    count = 0
+    for item in data["items"]:
+        if item["title"].lower() == title.lower().strip() and is_tutor(item):
+            item["link"] = link
+            count += 1
+    await save(uid, data)
+    return count
 
 
 def alternatives(data: dict) -> list[tuple[dict, dict]]:
@@ -357,7 +412,7 @@ def main_slots(data: dict) -> list[dict]:
     second = {id(b) for b in pairs.values()}
     slots = []
     for i in data["items"]:
-        if id(i) in second:
+        if id(i) in second or i.get("date"):  # разовые — отдельно, датой (sync_main_schedule)
             continue
         title = i["title"]
         if id(i) in pairs:
@@ -376,6 +431,10 @@ async def sync_main_schedule(uid: int, data: dict) -> int:
     slots = main_slots(data)
     for s in slots:
         await notion.add_slot(uid, s["title"], KIND_REGULAR, s["start"], s["end"], days=s["days"])
+    for i in data["items"]:
+        if i.get("date"):
+            await notion.add_slot(uid, SLOT_MARK + i["title"], KIND_ONCE, i["start"], i["end"], date=i["date"])
+            slots.append(i)
     return len(slots)
 
 
@@ -459,6 +518,10 @@ async def reload_owner(uid: int) -> str:
     old = await load(uid) or {}
     data = {"anchor": SEED_ANCHOR, "items": parse(SEED_FILE.read_text(encoding="utf-8")), "bells": old.get("bells", True)}
     _tutors(data)
+    # то, что владелица добавила сама (кнопкой или из виджета), и её ссылки репетиторов при обновлении из файла не теряются
+    data["items"] += [i for i in old.get("items", []) if i.get("added")]
+    if old.get("tutor_links"):
+        data["tutor_links"] = old["tutor_links"]
     await save(uid, data)
     slots = await sync_main_schedule(uid, data)
     for key in ("seed:timetable:1", "seed:timetable:3"):

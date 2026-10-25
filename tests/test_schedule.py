@@ -94,18 +94,66 @@ async def run():
     question = next(d for e, d in reversed(h.sent) if e == "sendMessage")
     buttons = [b.callback_data for row in question["reply_markup"].inline_keyboard for b in row]
     assert question["text"] == main.KIND_QUESTION and buttons == ["sc:ek:tutor", "sc:ek:me", "sc:ek:lesson", "sc:ek:task", "sc:ek:other"]
-    await app.process_update(h.callback("sc:ek:tutor"))
-    assert h.texts(chat=42)[-1] == main.CHANGE_PROMPTS["tutor"]
+    # …потом — разово или каждую неделю; ИИ мог понять иначе — бот приводит к её ответу
     seen = []
 
-    async def parse_tutor(text, base, now, routine):
+    async def parse(text, base, now, routine):
         seen.append(text)
-        return {"replace_base": False, "base_add": [{"title": "Английский", "days": ["вт"], "start": "17:00", "end": "18:00"}],
-                "base_remove": [], "add": [], "cancel": []}
-    ai.parse_schedule = parse_tutor
-    await app.process_update(h.text("по вторникам 17-18 английский", reply_to=h._message(main.CHANGE_PROMPTS["tutor"])))
-    assert "(Это: репетитор.)" in seen[-1]
-    assert "Что это: 🧑‍🏫 репетитор" in h.texts(chat=42)[-1] and "🧑‍🏫 Английский" in h.texts(chat=42)[-1], h.texts(chat=42)[-1]
+        return parse.answer
+    ai.parse_schedule = parse
+
+    def edited():
+        return next(d for e, d in reversed(h.sent) if e == "editMessageText")
+
+    async def apply_last():
+        press = h.callback("sca")
+        press.callback_query.message._unfreeze()
+        press.callback_query.message.message_id = list(main._schedule_plans)[-1]
+        await app.process_update(press)
+
+    await app.process_update(h.callback("sc:ek:task"))
+    assert main.ONCE_QUESTION in edited()["text"]
+    assert [b.callback_data for row in edited()["reply_markup"].inline_keyboard for b in row] == ["sc:eo:task:1", "sc:eo:task:w"]
+    await app.process_update(h.callback("sc:eo:task:w"))
+    assert h.texts(chat=42)[-1] == main.CHANGE_PROMPTS[("task", False)] and "каждую неделю" in h.texts(chat=42)[-1]
+    parse.answer = {"replace_base": False, "base_add": [], "base_remove": [], "cancel": [],
+                    "add": [{"title": "Уборка", "date": "2026-10-10", "start": "10:00", "end": ""}]}  # fmt: skip
+    await app.process_update(h.text("в субботу в 10 уборка", reply_to=h._message(main.CHANGE_PROMPTS[("task", False)])))
+    assert "(Это: доп. дело. Каждую неделю.)" in seen[-1]
+    assert "Что это: 📝 доп. дело · каждую неделю" in h.texts(chat=42)[-1] and "🔁 Сб 10:00 — 📝 Уборка" in h.texts(chat=42)[-1], h.texts(chat=42)[-1]
+    await apply_last()
+    assert any(r["title"] == "📝 Уборка" and r["kind"] == notion.KIND_REGULAR and r["days"] == ["Сб"] for r in rows), rows
+
+    # репетитор разово (плавающий график): в «🎒 Моё расписание» на дату, ссылка постоянная — уже известна
+    await app.process_update(h.callback("sc:ek:tutor"))
+    await app.process_update(h.callback("sc:eo:tutor:1"))
+    prompt = main.CHANGE_PROMPTS[("tutor", True)]
+    assert h.texts(chat=42)[-1] == prompt
+    parse.answer = {"replace_base": False, "base_add": [{"title": "китайский", "days": ["пт"], "start": "19:00", "end": ""}],
+                    "base_remove": [], "add": [], "cancel": []}  # fmt: skip
+    await app.process_update(h.text("в пятницу в 19 китайский", reply_to=h._message(prompt)))
+    shown = h.texts(chat=42)[-1]
+    assert "📌" in shown and "19:00–20:00 — 🧑‍🏫 Китайский 🔗" in shown and "Моё расписание" in shown, shown
+    await apply_last()
+    from bot import timetable
+    tt = await timetable.load(42)
+    friday = next(i for i in tt["items"] if i["title"] == "Китайский")
+    assert friday["date"] and friday["link"].startswith("https://telemost") and friday["homework"] and friday["added"]
+    assert any(r["title"] == "🎒 Китайский" and r["kind"] == notion.KIND_ONCE and r["date"] == friday["date"] for r in rows)
+    assert timetable.for_day(tt, date.fromisoformat(friday["date"])) and not timetable.for_day(tt, date.fromisoformat(friday["date"]) + main.timedelta(days=7))
+
+    # новый репетитор без ссылки — бот спрашивает постоянную ссылку и ставит её всем его занятиям
+    parse.answer = {"replace_base": False, "base_add": [{"title": "Бэлла", "days": ["вт"], "start": "09:00", "end": "10:00"}],
+                    "base_remove": [], "add": [{"title": "Бэлла", "date": "2026-10-30", "start": "18:00", "end": ""}], "cancel": []}  # fmt: skip
+    await app.process_update(h.text("бэлла во вторник утром и в пятницу вечером", reply_to=h._message(prompt)))
+    await apply_last()
+    asked = h.texts(chat=42)[-1]
+    assert asked.startswith(main.TUTOR_LINK_PROMPT + "Бэлла»"), asked
+    await app.process_update(h.text("вот https://zoom.us/j/123", reply_to=h._message(asked)))
+    tt = await timetable.load(42)
+    assert [i["link"] for i in tt["items"] if i["title"] == "Бэлла"] == ["https://zoom.us/j/123"] * 2
+    assert tt["tutor_links"]["бэлла"] == "https://zoom.us/j/123" and "Запомнила ссылку" in h.texts(chat=42)[-1]
+    assert timetable.make_item(tt, "Бэлла", "11:00", "", tutor=True, day="2026-11-03")["link"] == "https://zoom.us/j/123", "следующие — сразу со ссылкой"
     # отмена по названию без значка находит занятие со значком
     await schedule.apply(42, plan={"base_add": [{"title": "🧑‍🏫 Английский", "days": ["вт"], "start": "17:00", "end": "18:00"}],
                                    "cancel": [{"title": "английский", "date": "2026-10-13"}]})

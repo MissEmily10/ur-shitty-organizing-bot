@@ -106,3 +106,14 @@ def human(iso: str, now: datetime) -> str:
         days, ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][at.weekday()] + at.strftime(" %d.%m")
     )
     return f"{day} {at.strftime('%H:%M')}" if has_time else day
+
+
+def urgency(iso: str, today: date) -> tuple[str, str]:
+    """Срок для карточек и виджета: («пн 26.10 08:00», насколько горит: fire — просрочено или сегодня,
+    soon — в ближайшую неделю, later — позже)."""
+    at = datetime.fromisoformat(iso) if "T" in iso else None
+    day = at.date() if at else date.fromisoformat(iso[:10])
+    label = {0: "сегодня", 1: "завтра", -1: "вчера"}.get((day - today).days, ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][day.weekday()] + f" {day:%d.%m}")
+    if at:
+        label += f" {at:%H:%M}"
+    return label, "fire" if day <= today else "soon" if (day - today).days <= 7 else "later"
