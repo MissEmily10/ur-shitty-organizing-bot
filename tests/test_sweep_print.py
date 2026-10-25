@@ -221,9 +221,30 @@ async def run():
     # 5. в меню «📒 Все заметки» — новые кнопки
     text, rows = await main._section(42, "notes")
     text = text.replace("<b>", "").replace("</b>", "")
-    for label in ("🧽 Перебрать все", "🖨 Печать", "✏️ Зачёркнутое"):
+    for label in ("🧽 Перебрать все", "🖨 Печать", "✂️ Карточки", "✏️ Зачёркнутое"):
         assert label in text and any(b[0] == label for row in rows for b in row), label
     assert pdf.notes_pdf([], "x", "y")[:4] == b"%PDF"
+
+    # ✂️ карточки: одна открытая заметка — одна карточка; горящее первым, потом по сроку, потом без срока
+    for p in list(pages):
+        pages[p]["done"] = True
+    today = main.scheduler.local_now(await main.scheduler.get_settings(42)).date()
+    late, soon_, free = add("Без срока", 2), add("Через три дня", 3), add("Просрочено", 4)
+    pages[late]["when"] = None
+    pages[soon_]["when"] = (today + main.timedelta(days=3)).isoformat()
+    pages[free]["when"] = (today - main.timedelta(days=1)).isoformat() + "T15:00:00+03:00"
+    big2 = add("Большая", 5)
+    kid2 = add("Шаг 1", 6, parent_id=big2)
+    cards = await main._cards(42)
+    assert [(x["order"], x["title"], x["urgency"]) for x in cards] == [
+        (1, "Просрочено", "fire"), (2, "Через три дня", "soon"), (3, "Без срока", "later"), (4, "Большая", "later")], cards
+    assert cards[0]["when_label"] == "вчера 15:00" and cards[3]["steps"] == [("Шаг 1", False)], "подзадачи — внутри карточки"
+    assert kid2 not in [x["title"] for x in cards]
+    await app.process_update(h.callback("pf:cards"))
+    doc = last("sendDocument")
+    payload = doc["document"]
+    content = bytes(payload.input_file_content if hasattr(payload, "input_file_content") else payload)
+    assert content[:4] == b"%PDF" and doc["caption"].startswith("✂️ 4 карточки на 1 листе"), doc["caption"]
 
     # 6. notion.rewrite: новое название, новая суть на месте старой, старая — в «🕘 Было до правки»
     calls = []

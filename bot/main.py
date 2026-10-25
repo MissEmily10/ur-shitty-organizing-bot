@@ -267,11 +267,13 @@ async def _section(uid: int, name: str) -> tuple[str, list[list[tuple[str, str]]
             "🧹 <b>Навести порядок</b> — разложить по сферам и проектам\n"
             "🧽 <b>Перебрать все</b> — по одной, от старых к новым: закрыть, удалить или оставить\n"
             "🖨 <b>Печать</b> — все заметки в PDF A4, вычеркнуть ручкой\n"
+            "✂️ <b>Карточки</b> — задача на карточке, разрезать ножницами, по порядку важности\n"
             "✏️ <b>Зачёркнутое</b> — фото распечатки → удалить вычеркнутое\n"
             "📌 <b>Куда писать</b> — новые заметки сразу в проект",
             [[("📒 Список", "nb:a"), ("🗂 Разобрать", "m:razbor")],
              [("🧽 Перебрать все", "sw:st"), ("🔥 Горящие дедлайны", "hd:show")],
-             [("🖨 Печать", "pf:make"), ("✏️ Зачёркнутое", "cr:go")],
+             [("🖨 Печать", "pf:make"), ("✂️ Карточки", "pf:cards")],
+             [("✏️ Зачёркнутое", "cr:go")],
              [("🔗 Похожие цели", "og:find"), ("🧹 Навести порядок", "td:plan")],
              [("📌 Куда писать", "st:ap")]],
         )  # fmt: skip
@@ -2720,6 +2722,80 @@ async def _send_print(message: Message, uid: int) -> None:
     )  # fmt: skip
 
 
+# ✂️ Карточки для вырезания: одна открытая заметка — одна карточка, по порядку важности. Большая заметка — одной
+# карточкой с подзадачами чек-листом (отдельных карточек у подзадач нет). Без распознавания по фото.
+
+WEEKDAY_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def _short_when(iso: str, today) -> tuple[str, str]:
+    """Срок для карточки: («пн 26.10 08:00», насколько горит: fire — просрочено или сегодня, soon — неделя, later)."""
+    at = datetime.fromisoformat(iso) if "T" in iso else None
+    day = at.date() if at else date.fromisoformat(iso[:10])
+    label = {0: "сегодня", 1: "завтра", -1: "вчера"}.get((day - today).days, f"{WEEKDAY_SHORT[day.weekday()]} {day:%d.%m}")
+    if at:
+        label += f" {at:%H:%M}"
+    urgency = "fire" if day <= today else "soon" if (day - today).days <= 7 else "later"
+    return label, urgency
+
+
+async def _cards(uid: int) -> list[dict]:
+    items = await notion.open_notes(uid)
+    open_ids = {i["id"] for i in items}
+    today = scheduler.local_now(await scheduler.get_settings(uid)).date()
+    projects = {p["id"]: p for p in await notion.project_list(uid, include_closed=True)}
+    areas = {a["id"]: a["name"] for a in await notion.spheres()}
+    sem = asyncio.Semaphore(6)
+
+    async def card(i: dict) -> dict:
+        async with sem:
+            summary = await notion.preview(i["id"], 400)
+            kids = await notion.children(i["id"])
+        project = projects.get(i.get("project_id") or "")
+        sphere = areas.get((project or {}).get("sphere_id") or "")
+        when, urgency = _short_when(i["when"], today) if i.get("when") else ("", "later")
+        return {
+            "title": i["title"], "type": i.get("type") or i.get("ai_type") or "", "summary": summary,
+            "where": " › ".join(x for x in (sphere, project["name"] if project else "") if x),
+            "when_label": when, "urgency": urgency, "when": i.get("when") or "", "created": ".".join(reversed(i["created"].split("-")[1:])),
+            "steps": [(k["title"], k["done"]) for k in kids],
+        }  # fmt: skip
+
+    # подзадачи открытой большой заметки — внутри её карточки
+    cards = await asyncio.gather(*(card(i) for i in items if i.get("parent_id") not in open_ids))
+    rank = {"fire": 0, "soon": 1, "later": 2}
+    cards = sorted(cards, key=lambda x: (rank[x["urgency"]], x["when"] or "9999"))  # без срока — от старых к новым (sorted устойчива)
+    for n, x in enumerate(cards, 1):
+        x["order"] = n
+    return cards
+
+
+async def _send_cards(message: Message, uid: int) -> None:
+    status = await message.reply_text("✂️ Собираю карточки…")
+    try:
+        cards = await _cards(uid)
+        if not cards:
+            await status.edit_text(await styles.wrap(uid, "empty", "Открытых заметок нет — вырезать нечего 🎉", replace=True))
+            return
+        today = scheduler.local_now(await scheduler.get_settings(uid)).date()
+        data = pdf.cards_pdf(cards, f"Карточки задач · {today:%d.%m.%Y}")
+    except Exception as e:
+        log.exception("cards failed")
+        await status.edit_text(f"❌ Не получилось собрать карточки: {e}"[:4000])
+        return
+    await status.delete()
+    sheets = -(-len(cards) // (pdf.CARD_COLS * pdf.CARD_ROWS))
+    await message.reply_document(
+        io.BytesIO(data), filename=f"карточки-{today:%d.%m}.pdf",
+        caption=f"✂️ {len(cards)} {_plural(len(cards), 'карточка', 'карточки', 'карточек')} на {sheets} "
+        f"{_plural(sheets, 'листе', 'листах', 'листах')} A4 — режь по пунктиру. Номер на карточке — порядок важности: сначала то, что горит.",
+    )  # fmt: skip
+
+
+async def cards_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_cards(update.message, update.effective_user.id)
+
+
 async def print_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_print(update.message, update.effective_user.id)
 
@@ -2966,7 +3042,7 @@ async def on_print_button(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if head == "pf":
             await q.answer("Собираю PDF…")
-            await _send_print(q.message, uid)
+            await (_send_cards if action == "cards" else _send_print)(q.message, uid)
             return
         if action == "go":
             await q.answer()
@@ -5001,6 +5077,7 @@ COMMANDS = [
     ("notes", "Все заметки"),
     ("sweep", "Перебрать все: закрыть или удалить"),
     ("printnotes", "Все заметки в PDF для печати"),
+    ("cards", "Карточки задач для вырезания"),
     ("crossed", "Зачёркнутое на распечатке → удалить"),
     ("feed", "Лента по сферам"),
     ("start", "Знакомство с ботом"),
@@ -5237,6 +5314,7 @@ def build_app(webhook: bool) -> Application:
     app.add_handler(CommandHandler("notes", notes_cmd, filters=member))
     app.add_handler(CommandHandler("sweep", sweep_cmd, filters=member))
     app.add_handler(CommandHandler("printnotes", print_cmd, filters=member))
+    app.add_handler(CommandHandler("cards", cards_cmd, filters=member))
     app.add_handler(CommandHandler("crossed", crossed_cmd, filters=member))
     app.add_handler(CommandHandler("timetable", timetable_cmd, filters=owner))
     app.add_handler(CallbackQueryHandler(on_timetable_button, pattern=r"^(tt|td2):"))

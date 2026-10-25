@@ -601,3 +601,134 @@ def _note_row(c: Canvas, card: dict, x0: float, width: float, y: float) -> dict:
     band = [x0 + 4, y - card["h"] + card["rules"] * RULE_GAP + 3, x0 + width - 4, y - 3]
     return {"band": [round(v, 1) for v in band], "ink": [[round(v, 1) for v in b] for b in ink],
             "check": [round(x + 2.4, 1), round(y - 14.6, 1), round(x + 6.6, 1), round(y - 10.4, 1)]}  # fmt: skip
+
+
+# ---------- ✂️ карточки для вырезания: одна задача — одна карточка ----------
+
+CARD_COLS, CARD_ROWS = 2, 4  # 8 карточек на A4, каждая ~98 × 70 мм
+CARD_PAD = 12
+URGENCY_LABELS = {"fire": "горит", "soon": "скоро", "later": "потом"}
+
+
+def cards_pdf(cards: list[dict], title: str) -> bytes:
+    """A4 книжная, сетка карточек без зазоров: режется по пунктиру ножницами в два счёта.
+    Карточка — {"order", "num", "title", "type", "where", "when_label", "urgency": fire|soon|later, "summary",
+    "steps": [(название, готово ли)], "created"}; порядок карточек — по важности (как пришли)."""
+    buf = io.BytesIO()
+    c = Canvas(buf, pagesize=(PORTRAIT_W, PORTRAIT_H))
+    top_margin, margin = 30, 18
+    card_w = (PORTRAIT_W - 2 * margin) / CARD_COLS
+    card_h = (PORTRAIT_H - top_margin - margin) / CARD_ROWS
+    per_page = CARD_COLS * CARD_ROWS
+    pages = max(1, -(-len(cards) // per_page))
+    for page in range(pages):
+        c.setFont("Body", 8)
+        c.setFillColor(COLORS["muted"])
+        c.drawString(margin, PORTRAIT_H - 19, _clean(title) + " · режь по пунктиру")
+        c.drawRightString(PORTRAIT_W - margin, PORTRAIT_H - 19, f"лист {page + 1} из {pages}")
+        chunk = cards[page * per_page : (page + 1) * per_page]
+        for i, card in enumerate(chunk):
+            col, row = i % CARD_COLS, i // CARD_COLS
+            x = margin + col * card_w
+            y = PORTRAIT_H - top_margin - (row + 1) * card_h
+            _cut_card(c, card, x, y, card_w, card_h)
+        # линии реза: сквозные пунктиры через весь лист, чтобы резать одним движением
+        c.setStrokeColor(COLORS["muted"])
+        c.setLineWidth(0.5)
+        c.setDash(4, 3)
+        rows = -(-len(chunk) // CARD_COLS)  # на последнем листе — только под заполненными рядами
+        low = PORTRAIT_H - top_margin - rows * card_h
+        for k in range(CARD_COLS + 1):
+            gx = margin + k * card_w
+            c.line(gx, low - (6 if rows < CARD_ROWS else low), gx, PORTRAIT_H - top_margin + 6)
+        for k in range(rows + 1):
+            gy = PORTRAIT_H - top_margin - k * card_h
+            c.line(0, gy, PORTRAIT_W, gy)
+        c.setDash()
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _cut_card(c: Canvas, card: dict, x: float, y: float, w: float, h: float) -> None:
+    kind = _note_kind(card)
+    fill, border = _box_colors(kind) if kind else (COLORS["header"], COLORS["muted"])
+    inner_w = w - 2 * CARD_PAD
+    top = y + h
+    # цветная шапка: тип слева, номер по важности справа
+    c.setFillColor(fill)
+    c.rect(x, top - 30, w, 30, stroke=0, fill=1)
+    c.setFillColor(border)
+    c.rect(x, top - 30, 4, 30, stroke=0, fill=1)
+    c.setFillColor(COLORS["text"])
+    c.setFont("Bold", 8.5)
+    c.drawString(x + CARD_PAD, top - 19, _clean(card.get("type") or "Заметка", "Bold").upper())
+    order = str(card.get("order", ""))
+    label = URGENCY_LABELS.get(card.get("urgency") or "", "")
+    big = DAY_FONT or "Bold"
+    c.setFont(big, 17)
+    c.drawRightString(x + w - CARD_PAD, top - 22, order)
+    if label:
+        c.setFont("Bold", 8)
+        c.setFillColor(COLORS["mood_1"] if card.get("urgency") == "fire" else COLORS["muted"])
+        c.drawRightString(x + w - CARD_PAD - c.stringWidth(order, big, 17) - 8, top - 19, label.upper())
+    # название крупно
+    line = top - 30 - 18
+    name = _clean(card["title"])
+    font = _can(DISPLAY_FONT, name, "Bold")
+    c.setFillColor(COLORS["text"])
+    c.setFont(font, 13.5)
+    for t in _wrap(c, name, font, 13.5, inner_w, 2):
+        c.drawString(x + CARD_PAD, line, t)
+        line -= 15.5
+    # где и когда
+    c.setFont("Body", 8.5)
+    c.setFillColor(COLORS["muted"])
+    where = _clean(card.get("where") or "")
+    if where:
+        c.drawString(x + CARD_PAD, line + 2, _fit(c, where, "Body", 8.5, inner_w))
+        line -= 11
+    if card.get("when_label"):
+        pill = f"до {card['when_label']}"
+        pw = c.stringWidth(pill, "Bold", 8.5) + 12
+        c.setFillColor(COLORS["mood_1"] if card.get("urgency") == "fire" else COLORS["text"])
+        c.roundRect(x + CARD_PAD, line - 3, pw, 13, 6.5, stroke=0, fill=1)
+        c.setFillColor(COLORS["background"])
+        c.setFont("Bold", 8.5)
+        c.drawString(x + CARD_PAD + 6, line + 0.5, pill)
+        line -= 17
+    line -= 2
+    # суть и шаги — сколько поместится до подвала
+    footer = y + 22
+    steps = card.get("steps") or []
+    step_lines = min(len(steps), 4)
+    room = int((line - footer - step_lines * 12.5 - (4 if steps else 0)) // 11.5)
+    c.setFillColor(COLORS["text"])
+    c.setFont("Body", 9.5)
+    for t in _wrap(c, _clean(card.get("summary") or ""), "Body", 9.5, inner_w, max(room, 0)):
+        c.drawString(x + CARD_PAD, line, t)
+        line -= 11.5
+    if steps:
+        line -= 4
+        for k, (step, done) in enumerate(steps[:step_lines]):
+            if k == step_lines - 1 and len(steps) > step_lines:
+                step, done = f"и ещё {len(steps) - step_lines + 1}…", False
+            c.setStrokeColor(COLORS["text"])
+            c.setLineWidth(0.7)
+            c.rect(x + CARD_PAD, line - 1, 7, 7, stroke=1, fill=0)
+            if done:
+                c.line(x + CARD_PAD + 1, line + 2.5, x + CARD_PAD + 3, line)
+                c.line(x + CARD_PAD + 3, line, x + CARD_PAD + 6.5, line + 6)
+            c.setFillColor(COLORS["muted"] if done else COLORS["text"])
+            c.setFont("Body", 9)
+            c.drawString(x + CARD_PAD + 12, line, _fit(c, _clean(step), "Body", 9, inner_w - 12))
+            line -= 12.5
+    # подвал: квадратик «готово», номер заметки (по нему бот поймёт фото) и дата
+    c.setStrokeColor(COLORS["text"])
+    c.setLineWidth(0.8)
+    c.rect(x + CARD_PAD, y + 10, 9, 9, stroke=1, fill=0)
+    c.setFillColor(COLORS["text"])
+    c.setFont("Body", 8)
+    c.drawString(x + CARD_PAD + 13, y + 12, "готово")
+    c.setFillColor(COLORS["muted"])
+    c.drawRightString(x + w - CARD_PAD, y + 12, " · ".join(b for b in (f"#{card['num']}" if card.get("num") else "", f"от {card.get('created', '')}") if b))
