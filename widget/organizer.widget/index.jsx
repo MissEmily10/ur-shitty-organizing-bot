@@ -110,7 +110,7 @@ const URGENCY = { fire: ["горит", "#E5534B"], soon: ["скоро", "#1F1F24
 export const className = css`
   top: 24px;
   right: 24px;
-  width: 360px;
+  width: 760px;
   font-family: "PT Sans", -apple-system, sans-serif;
   color: #1f1f24;
   -webkit-font-smoothing: antialiased;
@@ -121,7 +121,17 @@ const card = css`
   border-radius: 18px;
   box-shadow: 0 8px 30px rgba(31, 31, 36, 0.14);
   padding: 16px 16px 12px;
-  margin-bottom: 12px;
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  & > section {
+    flex: 1;
+    min-width: 0;
+  }
+  & > section + section {
+    border-left: 1px solid #f2f2f6;
+    padding-left: 18px;
+  }
 `;
 const head = css`
   display: flex;
@@ -279,7 +289,7 @@ const Day = ({ data, dispatch }) => {
 };
 
 const Plans = ({ plans, all, dispatch }) => {
-  const shown = all ? plans : plans.slice(0, 8);
+  const shown = all ? plans : plans.slice(0, 12);
   return (
     <div>
       {shown.map((p) => {
@@ -302,41 +312,44 @@ const Plans = ({ plans, all, dispatch }) => {
           </div>
         );
       })}
-      {plans.length > 8 && (
+      {plans.length > 12 && (
         <div className={note} style={{ cursor: "pointer" }} onClick={() => dispatch({ type: "TOGGLE_PLANS" })}>
-          {all ? "свернуть" : `ещё ${plans.length - 8}…`}
+          {all ? "свернуть" : `ещё ${plans.length - 12}…`}
         </div>
       )}
     </div>
   );
 };
 
+// один большой виджет: слева — день, справа — планы
 export const render = ({ data, error, busy, allPlans }, dispatch) => (
   <div>
     <style>{"@import url('https://fonts.googleapis.com/css2?family=Paytone+One&family=PT+Sans:wght@400;700&display=swap');"}</style>
     <div className={card}>
-      <div className={head}>
-        <button className={btn} onClick={() => data && shift(dispatch, data, -1)}>‹</button>
-        <h1>{data ? data.title : "Мой день"}</h1>
-        {data && data.relative && <small>{data.relative}</small>}
-        <button className={btn} onClick={() => data && shift(dispatch, data, 1)}>›</button>
-        <button className={btn} title="Добавить в расписание" onClick={() => addEvent(dispatch)}>＋</button>
-      </div>
-      {data ? <Day data={data} dispatch={dispatch} /> : <div className={note}>Загружаю…</div>}
-      {data && !data.today && (
-        <div className={note} style={{ cursor: "pointer" }} onClick={() => { shownDate = ""; load(dispatch); }}>
-          ↩︎ к сегодня
+      <section>
+        <div className={head}>
+          <button className={btn} onClick={() => data && shift(dispatch, data, -1)}>‹</button>
+          <h1>{data ? data.title : "Мой день"}</h1>
+          {data && data.relative && <small>{data.relative}</small>}
+          <button className={btn} onClick={() => data && shift(dispatch, data, 1)}>›</button>
+          <button className={btn} title="Добавить в расписание" onClick={() => addEvent(dispatch)}>＋</button>
         </div>
-      )}
-    </div>
-    <div className={card}>
-      <div className={head}>
-        <h1>Plans</h1>
-        {data && <small>{data.plans.length}</small>}
-        <button className={btn} title="Новая заметка" onClick={() => addNote(dispatch)}>＋</button>
-      </div>
-      {data ? <Plans plans={data.plans} all={allPlans} dispatch={dispatch} /> : null}
-      {(busy || error) && <div className={note}>{busy || error}</div>}
+        {data ? <Day data={data} dispatch={dispatch} /> : <div className={note}>Загружаю…</div>}
+        {data && !data.today && (
+          <div className={note} style={{ cursor: "pointer" }} onClick={() => { shownDate = ""; load(dispatch); }}>
+            ↩︎ к сегодня
+          </div>
+        )}
+      </section>
+      <section>
+        <div className={head}>
+          <h1>Plans</h1>
+          {data && <small>{data.plans.length}</small>}
+          <button className={btn} title="Новая заметка" onClick={() => addNote(dispatch)}>＋</button>
+        </div>
+        {data ? <Plans plans={data.plans} all={allPlans} dispatch={dispatch} /> : null}
+        {(busy || error) && <div className={note}>{busy || error}</div>}
+      </section>
     </div>
   </div>
 );
