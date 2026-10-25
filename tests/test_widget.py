@@ -71,6 +71,9 @@ async def run():
     archive = zipfile.ZipFile(io.BytesIO(widget.package(token)))
     jsx = archive.read("organizer.widget/index.jsx").decode()
     assert f"/w/{token}" in jsx and "__BOT_URL__" not in jsx and "organizer.widget/README.txt" in archive.namelist()
+    hotkey = archive.read("Горячая клавиша для заметки.txt").decode()
+    iphone = archive.read("iPhone — Мой день.js").decode()
+    assert f"/w/{token}/add" in hotkey and f'"{widget.url(token)}"' in iphone and "__BOT" not in iphone + hotkey
     await app.process_update(h.text("/widget"))
     doc = next(d for e, d in reversed(h.sent) if e == "sendDocument")
     assert getattr(doc["document"], "filename", "") == "organizer.widget.zip" and "Übersicht" in doc["caption"], doc
@@ -129,6 +132,28 @@ async def run():
         r = await client.post(f"/w/{token}/add", data=json.dumps({"text": "ммм", "kind": "task", "once": False}))
         assert r.status == 400 and "Не поняла" in (await r.json())["error"]
         assert (await client.post(f"/w/{token}/add", data=json.dumps({"text": "x", "kind": "hack"}))).status == 400
+
+        # 6. ⏰ на завтра (время срока сохраняется), перетащенный порядок, настроение
+        moved = []
+
+        async def set_when(pid, when):
+            moved.append((pid, when))
+        notion.set_when = set_when
+        notes[1]["when"] = "2026-10-20T15:00:00+03:00"
+        r = await client.post(f"/w/{token}/tomorrow", data=json.dumps({"id": "2" * 32}))
+        assert (await r.json())["ok"] and moved == [("2" * 32, f"{TODAY + timedelta(days=1)}T15:00:00+03:00")], moved
+        await client.post(f"/w/{token}/tomorrow", data=json.dumps({"id": "1" * 32}))
+        assert moved[-1] == ("1" * 32, (TODAY + timedelta(days=1)).isoformat())
+        r = await client.post(f"/w/{token}/order", data=json.dumps({"ids": ["1" * 32, "3" * 32]}))
+        assert (await r.json())["ok"]
+        data = await (await client.get(f"/w/{token}/day?d={TODAY.isoformat()}")).json()
+        assert [p["title"] for p in data["plans"]] == ["Без срока", "Большая"], "порядок, перетащенный руками"
+        assert [x["id"] for x in widget._manual_order([{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "d"}], ["d", "b"])] == ["a", "d", "c", "b"]
+        r = await client.post(f"/w/{token}/mood", data=json.dumps({"score": 4}))
+        assert (await r.json())["ok"] and (await notion.moods(42))[TODAY.isoformat()][0] == 4
+        data = await (await client.get(f"/w/{token}/day?d={TODAY.isoformat()}")).json()
+        assert data["mood"]["score"] == 4
+        assert (await client.post(f"/w/{token}/mood", data=json.dumps({"score": 9}))).status == 400
 
         # 6. новый адрес — старый перестаёт работать
         new = await widget.secret(new=True)

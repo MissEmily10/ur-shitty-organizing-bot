@@ -103,6 +103,8 @@ export const updateState = (event, state) => {
       return { ...state, tint: event.tint };
     case "BUSY":
       return { ...state, busy: event.text };
+    case "PLANS":
+      return { ...state, data: { ...state.data, plans: event.plans } };
     case "TOGGLE_PLANS":
       return { ...state, allPlans: !state.allPlans };
     default:
@@ -152,6 +154,33 @@ const addNote = async (dispatch) => {
     if (res.error) return dispatch({ type: "ERROR", error: res.error });
     load(dispatch);
   } catch (e) {}
+};
+
+// «⏰ завтра», перетаскивание планов и настроение
+const later = async (dispatch, id) => {
+  dispatch({ type: "BUSY", text: "Переношу на завтра…" });
+  const res = await send("tomorrow", { id }).catch(() => ({ error: "Нет связи с ботом" }));
+  if (res.error) return dispatch({ type: "ERROR", error: res.error });
+  load(dispatch);
+};
+
+let dragId = "";
+
+const drop = (dispatch, plans, targetId) => {
+  if (!dragId || dragId === targetId) return;
+  const moving = plans.find((p) => p.id === dragId);
+  const rest = plans.filter((p) => p.id !== dragId);
+  rest.splice(rest.findIndex((p) => p.id === targetId), 0, moving);
+  dragId = "";
+  dispatch({ type: "PLANS", plans: rest }); // сразу на экране, потом — боту
+  send("order", { ids: rest.map((p) => p.id) }).catch(() => dispatch({ type: "ERROR", error: "Порядок не сохранился — нет связи" }));
+};
+
+const rate = async (dispatch, score) => {
+  dispatch({ type: "BUSY", text: "Записываю настроение…" });
+  const res = await send("mood", { score }).catch(() => ({ error: "Нет связи с ботом" }));
+  if (res.error) return dispatch({ type: "ERROR", error: res.error });
+  load(dispatch);
 };
 
 const close = async (dispatch, id) => {
@@ -288,6 +317,31 @@ const gap = css`
   border-left: 2px dashed var(--line);
   padding-left: 8px;
 `;
+const mood = css`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--muted);
+  button {
+    border: 1px solid var(--line);
+    background: var(--pill);
+    color: var(--text);
+    border-radius: 12px;
+    min-width: 30px;
+    padding: 2px 8px;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  button.on {
+    border: 2px solid var(--accent);
+    transform: scale(1.12);
+  }
+`;
+const MOODS = ["😣", "😕", "😐", "🙂", "😄"];
+
 const plan = css`
   display: flex;
   gap: 8px;
@@ -318,6 +372,34 @@ const plan = css`
     gap: 6px;
     font-size: 12px;
     margin-top: 3px;
+  }
+  .grip {
+    cursor: grab;
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 1px;
+    user-select: none;
+  }
+  position: relative;
+  .later {
+    position: absolute;
+    right: 0;
+    top: 5px;
+    font-size: 10px;
+    font-weight: 700;
+    border: 1px solid var(--line);
+    background: var(--pill);
+    border-radius: 10px;
+    padding: 1px 8px;
+    cursor: pointer;
+    opacity: 0;
+    white-space: nowrap;
+  }
+  &:hover .later {
+    opacity: 1;
+  }
+  &.over {
+    box-shadow: 0 -2px 0 var(--accent);
   }
   .step .check {
     width: 11px;
@@ -369,11 +451,17 @@ const Plans = ({ plans, all, dispatch }) => {
       {shown.map((p) => {
         const [label, color] = URGENCY[p.urgency];
         return (
-          <div className={plan} key={p.id}>
+          <div className={plan} key={p.id} draggable
+               onDragStart={() => { dragId = p.id; }}
+               onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add("over"); }}
+               onDragLeave={(e) => e.currentTarget.classList.remove("over")}
+               onDrop={(e) => { e.currentTarget.classList.remove("over"); drop(dispatch, plans, p.id); }}>
+            <div className="grip" title="Перетащи, чтобы поменять важность">⋮⋮</div>
             <div className="check" title="Закрыть" onClick={() => close(dispatch, p.id)} />
             <div style={{ flex: 1 }}>
               <div className="t">
                 {p.title} <span style={{ color, fontSize: 10, fontWeight: 700, textTransform: "uppercase" }}>{label}</span>
+                <span className="later" title="Срок — завтра" onClick={() => later(dispatch, p.id)}>⏰ завтра</span>
               </div>
               <div className="w">{[p.when && `до ${p.when}`, p.where].filter(Boolean).join(" · ")}</div>
               {p.steps.map((s) => (
@@ -411,6 +499,16 @@ export const render = ({ data, error, busy, allPlans, tint }, dispatch) => {
           <button className={btn} onClick={() => data && shift(dispatch, data, 1)}>›</button>
           <button className={btn} title="Добавить в расписание" onClick={() => addEvent(dispatch)}>＋</button>
         </div>
+        {data && data.mood && data.mood.ask && (
+          <div className={mood}>
+            <span>{data.mood.score ? "Настроение сегодня:" : "Как прошёл день?"}</span>
+            {MOODS.map((face, k) => (
+              <button key={k} className={data.mood.score === k + 1 ? "on" : ""} title={`${k + 1}`} onClick={() => rate(dispatch, k + 1)}>
+                {face}
+              </button>
+            ))}
+          </div>
+        )}
         {data ? <Day data={data} dispatch={dispatch} colors={colors} /> : <div className={note}>Загружаю…</div>}
         {data && !data.today && (
           <div className={note} style={{ cursor: "pointer" }} onClick={() => { shownDate = ""; load(dispatch); }}>

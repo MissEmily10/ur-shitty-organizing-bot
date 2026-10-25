@@ -2789,12 +2789,13 @@ async def widget_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     new = bool(ctx.args) and ctx.args[0].lower() in ("new", "новый")
     token = await widget.secret(new=new)
     await update.message.reply_document(
-        io.BytesIO(widget.package(token)), filename="organizer.widget.zip",
+        io.BytesIO(widget.package(token, ctx.bot.username or "")), filename="organizer.widget.zip",
         caption=("🔄 Новый адрес: старый виджет перестал работать, поставь этот. " if new else "")
         + "🖥 Виджет «Мой день» для рабочего стола Mac: расписание на день и планы, «＋» и «☐».\n\n"
         "1. Поставь Übersicht (бесплатно): tracesof.net/uebersicht\n"
         "2. Распакуй архив, значок Übersicht в строке меню → «Open Widgets Folder» → перетащи туда папку organizer.widget.\n\n"
-        "Подробности — в README.txt внутри. Адрес бота в файле секретный: не пересылай архив.",
+        "Ещё в архиве: «Горячая клавиша для заметки.txt» и виджет для iPhone (Scriptable). "
+        "Подробности — в README.txt внутри. Адрес бота в файлах секретный: не пересылай архив.",
     )  # fmt: skip
 
 
