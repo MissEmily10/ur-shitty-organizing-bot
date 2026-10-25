@@ -322,7 +322,7 @@ def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str
             y_top, y_bottom = y_of(start) - 1, y_of(end) + 1
             h = y_top - y_bottom
             # цвета из Figma: уроки — сиреневые, репетиторы (у них ссылка на вход) — розовые, вне школы — салатовые
-            kind = "tt_tutor" if item.get("link") else ("tt_lesson" if item.get("lesson") else "tt_other")
+            kind = "tt_tutor" if item.get("tutor") or item.get("link") else ("tt_lesson" if item.get("lesson") else "tt_other")
             fill, border = _box_colors(kind)
             c.setFillColor(fill)
             c.setStrokeColor(border)

@@ -141,31 +141,37 @@ async def run():
     assert len(bells) == 1 and not [t for t in h.texts(chat=77) if t.startswith("🔔")]
     # 8. разовая загрузка расписания владелицы из data/owner_timetable.txt
     real = timetable.parse(timetable.SEED_FILE.read_text(encoding="utf-8"))
-    assert len(real) == 24 and timetable.alternatives({"items": real}) == []
+    assert len(real) == 26 and timetable.alternatives({"items": real}) == []
     h.service.pop("timetable:42", None)
     h.service.pop("seed:timetable:1", None)
     slots.clear()
     result = await timetable.seed_owner(42)
-    assert result.startswith("загружено: 24") and (await timetable.load(42))["anchor"] == timetable.SEED_ANCHOR
+    assert result.startswith("загружено: 26") and (await timetable.load(42))["anchor"] == timetable.SEED_ANCHOR
     assert await timetable.seed_owner(42) == "не нужно", "только один раз"
     seeded = await timetable.load(42)
     thu = [i["title"] for i in timetable.for_day(seeded, date(2026, 10, 22))]
-    assert thu == ["Физическая культура (в записи)", "Информатика", "Литература", "Химия", "Консультация по алгебре", "Танцы тодес олимпийский"], thu
-    # 9. репетиторы пн/ср: по часу, ссылка за 5 минут до начала, «сделала домашку?» после
+    assert thu == ["Физическая культура (в записи)", "Информатика", "Литература", "Химия", "Математика", "Консультация по алгебре", "Танцы тодес олимпийский"], thu
+    # 9. репетиторы: по часу, ссылка за 5 минут до начала (если есть), «сделала домашку?» после
     h.service.pop("seed:timetable:3", None)
     assert (await timetable.upgrade_owner(42)).startswith("репетиторы")
     assert await timetable.upgrade_owner(42) == "не нужно"
     data = await timetable.load(42)
-    tutors = [i for i in data["items"] if i["days"] == ["Пн", "Ср"]]
-    assert [i["title"] for i in tutors] == ["Китайский", "Математика", "Обществознание"]
-    assert [(i["start"], i["end"], i["homework"]) for i in tutors] == [("14:00", "15:00", True), ("16:00", "17:00", True), ("18:00", "19:00", True)]
-    assert not any(i.get("link") for i in data["items"] if i["days"] != ["Пн", "Ср"]), "ссылки только у репетиторов"
+    tutors = [i for i in data["items"] if timetable.is_tutor(i)]
+    assert [(i["days"], i["start"], i["end"], i["title"], i["homework"]) for i in tutors] == [
+        (["Пн"], "10:00", "11:00", "Китайский", True), (["Вт"], "15:00", "16:00", "Математика", True),
+        (["Вт"], "17:30", "18:30", "Гетало", True), (["Ср"], "12:00", "13:00", "Китайский", True),
+        (["Чт"], "15:00", "16:00", "Математика", True)]  # fmt: skip
+    assert [i["title"] for i in data["items"] if i.get("link")] == ["Китайский", "Математика", "Китайский", "Математика"], "у Гетало ссылки нет"
+    assert not any(timetable.is_tutor(i) for i in data["items"] if i["room"]), "школьные уроки — не репетиторы"
     mon = lambda hh, mm: datetime(2026, 10, 19, hh, mm, tzinfo=timezone.utc)  # noqa: E731
-    (key, text), = timetable.due_joins(data, mon(13, 55))
-    assert "Китайский (14:00–15:00)" in text and "telemost.yandex.ru" in text and key == "join:2026-10-19:14:00"
-    assert timetable.due_joins(data, mon(13, 50)) == [] and timetable.due_joins(data, mon(14, 0)) == []
-    assert [i["title"] for _, i in timetable.due_homework(data, mon(15, 0))] == ["Китайский"]
-    assert timetable.due_homework(data, mon(14, 55)) == []
+    (key, text), = timetable.due_joins(data, mon(9, 55))
+    assert "Китайский (10:00–11:00)" in text and "telemost.yandex.ru" in text and key == "join:2026-10-19:10:00"
+    assert timetable.due_joins(data, mon(9, 50)) == [] and timetable.due_joins(data, mon(10, 0)) == []
+    assert [i["title"] for _, i in timetable.due_homework(data, mon(11, 0))] == ["Китайский"]
+    assert timetable.due_homework(data, mon(10, 55)) == []
+    tue = lambda hh, mm: datetime(2026, 10, 20, hh, mm, tzinfo=timezone.utc)  # noqa: E731
+    assert timetable.due_joins(data, tue(17, 25)) == [], "у Гетало нет ссылки — и напоминания со ссылкой нет"
+    assert [i["title"] for _, i in timetable.due_homework(data, tue(18, 30))] == ["Гетало"]
     notes = []
 
     async def create_idea(title, source, tags, blocks, details, author_id=0, author="", when=None, ai_type=None):
@@ -175,30 +181,31 @@ async def run():
     async def set_type(pid, name):
         pass
     notion.create_idea, notion.set_type = create_idea, set_type
-    await app.process_update(h.callback("hw:y:1400"))
+    await app.process_update(h.callback("hw:y:1000"))
     assert "Домашка по «Китайский» сделана" in h.texts("editMessageText")[-1]
-    await app.process_update(h.callback("hw:n:1800"))
-    await app.process_update(h.callback("hw:l:1800:2h"))
-    assert notes and notes[-1][0] == "Домашка: Обществознание" and notes[-1][2] == "⏰ Напоминание"
-    await app.process_update(h.callback("hw:y:1400", user=h.person(77, "Аня")))
+    await app.process_update(h.callback("hw:n:1730"))
+    await app.process_update(h.callback("hw:l:1730:2h"))
+    assert notes and notes[-1][0] == "Домашка: Гетало" and notes[-1][2] == "⏰ Напоминание"
+    await app.process_update(h.callback("hw:y:1000", user=h.person(77, "Аня")))
     assert len(notes) == 1
     # через планировщик: ссылка и вопрос приходят по одному разу
     timetable._cache.clear()
-    for t in (datetime(2026, 10, 19, 10, 55, tzinfo=timezone.utc), datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)):  # 13:55 и 15:00 МСК
+    for t in (datetime(2026, 10, 19, 6, 55, tzinfo=timezone.utc), datetime(2026, 10, 19, 8, 0, tzinfo=timezone.utc)):  # 9:55 и 11:00 МСК
         await scheduler.tick(app.bot, [42], now=t)
         await scheduler.tick(app.bot, [42], now=t)
     assert len([t for t in h.texts(chat=42) if t.startswith("🔗 Через 5 мин: Китайский")]) == 1
     assert len([t for t in h.texts(chat=42) if "Сделала домашку?" in t]) == 1
-    # 10. новая версия расписания заменяет загруженную: школьные уроки новые, репетиторы и звонки — как были
+    # 10. новая версия расписания заменяет загруженную: уроки и репетиторы из файла, звонки — как были
     old = await timetable.load(42)
     old["bells"] = False
     await timetable.save(42, old)
     h.service.pop("seed:timetable:version", None)
-    assert (await timetable.reload_owner(42)).startswith("загружено: 24")
+    assert (await timetable.reload_owner(42)).startswith("загружено: 26")
     assert await timetable.reload_owner(42) == "не нужно"
     new = await timetable.load(42)
     assert new["bells"] is False
-    assert [i["title"] for i in new["items"] if i.get("link")] == ["Китайский", "Математика", "Обществознание"]
+    assert [i["title"] for i in new["items"] if timetable.is_tutor(i)] == ["Китайский", "Математика", "Гетало", "Китайский", "Математика"]
+    assert not any(i["title"] == "Обществознание" and timetable.is_tutor(i) for i in new["items"]), "старых репетиторов нет"
     assert not any(i["room"] not in ("", "онлайн") for i in new["items"]), "старых кабинетов не осталось"
     assert any(s["title"] == "🎒 Химия · онлайн" for s in slots) and not any("каб." in s["title"] for s in slots)
     new["bells"] = True
@@ -211,7 +218,7 @@ async def run():
     tue = timetable.for_day(new, date(2026, 10, 20))
     assert ("11:00", "12:00", "Встреча с наставником") in [(i["start"], i["end"], i["title"]) for i in tue]
     (_, text), = timetable.due_bells(new, datetime(2026, 10, 20, 13, 40, tzinfo=timezone.utc))
-    assert "Консультация по физике" in text and "перерыв 2 ч 15 мин" in text, text
+    assert "Математика" in text and "перерыв 1 ч 15 мин" in text, text
     print("timetable OK")
 
 

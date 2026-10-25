@@ -392,7 +392,7 @@ def week_pdf(data: dict, day: date) -> bytes:
     end = start + timedelta(days=6)
     return pdf.timetable_pdf(
         days, f"Моё расписание · {start:%d.%m}–{end:%d.%m}",
-        (f"неделя {'А' if week == 0 else 'Б'} · " if alternatives(data) else "") + ("сиреневые — уроки, розовые — репетиторы, салатовые — вне школы" if any(i.get("link") for i in data["items"])
+        (f"неделя {'А' if week == 0 else 'Б'} · " if alternatives(data) else "") + ("сиреневые — уроки, розовые — репетиторы, салатовые — вне школы" if any(is_tutor(i) for i in data["items"])
          else "сиреневые — уроки, салатовые — вне школы"), other,
     )  # fmt: skip
 
@@ -418,26 +418,32 @@ async def seed_owner(uid: int) -> str:
     return f"загружено: {len(items)} занятий, строк в основном расписании: {slots}"
 
 
-# Пн и ср — занятия с репетиторами по часу: ссылка на вход за 5 минут и «сделала домашку?» после
-TUTOR_LINKS = {
-    "14:00": "https://telemost.yandex.ru/j/61862118303727",  # китайский
-    "16:00": "https://chattern.ru/duo?rid=D-KzCkJaQW",  # математика
-    "18:00": "https://m1qa3quv.ktalk.ru/opvjrcj0okbg",  # обществознание
+# Занятия с репетиторами (строки «день - ЧЧ:ММ-ЧЧ:ММ предмет» в начале data/owner_timetable.txt): по часу,
+# ссылка на вход за 5 минут (если есть) и «сделала домашку?» после. Ключ — предмет строчными.
+TUTORS = {
+    "китайский": "https://telemost.yandex.ru/j/61862118303727",
+    "математика": "https://chattern.ru/duo?rid=D-KzCkJaQW",
+    "гетало": "",  # ссылки на вход пока нет
 }
 
 
 def _tutors(data: dict) -> None:
     for item in data["items"]:
-        if item["days"] == ["Пн", "Ср"] and item["start"] == "16:00" and item["title"] == "Английский":
-            item["title"] = "Математика"  # в 16:00 — репетитор по математике (по английскому репетитора пока нет)
-        if item["days"] == ["Пн", "Ср"] and item["lesson"] and item["start"] in TUTOR_LINKS:
+        # репетиторы записаны строкой дня без кабинета; школьные уроки — с «• онлайн»
+        if item["lesson"] and not item["room"] and item["title"].lower() in TUTORS:
             if not item["end"]:
                 item["end"] = f"{_minutes(item['start']) // 60 + 1:02d}:{item['start'][3:]}"
-            item["link"] = TUTOR_LINKS[item["start"]]
+            item["tutor"] = True
+            if TUTORS[item["title"].lower()]:
+                item["link"] = TUTORS[item["title"].lower()]
             item["homework"] = True
 
 
-SEED_VERSION = 6  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
+def is_tutor(item: dict) -> bool:
+    return bool(item.get("tutor") or item.get("link"))
+
+
+SEED_VERSION = 7  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
 
 
 async def reload_owner(uid: int) -> str:

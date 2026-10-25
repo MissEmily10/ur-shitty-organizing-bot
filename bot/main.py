@@ -5053,7 +5053,7 @@ async def set_commands(app: Application) -> None:
         if seeded.startswith("загружено"):
             text, kb = await _tt_view(c.OWNER_ID)
             await app.bot.send_message(
-                c.OWNER_ID, "🎒 Внесла твоё новое расписание уроков (репетиторы — как были): звонки за 5 минут до конца урока включены.\n\n" + text,
+                c.OWNER_ID, "🎒 Обновила твоё расписание: репетиторы — китайский (пн 10–11, ср 12–13), математика (вт и чт 15–16), Гетало (вт 17:30–18:30); танцы и уроки — как были.\n\n" + text,
                 reply_markup=kb, parse_mode=ParseMode.HTML,
             )  # fmt: skip
     except Exception:
