@@ -50,7 +50,29 @@ const loadTint = (dispatch) => {
     .catch((e) => dispatch({ type: "TINT_ERROR", error: `не запустилась проверка обоев (${String(e).slice(0, 80)})` }));
 };
 
+// Место виджета хранится в файле position.json рядом: память браузера у Übersicht сбрасывается
+// (например, когда виджет переводят вперёд или назад), а файл — нет.
+const POSITION = "if [ -d organizer.widget ]; then f=organizer.widget/position.json; else f=position.json; fi;";
+let positionLoaded = false;
+
+const loadPosition = (dispatch) => {
+  if (positionLoaded) return;
+  positionLoaded = true;
+  run(`${POSITION} cat "$f" 2>/dev/null`)
+    .then((out) => {
+      const p = JSON.parse(out || "null");
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) dispatch({ type: "MOVE", offset: { x: p.x, y: p.y } });
+    })
+    .catch(() => {});
+};
+
+const savePosition = (p) => {
+  const json = JSON.stringify({ x: Math.round(p.x), y: Math.round(p.y) }); // только числа — в команду ничего чужого не попадает
+  run(`${POSITION} printf '%s' '${json}' > "$f"`).catch(() => {});
+};
+
 export const command = (dispatch) => {
+  loadPosition(dispatch);
   loadTint(dispatch);
   return load(dispatch);
 };
@@ -89,8 +111,8 @@ const theme = (tint) => {
   const dark = (0.299 * r + 0.587 * g + 0.114 * b) / 255 < 0.42;
   const mix = (c, to, k) => Math.round(c + (to - c) * k);
   const glass = dark
-    ? `rgba(${mix(r, 0, 0.45)}, ${mix(g, 0, 0.45)}, ${mix(b, 0, 0.45)}, 0.42)`
-    : `rgba(${mix(r, 255, 0.55)}, ${mix(g, 255, 0.55)}, ${mix(b, 255, 0.55)}, 0.42)`;
+    ? `rgba(${mix(r, 0, 0.5)}, ${mix(g, 0, 0.5)}, ${mix(b, 0, 0.5)}, 0.8)`
+    : `rgba(${mix(r, 255, 0.6)}, ${mix(g, 255, 0.6)}, ${mix(b, 255, 0.6)}, 0.8)`;
   return {
     "--glass": glass,
     "--text": dark ? "#F7F5F2" : "#1F1F24",
@@ -229,8 +251,7 @@ export const className = css`
 
 const card = css`
   background: var(--glass);
-  -webkit-backdrop-filter: blur(28px) saturate(160%);
-  backdrop-filter: blur(28px) saturate(160%);
+  /* без размытия фона: когда виджет позади окон, macOS не даёт размыть обои, и стекло было то мутным, то прозрачным */
   border: 1px solid var(--line);
   border-radius: 18px;
   box-shadow: 0 8px 30px rgba(31, 31, 36, 0.12);
@@ -512,6 +533,7 @@ const startMove = (event, offset, dispatch) => {
     try {
       localStorage.setItem("organizer.offset", JSON.stringify(last));
     } catch (e) {}
+    savePosition(last);
   };
   window.addEventListener("mousemove", move);
   window.addEventListener("mouseup", stop);
