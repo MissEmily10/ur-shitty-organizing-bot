@@ -72,7 +72,7 @@ def package(token: str, bot_username: str = "") -> bytes:
         for path in WIDGET_DIR.rglob("*"):
             if path.is_file():
                 z.writestr(f"organizer.widget/{path.relative_to(WIDGET_DIR)}", filled(path.read_bytes()))
-        for name in ("Горячая клавиша для заметки.txt", "Karabiner — T+G+Enter.json", "iPhone — Мой день.js"):
+        for name in ("Горячая клавиша для заметки.txt", "iPhone — Мой день.js"):
             if (EXTRAS / name).is_file():
                 z.writestr(name, filled((EXTRAS / name).read_bytes()))
     return buf.getvalue()
