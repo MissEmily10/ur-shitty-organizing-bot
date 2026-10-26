@@ -158,7 +158,7 @@ async def run():
     data = await timetable.load(42)
     tutors = [i for i in data["items"] if timetable.is_tutor(i)]
     assert [(i["days"], i["start"], i["end"], i["title"], i["homework"]) for i in tutors] == [
-        (["Пн"], "10:00", "11:00", "Китайский", True), (["Вт"], "15:00", "16:00", "Математика", True),
+        (["Пн"], "10:00", "11:00", "Китайский", True), (["Пн"], "15:00", "16:00", "Математика", True),
         (["Вт"], "17:30", "18:30", "Гетало", True), (["Ср"], "12:00", "13:00", "Китайский", True),
         (["Чт"], "15:00", "16:00", "Математика", True), (["Пт"], "14:00", "15:30", "Русский язык", True), (["Пт"], "21:00", "22:00", "Обществознание", True)]  # fmt: skip
     assert next(i for i in tutors if i["days"] == ["Пт"])["teacher"] == "Евгений"
@@ -220,7 +220,7 @@ async def run():
     tue = timetable.for_day(new, date(2026, 10, 20))
     assert ("11:00", "12:00", "Встреча с наставником") in [(i["start"], i["end"], i["title"]) for i in tue]
     (_, text), = timetable.due_bells(new, datetime(2026, 10, 20, 13, 40, tzinfo=timezone.utc))
-    assert "Математика" in text and "перерыв 1 ч 15 мин" in text, text
+    assert "Консультация по физике" in text and "перерыв 2 ч 15 мин" in text, text
     print("timetable OK")
 
 
