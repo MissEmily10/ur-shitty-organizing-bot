@@ -34,30 +34,36 @@ function text(stack, value, size, color = TEXT, bold = false) {
   return t;
 }
 
+// Без заливок: в оттенённом и прозрачном режимах экрана «Домой» iOS красит всё в один цвет — залитые плашки
+// становятся сплошными, текст на них пропадает. Тонкая цветная полоска слева и текст читаются в любом режиме.
 function lesson(w, item, current) {
   const row = w.addStack();
   row.layoutHorizontally();
   row.centerAlignContent();
   const time = row.addStack();
-  time.size = new Size(40, 0);
-  text(time, item.start || "весь", 11, TEXT, true);
+  time.size = new Size(42, 0);
+  text(time, item.start || "весь", 12, current ? TEXT : MUTED, true);
   row.addSpacer(6);
-  const [fill, border] = COLORS[item.kind] || COLORS.note;
+  const [, border] = COLORS[item.kind] || COLORS.note;
+  const bar = row.addStack();
+  bar.size = new Size(3, 26);
+  bar.cornerRadius = 1.5;
+  bar.backgroundColor = new Color(border);
+  row.addSpacer(7);
   const box = row.addStack();
   box.layoutVertically();
-  box.backgroundColor = new Color(fill);
-  box.cornerRadius = 6;
-  box.borderColor = new Color(border);
-  box.borderWidth = current ? 2 : 1;
-  box.setPadding(3, 7, 3, 7);
   const head = box.addStack();
-  text(head, item.title, 12, TEXT, true);
-  head.addSpacer();
-  if (current) text(head, "сейчас", 9, new Color(border), true);
+  head.centerAlignContent();
+  text(head, item.title, 13, TEXT, true);
+  if (current) {
+    head.addSpacer(6);
+    text(head, "сейчас", 9, new Color(border), true);
+  }
   const meta = [item.end ? `до ${item.end}` : "", item.online ? "онлайн" : "", item.teacher].filter(Boolean).join(" · ");
   if (meta) text(box, meta, 10, MUTED);
-  if (item.link) box.url = item.link;
-  w.addSpacer(4);
+  row.addSpacer();
+  if (item.link) row.url = item.link;
+  w.addSpacer(5);
 }
 
 async function main() {
