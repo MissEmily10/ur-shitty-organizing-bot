@@ -484,7 +484,7 @@ TUTORS = {
     "математика": "https://chattern.ru/duo?rid=D-KzCkJaQW",
     "гетало": "",  # ссылки на вход пока нет
     "обществознание": "https://m1qa3quv.ktalk.ru/opvjrcj0okbg",
-    "русский язык": "",  # ссылки на вход пока нет
+    "русский язык": "https://us06web.zoom.us/j/87065984879?pwd=rUh80TBGVTrBBG4HybIkXcZdhFWb2s.1",  # Евгений
 }
 TUTOR_TEACHERS = {"русский язык": "Евгений"}
 
@@ -506,7 +506,7 @@ def is_tutor(item: dict) -> bool:
     return bool(item.get("tutor") or item.get("link"))
 
 
-SEED_VERSION = 10  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
+SEED_VERSION = 11  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
 
 
 async def reload_owner(uid: int) -> str:

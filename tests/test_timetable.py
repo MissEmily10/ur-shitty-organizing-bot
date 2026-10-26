@@ -163,7 +163,7 @@ async def run():
         (["Чт"], "15:00", "16:00", "Математика", True), (["Пт"], "14:00", "15:30", "Русский язык", True), (["Пт"], "21:00", "22:00", "Обществознание", True)]  # fmt: skip
     assert next(i for i in tutors if i["days"] == ["Пт"])["teacher"] == "Евгений"
     assert not any(timetable.is_tutor(i) for i in data["items"] if i["days"] == ["Вт"] and i["title"] == "Русский язык"), "школьный русский — урок"
-    assert [i["title"] for i in data["items"] if i.get("link")] == ["Китайский", "Математика", "Китайский", "Математика", "Обществознание"], "у Гетало и русского ссылки нет"
+    assert [i["title"] for i in data["items"] if i.get("link")] == ["Китайский", "Математика", "Китайский", "Математика", "Русский язык", "Обществознание"], "у Гетало ссылки нет"
     assert not any(timetable.is_tutor(i) for i in data["items"] if i["room"]), "школьные уроки — не репетиторы"
     mon = lambda hh, mm: datetime(2026, 10, 19, hh, mm, tzinfo=timezone.utc)  # noqa: E731
     (key, text), = timetable.due_joins(data, mon(9, 55))
