@@ -350,9 +350,11 @@ def timetable_pdf(days: list[tuple[date, list[dict]]], title: str, subtitle: str
             words, first_line = name.split(), ""
             while words and c.stringWidth((first_line + " " + words[0]).strip(), font, size) <= w - 8:
                 first_line = (first_line + " " + words.pop(0)).strip()
+            if not first_line and words:  # первое слово само не влезает — обрезаем его, а не печатаем название дважды
+                first_line = _fit(c, words.pop(0), font, size, w - 8)
             c.setFont(font, size)
             if words and line - 10 >= y_bottom + 2:
-                c.drawString(bx + 4, line, first_line or _fit(c, name, font, size, w - 8))
+                c.drawString(bx + 4, line, first_line)
                 line -= 10
                 c.drawString(bx + 4, line, _fit(c, " ".join(words), font, size, w - 8))
             else:  # в одну строку: сначала чуть уменьшаем шрифт, потом уже обрезаем

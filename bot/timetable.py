@@ -494,6 +494,7 @@ TUTORS = {
     "китайский": "https://telemost.yandex.ru/j/61862118303727",
     "математика": "https://chattern.ru/duo?rid=D-KzCkJaQW",
     "гетало": "",  # ссылки на вход пока нет
+    "английский": "",  # суббота; ссылки пока нет
     "обществознание": "https://m1qa3quv.ktalk.ru/opvjrcj0okbg",
     "русский язык": "https://us06web.zoom.us/j/87065984879?pwd=rUh80TBGVTrBBG4HybIkXcZdhFWb2s.1",  # Евгений
 }
@@ -517,7 +518,7 @@ def is_tutor(item: dict) -> bool:
     return bool(item.get("tutor") or item.get("link"))
 
 
-SEED_VERSION = 12  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
+SEED_VERSION = 13  # растёт, когда владелица присылает новое расписание: тогда оно заменяет загруженное
 
 
 async def reload_owner(uid: int) -> str:
@@ -530,7 +531,12 @@ async def reload_owner(uid: int) -> str:
     data = {"anchor": SEED_ANCHOR, "items": parse(SEED_FILE.read_text(encoding="utf-8")), "bells": old.get("bells", True)}
     _tutors(data)
     # то, что владелица добавила сама (кнопкой или из виджета), и её ссылки репетиторов при обновлении из файла не теряются
-    data["items"] += [i for i in old.get("items", []) if i.get("added")]
+    weekly = {(d, i["title"].lower(), i["start"]) for i in data["items"] if not i.get("date") for d in i["days"]}
+    data["items"] += [
+        i for i in old.get("items", [])
+        # разовое, которое теперь стоит в расписании каждую неделю в то же время, не дублируем
+        if i.get("added") and not (i.get("date") and (i["days"][0], i["title"].lower(), i["start"]) in weekly)
+    ]  # fmt: skip
     for key in ("tutor_links", "skips", "applied_changes"):
         if old.get(key):
             data[key] = old[key]
