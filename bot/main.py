@@ -5155,10 +5155,16 @@ async def set_commands(app: Application) -> None:
         log.info("timetable reload: %s", reloaded)
         if reloaded.startswith("загружено"):
             seeded = "загружено (новое расписание)"
+        today = scheduler.local_now(await scheduler.get_settings(c.OWNER_ID)).date()
+        extra = await timetable.apply_owner_changes(c.OWNER_ID, today)
+        log.info("timetable changes: %s", extra)
+        if extra and not seeded.startswith("загружено"):
+            await app.bot.send_message(c.OWNER_ID, "🎒 Внесла в твоё расписание:\n\n" + "\n".join(extra))
         if seeded.startswith("загружено"):
             text, kb = await _tt_view(c.OWNER_ID)
             await app.bot.send_message(
-                c.OWNER_ID, "🎒 Обновила твоё расписание: репетиторы — китайский (пн 10–11, ср 12–13), математика (пн и чт 15–16), Гетало (вт 17:30–18:30), русский язык с Евгением (пт 14:00–15:30, ссылка Zoom), обществознание (пт 21–22); танцы и уроки — как были.\n\n" + text,
+                c.OWNER_ID, "🎒 Обновила твоё расписание: репетиторы — китайский (пн 10–11, ср 12–13), математика (пн и чт 15–16), Гетало (вт 17:30–18:30), русский язык с Евгением (пт 14:00–15:30, ссылка Zoom), обществознание (пт 21–22); танцы и уроки — как были."
+                + ("\n\nИ разово:\n" + "\n".join(extra) if extra else "") + "\n\n" + text,
                 reply_markup=kb, parse_mode=ParseMode.HTML,
             )  # fmt: skip
     except Exception:

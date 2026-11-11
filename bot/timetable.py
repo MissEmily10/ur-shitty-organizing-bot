@@ -22,7 +22,7 @@ from pathlib import Path
 from datetime import date, datetime, timedelta
 
 from . import notion, pdf
-from .notion import KIND_ONCE, KIND_REGULAR, WEEKDAYS
+from .notion import KIND_CANCEL, KIND_ONCE, KIND_REGULAR, WEEKDAYS
 
 DAY_NAMES = {
     "понедельник": "Пн", "вторник": "Вт", "среда": "Ср", "среду": "Ср", "четверг": "Чт",
@@ -179,12 +179,21 @@ def week_index(data: dict, day: date) -> int:
     return ((monday(day) - anchor).days // 7) % 2
 
 
+def skipped(data: dict, item: dict, day: date) -> bool:
+    """Обычное занятие отменено в этот день (data["skips"]: [{"title", "start", "date"}] — «в эту пятницу не в 14:00»)."""
+    return any(
+        s["date"] == day.isoformat() and s["title"].lower() == item["title"].lower() and s.get("start", item["start"]) == item["start"]
+        for s in data.get("skips") or []
+    )
+
+
 def for_day(data: dict, day: date) -> list[dict]:
-    """Занятия этого дня с учётом чередования и разовых занятий (у них "date"), по времени."""
+    """Занятия этого дня с учётом чередования, разовых занятий (у них "date") и разовых отмен, по времени."""
     weekday, week = WEEKDAYS[day.weekday()], week_index(data, day)
     items = [
         i for i in data["items"]
-        if (i.get("date") == day.isoformat()) or (not i.get("date") and weekday in i["days"] and i["week"] in (None, week))
+        if (i.get("date") == day.isoformat())
+        or (not i.get("date") and weekday in i["days"] and i["week"] in (None, week) and not skipped(data, i, day))
     ]  # fmt: skip
     return sorted(items, key=lambda i: i["start"] or "00:00")
 
@@ -435,6 +444,8 @@ async def sync_main_schedule(uid: int, data: dict) -> int:
         if i.get("date"):
             await notion.add_slot(uid, SLOT_MARK + i["title"], KIND_ONCE, i["start"], i["end"], date=i["date"])
             slots.append(i)
+    for skip in data.get("skips") or []:  # разовая отмена обычного занятия — отменой и в основном расписании
+        await notion.add_slot(uid, SLOT_MARK + skip["title"], KIND_CANCEL, date=skip["date"])
     return len(slots)
 
 
@@ -520,8 +531,9 @@ async def reload_owner(uid: int) -> str:
     _tutors(data)
     # то, что владелица добавила сама (кнопкой или из виджета), и её ссылки репетиторов при обновлении из файла не теряются
     data["items"] += [i for i in old.get("items", []) if i.get("added")]
-    if old.get("tutor_links"):
-        data["tutor_links"] = old["tutor_links"]
+    for key in ("tutor_links", "skips", "applied_changes"):
+        if old.get(key):
+            data[key] = old[key]
     await save(uid, data)
     slots = await sync_main_schedule(uid, data)
     for key in ("seed:timetable:1", "seed:timetable:3"):
@@ -542,3 +554,48 @@ async def upgrade_owner(uid: int) -> str:
     await sync_main_schedule(uid, data)
     await notion.set_value("seed:timetable:3", "ok")
     return "репетиторы: по часу, ссылки, домашка"
+
+
+# ---------- разовые изменения, которые владелица надиктовала (data/owner_changes.json) ----------
+# Каждое изменение применяется один раз (id запоминается в data["applied_changes"]) при запуске бота.
+#   {"id": "…", "add": {"date", "start", "end", "title", "tutor": bool, "busy": bool}}   — разовое занятие или окно
+#   {"id": "…", "skip": {"date", "title", "start"}}                                    — обычное занятие в этот день не идёт
+
+CHANGES_FILE = SEED_FILE.parent / "owner_changes.json"
+
+
+async def apply_owner_changes(uid: int, today: date) -> list[str]:
+    if not uid or not CHANGES_FILE.exists():
+        return []
+    changes = json.loads(CHANGES_FILE.read_text(encoding="utf-8"))
+    data = await load(uid)
+    if not data:
+        return []
+    before = set(data.get("applied_changes") or [])
+    applied = set(before)
+    done = []
+    for change in changes:
+        if change["id"] in applied:
+            continue
+        applied.add(change["id"])
+        when = (change.get("add") or change.get("skip"))["date"]
+        if when < today.isoformat():
+            continue  # уже прошло
+        if "skip" in change:
+            data.setdefault("skips", []).append(change["skip"])
+            sk = change["skip"]
+            done.append(f"🚫 {date.fromisoformat(sk['date']):%d.%m} — без «{sk['title']}» в {sk['start']}")
+            continue
+        a = change["add"]
+        item = make_item(data, a["title"], a["start"], a.get("end", ""), tutor=bool(a.get("tutor")), day=a["date"])
+        if not a.get("tutor"):
+            item["lesson"] = False  # окно или дело: без звонков
+        data["items"].append(item)
+        done.append(f"📌 {date.fromisoformat(a['date']):%d.%m} {item['start']}–{item['end']} — {item['title']}" + (" 🔗" if item.get("link") else ""))
+    data["applied_changes"] = sorted(applied)
+    if done:
+        await save(uid, data)
+        await sync_main_schedule(uid, data)
+    elif applied != before:
+        await save(uid, data)  # только отметки о том, что прошедшее уже не нужно
+    return done

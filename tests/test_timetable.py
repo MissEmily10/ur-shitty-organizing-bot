@@ -48,7 +48,7 @@ async def schedule_slots(uid):
 
 
 async def add_slot(uid, title, kind, start="", end="", days=None, date=None):
-    slots.append({"page": f"s{len(slots)}", "title": title, "kind": kind, "start": start, "end": end, "days": days or []})
+    slots.append({"page": f"s{len(slots)}", "title": title, "kind": kind, "start": start, "end": end, "days": days or [], "date": date})
 
 
 async def remove_slot(page):
@@ -221,6 +221,30 @@ async def run():
     assert ("11:00", "12:00", "Встреча с наставником") in [(i["start"], i["end"], i["title"]) for i in tue]
     (_, text), = timetable.due_bells(new, datetime(2026, 10, 20, 13, 40, tzinfo=timezone.utc))
     assert "Консультация по физике" in text and "перерыв 2 ч 15 мин" in text, text
+    # 11. разовые изменения из data/owner_changes.json: занятие на дату, перенос (отмена обычного в этот день), окно
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+    changes = _Path(tempfile.mkdtemp()) / "owner_changes.json"
+    changes.write_text(_json.dumps([
+        {"id": "a", "add": {"date": "2026-11-12", "start": "12:00", "end": "13:30", "title": "русский язык", "tutor": True}},
+        {"id": "b", "skip": {"date": "2026-11-13", "title": "Русский язык", "start": "14:00"}},
+        {"id": "c", "add": {"date": "2026-11-13", "start": "17:00", "end": "20:00", "title": "Занято"}},
+        {"id": "old", "add": {"date": "2026-11-01", "start": "10:00", "end": "11:00", "title": "Прошло"}},
+    ]), encoding="utf-8")
+    timetable.CHANGES_FILE = changes
+    done = await timetable.apply_owner_changes(42, date(2026, 11, 11))
+    assert len(done) == 3 and done[0].startswith("📌 12.11 12:00–13:30 — Русский язык 🔗"), done
+    assert await timetable.apply_owner_changes(42, date(2026, 11, 11)) == [], "каждое — один раз"
+    data = await timetable.load(42)
+    thu = timetable.for_day(data, date(2026, 11, 12))
+    ru = next(i for i in thu if i["title"] == "Русский язык")
+    assert ru["link"].startswith("https://us06web.zoom.us") and ru["teacher"] == "Евгений" and ru["homework"]
+    fri = [(i["start"], i["title"], i["lesson"]) for i in timetable.for_day(data, date(2026, 11, 13))]
+    assert ("14:00", "Русский язык", True) not in fri and ("17:00", "Занято", False) in fri, fri
+    assert ("14:00", "Русский язык", True) in [(i["start"], i["title"], i["lesson"]) for i in timetable.for_day(data, date(2026, 11, 20))]
+    assert not any(i["title"] == "Прошло" for i in data["items"])
+    assert any(s["kind"] == notion.KIND_CANCEL and s["date"] == "2026-11-13" for s in slots)
     print("timetable OK")
 
 
