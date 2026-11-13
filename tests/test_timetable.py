@@ -245,6 +245,11 @@ async def run():
     assert ("15:00", "Русский язык", True) not in fri and ("17:00", "Занято", False) in fri, fri
     assert ("15:00", "Русский язык", True) in [(i["start"], i["title"], i["lesson"]) for i in timetable.for_day(data, date(2026, 11, 20))]
     assert not any(i["title"] == "Прошло" for i in data["items"])
+    # отмена разового занятия убирает его совсем
+    changes.write_text(_json.dumps([{"id": "d", "skip": {"date": "2026-11-11", "title": "Русский язык", "start": "17:00"}}]), encoding="utf-8")
+    assert len(await timetable.apply_owner_changes(42, date(2026, 11, 11))) == 1
+    data = await timetable.load(42)
+    assert not any(i.get("date") == "2026-11-11" and i["title"] == "Русский язык" for i in data["items"])
     assert any(s["kind"] == notion.KIND_CANCEL and s["date"] == "2026-11-13" for s in slots)
     # разовое, которое совпало с постоянным в то же время, при обновлении из файла не дублируется
     data["items"].append(timetable.make_item(data, "русский язык", "15:00", "16:30", tutor=True, day="2026-11-20"))

@@ -565,7 +565,7 @@ async def upgrade_owner(uid: int) -> str:
 # ---------- разовые изменения, которые владелица надиктовала (data/owner_changes.json) ----------
 # Каждое изменение применяется один раз (id запоминается в data["applied_changes"]) при запуске бота.
 #   {"id": "…", "add": {"date", "start", "end", "title", "tutor": bool, "busy": bool}}   — разовое занятие или окно
-#   {"id": "…", "skip": {"date", "title", "start"}}                                    — обычное занятие в этот день не идёт
+#   {"id": "…", "skip": {"date", "title", "start"}}       — занятие в этот день не идёт (разовое убирается совсем)
 
 CHANGES_FILE = SEED_FILE.parent / "owner_changes.json"
 
@@ -588,8 +588,12 @@ async def apply_owner_changes(uid: int, today: date) -> list[str]:
         if when < today.isoformat():
             continue  # уже прошло
         if "skip" in change:
-            data.setdefault("skips", []).append(change["skip"])
             sk = change["skip"]
+            # разовое занятие на эту дату убираем совсем, обычное — отменяем только в этот день
+            same = lambda i: (i.get("date") == sk["date"] and i["title"].lower() == sk["title"].lower()  # noqa: E731
+                              and i["start"] == sk.get("start", i["start"]))
+            data["items"] = [i for i in data["items"] if not same(i)]
+            data.setdefault("skips", []).append(sk)
             done.append(f"🚫 {date.fromisoformat(sk['date']):%d.%m} — без «{sk['title']}» в {sk['start']}")
             continue
         a = change["add"]
